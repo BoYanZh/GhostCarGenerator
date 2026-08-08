@@ -1,0 +1,24 @@
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Telemetry, ghost and binary replay files
+*.blap
+*.olap
+*.blapta
+*.olapta
+*.ghost
+
+# Data directory
+data/
+
+# Temporary JSON outputs & report files
+*.json
+analysis_report.md
+*.tmp
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
