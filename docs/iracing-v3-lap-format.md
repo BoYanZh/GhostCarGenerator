@@ -50,6 +50,22 @@ its distance map and the BLAP-spline lateral map are combined by source
 distance; target distance is not a valid join key between independently fitted
 maps.
 
+For a closed lap, distance-map correction must also be continuous at the
+start/finish boundary. Anchoring only the final sample to zero creates an
+artificial local distance stretch and therefore a speed spike because BLAP
+speed is inferred from `ds/dt`. ghost-car removes the smoothed correction's
+endpoint trend across the lap, then preserves exact sector durations while
+smoothing positive time increments. Tangent yaw is reconstructed from the
+inferred reference spline plus the generated lateral-offset gradient, matching
+the path iRacing actually renders instead of the pre-projection source GPS
+tangent. Both output and input headings use circular smoothing and shortest-arc
+interpolation across the 0/360-degree boundary.
+Time-increment smoothing uses reflected sector boundaries by default so the
+polynomial filter cannot extrapolate a false finish-line speed; the legacy
+truncated boundary fit remains available through the advanced CLI.
+Generated tangent pitch negates the positive-up source slope because the
+lapfile convention is positive for nose-down rotation.
+
 ## Metadata confidence
 
 | Field | Observation | Confidence |

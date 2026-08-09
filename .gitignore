@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Python package build metadata
+*.egg-info/
+build/
+dist/
+
 # Telemetry, ghost and binary replay files
 *.blap
 *.olap

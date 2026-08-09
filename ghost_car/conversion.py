@@ -2,6 +2,7 @@
 
 import bisect
 import math
+import statistics
 from typing import Any, Dict, List, Optional, Sequence
 
 
@@ -96,7 +97,17 @@ def interpolate_point(
         first = points[left].get(key)
         second = points[right].get(key, first)
         if isinstance(first, (int, float)) and isinstance(second, (int, float)):
-            output[key] = float(first) + fraction * (float(second) - float(first))
+            if key in ("headingRad", "yawRad"):
+                first_angle = float(first)
+                delta = math.atan2(
+                    math.sin(float(second) - first_angle),
+                    math.cos(float(second) - first_angle),
+                )
+                output[key] = first_angle + fraction * delta
+            else:
+                output[key] = float(first) + fraction * (
+                    float(second) - float(first)
+                )
         else:
             output[key] = first
     return output
@@ -139,8 +150,302 @@ def _pose_from_tangent(
     horizontal = math.hypot(dx, dy)
     return {
         "yaw": math.atan2(dy, dx) if horizontal else 0.0,
-        "pitch": math.atan2(dz, horizontal) if horizontal or dz else 0.0,
+        # iRacing lapfiles use positive pitch for nose-down rotation, opposite
+        # to the positive-up ENU slope used by the source coordinates.
+        "pitch": -math.atan2(dz, horizontal) if horizontal or dz else 0.0,
     }
+
+
+def _window_bins(distances: Sequence[float], distance_m: float) -> int:
+    if distance_m <= 0:
+        return 1
+    positive_steps = [
+        float(current) - float(previous)
+        for previous, current in zip(distances, distances[1:])
+        if float(current) > float(previous)
+    ]
+    if not positive_steps:
+        return 1
+    window = max(1, int(round(distance_m / statistics.median(positive_steps))))
+    if window % 2 == 0:
+        window += 1
+    return window
+
+
+def _circular_average(values: Sequence[float], window: int) -> List[float]:
+    values = [float(value) for value in values]
+    if window <= 1 or len(values) < 2:
+        return values
+    window = min(window, len(values) if len(values) % 2 else len(values) - 1)
+    window = max(1, window)
+    if window % 2 == 0:
+        window -= 1
+    half = window // 2
+    return [
+        sum(values[(index + offset) % len(values)] for offset in range(-half, half + 1))
+        / window
+        for index in range(len(values))
+    ]
+
+
+def _edge_average(values: Sequence[float], window: int) -> List[float]:
+    values = [float(value) for value in values]
+    if window <= 1 or len(values) < 2:
+        return values
+    window = min(window, len(values) if len(values) % 2 else len(values) - 1)
+    window = max(1, window)
+    if window % 2 == 0:
+        window -= 1
+    half = window // 2
+    return [
+        sum(
+            values[min(len(values) - 1, max(0, index + offset))]
+            for offset in range(-half, half + 1)
+        )
+        / window
+        for index in range(len(values))
+    ]
+
+
+def _unwrap_angles(values: Sequence[float]) -> List[float]:
+    values = [float(value) for value in values]
+    if not values:
+        return []
+    output = [values[0]]
+    for value in values[1:]:
+        output.append(
+            output[-1]
+            + math.atan2(
+                math.sin(value - output[-1]),
+                math.cos(value - output[-1]),
+            )
+        )
+    return output
+
+
+def _series_gradient(
+    values: Sequence[float], distances: Sequence[float]
+) -> List[float]:
+    if len(values) != len(distances):
+        raise ValueError("Gradient values and distances must have equal length")
+    if len(values) < 2:
+        return [0.0] * len(values)
+    output = []
+    for index in range(len(values)):
+        left = max(0, index - 1)
+        right = min(len(values) - 1, index + 1)
+        span = float(distances[right]) - float(distances[left])
+        output.append(
+            (float(values[right]) - float(values[left])) / span if span else 0.0
+        )
+    return output
+
+
+def _interpolate_series(
+    grid: Sequence[float], values: Sequence[float], target: float
+) -> float:
+    if target <= grid[0]:
+        return float(values[0])
+    if target >= grid[-1]:
+        return float(values[-1])
+    left = max(0, bisect.bisect_right(grid, target) - 1)
+    right = min(len(grid) - 1, left + 1)
+    span = float(grid[right]) - float(grid[left])
+    fraction = (target - float(grid[left])) / span if span else 0.0
+    return float(values[left]) + fraction * (
+        float(values[right]) - float(values[left])
+    )
+
+
+def _output_path_yaws(
+    distances: Sequence[float],
+    lateral_offsets: Sequence[float],
+    template_distances: Sequence[float],
+    template_lateral_offsets: Sequence[float],
+    template_yaws: Sequence[float],
+    smoothing_distance_m: float,
+    reference_smoothing_distance_m: float,
+) -> List[float]:
+    """Calculate heading from the path iRacing will actually render.
+
+    BLAP position is the inferred track spline plus its signed lateral offset.
+    Its tangent is approximately ``spline_yaw + atan(d(offset) / ds)``.  Using
+    the source GPS tangent instead can point the car across the rendered path
+    when longitudinal alignment and lateral projection differ.
+    """
+    groups = _distance_groups(distances)
+    if len(groups) < 3 or len(template_distances) < 3:
+        raise ValueError("Output-path yaw requires at least three distance samples")
+    grouped_distances = [float(distances[group[0]]) for group in groups]
+    grouped_offsets = [
+        sum(float(lateral_offsets[index]) for index in group) / len(group)
+        for group in groups
+    ]
+
+    reference_yaws = _unwrap_angles(template_yaws)
+    reference_gradient = _series_gradient(
+        template_lateral_offsets, template_distances
+    )
+    spline_yaws = [
+        yaw - math.atan(gradient)
+        for yaw, gradient in zip(reference_yaws, reference_gradient)
+    ]
+    reference_window = _window_bins(
+        template_distances, reference_smoothing_distance_m
+    )
+    spline_yaws = _edge_average(spline_yaws, reference_window)
+    output_spline_yaws = [
+        _interpolate_series(template_distances, spline_yaws, distance)
+        for distance in grouped_distances
+    ]
+
+    output_window = _window_bins(grouped_distances, smoothing_distance_m)
+    smoothed_offsets = _edge_average(grouped_offsets, output_window)
+    output_gradient = _series_gradient(smoothed_offsets, grouped_distances)
+    grouped_yaws = [
+        spline_yaw + math.atan(gradient)
+        for spline_yaw, gradient in zip(output_spline_yaws, output_gradient)
+    ]
+    grouped_yaws = _edge_average(_unwrap_angles(grouped_yaws), output_window)
+
+    output = [0.0] * len(distances)
+    for group, yaw in zip(groups, grouped_yaws):
+        for index in group:
+            output[index] = yaw
+    return output
+
+
+def _distance_groups(distances: Sequence[float]) -> List[List[int]]:
+    groups: List[List[int]] = []
+    for index, distance in enumerate(distances):
+        if groups and abs(float(distance) - float(distances[groups[-1][0]])) <= 1e-6:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    return groups
+
+
+def _smoothed_tangent_yaws(
+    points: Sequence[Dict[str, Any]],
+    distances: Sequence[float],
+    smoothing_distance_m: float,
+) -> List[float]:
+    if smoothing_distance_m <= 0:
+        return [_pose_from_tangent(points, index)["yaw"] for index in range(len(points))]
+    groups = _distance_groups(distances)
+    if len(groups) < 3:
+        return [_pose_from_tangent(points, index)["yaw"] for index in range(len(points))]
+    group_distance = [float(distances[group[0]]) for group in groups]
+    x = [sum(float(points[index]["xM"]) for index in group) / len(group) for group in groups]
+    y = [sum(float(points[index]["yM"]) for index in group) / len(group) for group in groups]
+    lap_length = group_distance[-1] - group_distance[0]
+    if lap_length <= 0:
+        return [_pose_from_tangent(points, index)["yaw"] for index in range(len(points))]
+    for index, distance in enumerate(group_distance):
+        fraction = (distance - group_distance[0]) / lap_length
+        x[index] -= fraction * (x[-1] - x[0])
+        y[index] -= fraction * (y[-1] - y[0])
+    cycle_x = x[:-1]
+    cycle_y = y[:-1]
+    window = _window_bins(group_distance, smoothing_distance_m)
+    cycle_x = _circular_average(cycle_x, window)
+    cycle_y = _circular_average(cycle_y, window)
+    group_yaw = []
+    for index in range(len(cycle_x)):
+        previous = (index - 1) % len(cycle_x)
+        following = (index + 1) % len(cycle_x)
+        group_yaw.append(
+            math.atan2(
+                cycle_y[following] - cycle_y[previous],
+                cycle_x[following] - cycle_x[previous],
+            )
+        )
+    group_yaw.append(group_yaw[0])
+    output = [0.0] * len(points)
+    for group, yaw in zip(groups, group_yaw):
+        for index in group:
+            output[index] = yaw
+    return output
+
+
+def _smoothed_input_yaws(
+    angles: Sequence[float],
+    distances: Sequence[float],
+    smoothing_distance_m: float,
+) -> List[float]:
+    groups = _distance_groups(distances)
+    group_angles = []
+    for group in groups:
+        sine = sum(math.sin(float(angles[index])) for index in group)
+        cosine = sum(math.cos(float(angles[index])) for index in group)
+        group_angles.append(math.atan2(sine, cosine))
+    if smoothing_distance_m > 0 and len(group_angles) > 2:
+        cycle = group_angles[:-1]
+        window = _window_bins(
+            [float(distances[group[0]]) for group in groups],
+            smoothing_distance_m,
+        )
+        sine = _circular_average([math.sin(angle) for angle in cycle], window)
+        cosine = _circular_average([math.cos(angle) for angle in cycle], window)
+        cycle = [math.atan2(y, x) for y, x in zip(sine, cosine)]
+        group_angles = cycle + [cycle[0]]
+    output = [0.0] * len(angles)
+    for group, angle in zip(groups, group_angles):
+        for index in group:
+            output[index] = angle
+    return output
+
+
+def _smooth_cumulative_times(
+    times: Sequence[float],
+    window: int,
+    order: int,
+    boundary_mode: str,
+    min_time_step: float,
+) -> List[float]:
+    values = [float(value) for value in times]
+    if len(values) < 2:
+        return [0.0] * len(values)
+    duration = values[-1] - values[0]
+    if duration <= 0:
+        raise ValueError("Sector time must be strictly positive")
+    increment_count = len(values) - 1
+    required = min_time_step * increment_count
+    if required > duration + 1e-12:
+        raise ValueError("Minimum time step exceeds the sector duration")
+    increments = [
+        max(0.0, current - previous)
+        for previous, current in zip(values, values[1:])
+    ]
+    if window:
+        if boundary_mode == "reflect" and len(increments) > 1:
+            half = window // 2
+            period = 2 * len(increments) - 2
+
+            def reflected(index: int) -> int:
+                index %= period
+                return index if index < len(increments) else period - index
+
+            padded = [
+                increments[reflected(index)]
+                for index in range(-half, len(increments) + half)
+            ]
+            increments = polynomial_smooth(padded, window, order)[
+                half : half + len(increments)
+            ]
+        else:
+            increments = polynomial_smooth(increments, window, order)
+    weights = [max(float(value), 1e-12) for value in increments]
+    weight_sum = sum(weights)
+    available = max(0.0, duration - required)
+    normalized = [
+        min_time_step + available * weight / weight_sum for weight in weights
+    ]
+    output = [0.0]
+    for increment in normalized:
+        output.append(output[-1] + increment)
+    output[-1] = duration
+    return output
 
 
 def build_canonical_blap(
@@ -154,6 +459,9 @@ def build_canonical_blap(
     roll_source: str = "input",
     smoothing_window: int = 35,
     smoothing_order: int = 3,
+    smoothing_boundary_mode: str = "reflect",
+    yaw_smoothing_distance_m: float = 32.0,
+    reference_heading_smoothing_distance_m: float = 8.0,
     min_time_step: float = 0.0,
     control_scale: str = "percent",
     default_gear: int = 1,
@@ -182,6 +490,14 @@ def build_canonical_blap(
         )
     if sector_boundary_source not in ("generated", "template", "zero"):
         raise ValueError("Sector-boundary source must be generated, template, or zero")
+    if yaw_smoothing_distance_m < 0:
+        raise ValueError("Yaw smoothing distance cannot be negative")
+    if reference_heading_smoothing_distance_m < 0:
+        raise ValueError("Reference-heading smoothing distance cannot be negative")
+    if min_time_step < 0:
+        raise ValueError("Minimum time step cannot be negative")
+    if smoothing_boundary_mode not in ("reflect", "truncate"):
+        raise ValueError("Smoothing boundary mode must be reflect or truncate")
     distances = cumulative_distances(points)
     raw_total = distances[-1]
     template_sectors = template.get("summary", {}).get("sectors", [])
@@ -264,6 +580,7 @@ def build_canonical_blap(
     template_samples = template.get("samples", [])
     template_distances = []
     template_lateral_offsets = []
+    template_yaws = []
     template_sample_index = 0
     for sector in template_sectors:
         start = float(sector["startDistanceM"])
@@ -280,31 +597,21 @@ def build_canonical_blap(
             offset = float(
                 sample.get("lateralOffsetM", sample.get("deltaS", 0.0))
             )
+            yaw = float(sample.get("yawRad", 0.0))
             if template_distances and abs(distance - template_distances[-1]) <= 1e-6:
                 template_lateral_offsets[-1] = 0.5 * (
                     template_lateral_offsets[-1] + offset
                 )
+                yaw_delta = math.atan2(
+                    math.sin(yaw - template_yaws[-1]),
+                    math.cos(yaw - template_yaws[-1]),
+                )
+                template_yaws[-1] += 0.5 * yaw_delta
             else:
                 template_distances.append(distance)
                 template_lateral_offsets.append(offset)
+                template_yaws.append(yaw)
             template_sample_index += 1
-
-    def interpolate_series(
-        grid: Sequence[float],
-        values: Sequence[float],
-        target: float,
-    ) -> float:
-        if target <= grid[0]:
-            return float(values[0])
-        if target >= grid[-1]:
-            return float(values[-1])
-        left = max(0, bisect.bisect_right(grid, target) - 1)
-        right = min(len(grid) - 1, left + 1)
-        span = grid[right] - grid[left]
-        fraction = (target - grid[left]) / span if span else 0.0
-        return float(values[left]) + fraction * (
-            float(values[right]) - float(values[left])
-        )
 
     resolved_lateral_source = lateral_offset_source
     if resolved_lateral_source == "auto":
@@ -320,14 +627,14 @@ def build_canonical_blap(
         if resolved_lateral_source == "zero":
             return 0.0
         if resolved_lateral_source == "alignment":
-            return interpolate_series(
+            return _interpolate_series(
                 mapped_targets,
                 mapped_lateral_offsets,
                 target_distance - track_start,
             )
         if not template_distances:
             raise ValueError("Template has no samples for lateral-offset passthrough")
-        return interpolate_series(
+        return _interpolate_series(
             template_distances,
             template_lateral_offsets,
             target_distance,
@@ -354,15 +661,13 @@ def build_canonical_blap(
             local_points.append(point)
             sample_target_distances.append(target_distance)
             times.append(float(point.get("timeS", 0.0)) - start_time)
-        times = polynomial_smooth(times, smoothing_window, smoothing_order)
-        if times:
-            origin = times[0]
-            times = [number - origin for number in times]
-            for time_index in range(1, len(times)):
-                times[time_index] = max(
-                    times[time_index],
-                    times[time_index - 1] + min_time_step,
-                )
+        times = _smooth_cumulative_times(
+            times,
+            smoothing_window,
+            smoothing_order,
+            smoothing_boundary_mode,
+            min_time_step,
+        )
         resampled_points.extend(local_points)
         sector_times.extend(times)
         template_sector = template_sectors[index]
@@ -390,6 +695,31 @@ def build_canonical_blap(
         previous_raw_end = raw_end
 
     samples = []
+    output_lateral_offsets = [
+        lateral_offset(distance) for distance in sample_target_distances
+    ]
+    output_path_yaws = _output_path_yaws(
+        sample_target_distances,
+        output_lateral_offsets,
+        template_distances,
+        template_lateral_offsets,
+        template_yaws,
+        yaw_smoothing_distance_m,
+        reference_heading_smoothing_distance_m,
+    )
+    tangent_yaws = _smoothed_tangent_yaws(
+        resampled_points,
+        sample_target_distances,
+        yaw_smoothing_distance_m,
+    )
+    input_yaws = _smoothed_input_yaws(
+        [
+            float(point.get("headingRad", tangent_yaws[index]))
+            for index, point in enumerate(resampled_points)
+        ],
+        sample_target_distances,
+        yaw_smoothing_distance_m,
+    )
     sector_index = 0
     sector_bin = 0
     for index, point in enumerate(resampled_points):
@@ -400,15 +730,14 @@ def build_canonical_blap(
             sector_index += 1
             sector_bin = 0
         tangent = _pose_from_tangent(resampled_points, index)
+        tangent["yaw"] = tangent_yaws[index]
         reference = template_samples[index] if index < len(template_samples) else {}
         if yaw_source == "template":
             yaw = float(reference.get("yawRad", 0.0))
         elif yaw_source == "input":
-            yaw = float(point.get("headingRad", tangent["yaw"]))
+            yaw = input_yaws[index] + alignment_rotation_rad
         else:
-            yaw = tangent["yaw"]
-        if yaw_source != "template":
-            yaw += alignment_rotation_rad
+            yaw = output_path_yaws[index]
         if pitch_source == "template":
             pitch = float(reference.get("pitchRad", 0.0))
         elif pitch_source == "input":
@@ -439,7 +768,7 @@ def build_canonical_blap(
                 "globalBinIndex": index,
                 "sectorIndex": sector_index + 1,
                 "timeInSectorS": time_s,
-                "lateralOffsetM": lateral_offset(sample_target_distances[index]),
+                "lateralOffsetM": output_lateral_offsets[index],
                 "yawRad": yaw,
                 "pitchRad": pitch,
                 "rollRad": roll,

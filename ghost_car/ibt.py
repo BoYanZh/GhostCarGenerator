@@ -22,7 +22,7 @@ def _numpy():
         import numpy
     except ImportError as error:
         raise ImportError(
-            "IBT alignment requires NumPy; install ghost-car[motec]"
+            "Ghost Car requires NumPy; reinstall the package dependencies"
         ) from error
     return numpy
 
@@ -568,12 +568,13 @@ def fit_ibt_distance_map(
         raise ValueError("IBT projection has insufficient accepted samples")
     correction = projected_target - expected_target
     correction = np.interp(source_grid, source_grid[accepted], correction[accepted])
-    correction[0] = 0.0
-    correction[-1] = 0.0
     smoothing_window = max(
         1, int(round(smoothing_distance_m / max(sample_spacing_m, 1e-12)))
     )
     correction = _moving_average(correction, smoothing_window)
+    fraction = source_grid / source_total
+    endpoint_trend = correction[0] + fraction * (correction[-1] - correction[0])
+    correction = correction - endpoint_trend
     correction[0] = 0.0
     correction[-1] = 0.0
     mapped_target = expected_target + correction
