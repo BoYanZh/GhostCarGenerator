@@ -8,9 +8,7 @@ version = "0.1.0"
 description = "CLI and codecs for iRacing BLAP/OLAP generation and conversion"
 readme = "README.md"
 requires-python = ">=3.8"
-
-[project.optional-dependencies]
-motec = ["numpy"]
+dependencies = ["numpy"]
 
 [project.scripts]
 ghost-car = "ghost_car.cli:main"

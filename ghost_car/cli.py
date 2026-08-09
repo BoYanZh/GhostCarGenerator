@@ -84,6 +84,18 @@ def _add_iracing_conversion_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--smoothing-window", type=int, default=35)
     parser.add_argument("--smoothing-order", type=int, default=3)
+    parser.add_argument(
+        "--smoothing-boundary-mode",
+        choices=("reflect", "truncate"),
+        default="reflect",
+        help="Time-increment smoothing at sector boundaries",
+    )
+    parser.add_argument(
+        "--yaw-smoothing-distance-m",
+        type=float,
+        default=32.0,
+        help="Distance window used to smooth tangent or input yaw; zero disables",
+    )
     parser.add_argument("--min-time-step", type=float, default=0.0)
     parser.add_argument(
         "--control-scale",
@@ -227,6 +239,20 @@ def _add_ibt_alignment_options(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(reference_loop_closure=True)
 
 
+def _set_ld_to_iracing_defaults(parser: argparse.ArgumentParser) -> None:
+    """Supply expert defaults for the intentionally small public converter."""
+    expert = argparse.ArgumentParser(add_help=False)
+    expert.add_argument("--template-body-offset", type=parse_int)
+    _add_motec_options(expert)
+    _add_ibt_alignment_options(expert)
+    _add_iracing_conversion_options(expert)
+    parser.set_defaults(
+        template=None,
+        target_profile=None,
+        **vars(expert.parse_args([])),
+    )
+
+
 def _extract_motec(
     args: argparse.Namespace,
     profile_origin: Optional[Dict[str, float]] = None,
@@ -293,6 +319,11 @@ def _build_iracing_lap(
         roll_source=args.roll_source,
         smoothing_window=args.smoothing_window,
         smoothing_order=args.smoothing_order,
+        smoothing_boundary_mode=args.smoothing_boundary_mode,
+        yaw_smoothing_distance_m=args.yaw_smoothing_distance_m,
+        reference_heading_smoothing_distance_m=(
+            args.reference_heading_smoothing_distance_m
+        ),
         min_time_step=args.min_time_step,
         control_scale=args.control_scale,
         default_gear=args.default_gear,
@@ -652,20 +683,105 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Decode, encode, and generate iRacing BLAP/OLAP files.",
     )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
-    domains = parser.add_subparsers(dest="domain", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    iracing = domains.add_parser("iracing", help="Decode or encode iRacing BLAP/OLAP")
-    iracing_commands = iracing.add_subparsers(dest="iracing_command", required=True)
-    decode = iracing_commands.add_parser("decode", help="Decode BLAP/OLAP to Canonical JSON")
-    decode.add_argument("input", help="Input .blap/.olap path")
-    decode.add_argument("-o", "--output", help="Output JSON path; defaults to stdout")
-    decode.add_argument("--indent", type=int, default=2, help="JSON indentation")
-    decode.add_argument("--body-offset", type=parse_int, help="Override sample body offset")
-    decode.add_argument("--omit-prefix", action="store_true")
-    decode.add_argument("--brake-light-threshold", type=int, default=10)
-    decode.set_defaults(handler=_handle_iracing_decode)
+    convert = commands.add_parser(
+        "convert",
+        help="Convert a MoTeC LD lap to iRacing BLAP/OLAP",
+    )
+    _set_ld_to_iracing_defaults(convert)
+    convert.add_argument("input", help="Input MoTeC .ld path")
+    convert.add_argument("-o", "--output", required=True, help="Output .blap/.olap path")
+    target = convert.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--profile",
+        "--target-profile",
+        dest="target_profile",
+        help="Reusable target profile (recommended)",
+    )
+    target.add_argument("--template", help="Valid target-car and target-track BLAP/OLAP")
+    convert.add_argument("--lap", type=int, help="Specific numbered lap; defaults to fastest")
+    convert.add_argument(
+        "--reference-ibt",
+        help="Optional target-layout IBT for longitudinal alignment",
+    )
+    convert.add_argument("--driver", help="Driver-name override")
+    convert.set_defaults(handler=_handle_ld_to_iracing)
 
-    encode = iracing_commands.add_parser("encode", help="Encode Canonical JSON to BLAP/OLAP")
+    inspect = commands.add_parser("inspect", help="Decode BLAP/OLAP to Canonical JSON")
+    inspect.add_argument("input", help="Input .blap/.olap path")
+    inspect.add_argument("-o", "--output", help="Output JSON path; defaults to stdout")
+    inspect.add_argument("--indent", type=int, default=2, help="JSON indentation")
+    inspect.add_argument("--body-offset", type=parse_int, help="Override sample body offset")
+    inspect.add_argument("--omit-prefix", action="store_true")
+    inspect.add_argument("--brake-light-threshold", type=int, default=10)
+    inspect.set_defaults(handler=_handle_iracing_decode)
+
+    profile = commands.add_parser("profile", help="Manage reusable target profiles")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    create_profile = profile_commands.add_parser(
+        "create",
+        help="Create a target profile from a valid BLAP/OLAP",
+    )
+    create_profile.add_argument("input", help="Valid target-car and target-track BLAP/OLAP")
+    create_profile.add_argument("-o", "--output", required=True, help="Output profile JSON")
+    create_profile.add_argument(
+        "--reference-lap",
+        action="append",
+        default=[],
+        help=(
+            "Additional same-layout BLAP/OLAP used to average the inferred "
+            "track spline; repeat as needed"
+        ),
+    )
+    create_profile.add_argument(
+        "--reference-heading-smoothing-distance-m",
+        type=float,
+        default=8.0,
+    )
+    create_profile.add_argument(
+        "--no-reference-loop-closure",
+        action="store_false",
+        dest="reference_loop_closure",
+        help="Do not distribute inferred reference-spline closure error",
+    )
+    create_profile.set_defaults(reference_loop_closure=True)
+    create_profile.add_argument(
+        "--max-reference-track-length-difference-m",
+        type=float,
+        default=0.01,
+        help="Maximum allowed track-length difference for an additional lap",
+    )
+    create_profile.add_argument("--body-offset", type=parse_int)
+    create_profile.add_argument("--indent", type=int, default=2)
+    create_profile.set_defaults(handler=_handle_iracing_profile)
+
+    advanced = commands.add_parser("advanced", help="Expert and format-engineering commands")
+    advanced_commands = advanced.add_subparsers(dest="advanced_command", required=True)
+    advanced_convert = advanced_commands.add_parser(
+        "convert",
+        help="Convert MoTeC LD with all expert controls",
+    )
+    advanced_convert.add_argument("input", help="Input MoTeC .ld path")
+    advanced_convert.add_argument("-o", "--output", required=True)
+    target = advanced_convert.add_mutually_exclusive_group(required=True)
+    target.add_argument("--template", help="Valid target-car and target-track BLAP/OLAP")
+    target.add_argument(
+        "--profile",
+        "--target-profile",
+        dest="target_profile",
+        help="Reusable profile created by 'ghost-car profile create'",
+    )
+    advanced_convert.add_argument("--template-body-offset", type=parse_int)
+    _add_motec_options(advanced_convert)
+    _add_ibt_alignment_options(advanced_convert)
+    _add_iracing_conversion_options(advanced_convert)
+    advanced_convert.set_defaults(handler=_handle_ld_to_iracing)
+
+    encode = advanced_commands.add_parser(
+        "encode",
+        help="Encode Canonical JSON to BLAP/OLAP",
+    )
     encode.add_argument("input", help="Input Canonical JSON path")
     encode.add_argument("-o", "--output", required=True, help="Output .blap/.olap path")
     encode.add_argument("--template", help="Prefix template when JSON omits its prefix")
@@ -684,67 +800,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Raw clutch byte in flags bits 16..23; other names are legacy aliases",
     )
     encode.set_defaults(handler=_handle_iracing_encode)
-
-    profile = iracing_commands.add_parser(
-        "profile",
-        help="Create a reusable target profile from a valid BLAP/OLAP",
-    )
-    profile.add_argument("input", help="Valid target-car and target-track BLAP/OLAP")
-    profile.add_argument("-o", "--output", required=True, help="Output profile JSON")
-    profile.add_argument(
-        "--reference-lap",
-        action="append",
-        default=[],
-        help=(
-            "Additional same-layout BLAP/OLAP used to average the inferred "
-            "track spline; repeat as needed"
-        ),
-    )
-    profile.add_argument(
-        "--reference-heading-smoothing-distance-m",
-        type=float,
-        default=8.0,
-    )
-    profile.add_argument(
-        "--no-reference-loop-closure",
-        action="store_false",
-        dest="reference_loop_closure",
-        help="Do not distribute inferred reference-spline closure error",
-    )
-    profile.set_defaults(reference_loop_closure=True)
-    profile.add_argument(
-        "--max-reference-track-length-difference-m",
-        type=float,
-        default=0.01,
-        help="Maximum allowed track-length difference for an additional lap",
-    )
-    profile.add_argument("--body-offset", type=parse_int)
-    profile.add_argument("--indent", type=int, default=2)
-    profile.set_defaults(handler=_handle_iracing_profile)
-
-    convert = domains.add_parser("convert", help="Convert between ghost-car formats")
-    conversions = convert.add_subparsers(dest="conversion", required=True)
-
-    ld_to_iracing = conversions.add_parser(
-        "ld-to-iracing",
-        help="Convert MoTeC LD telemetry to BLAP/OLAP or JSON",
-    )
-    ld_to_iracing.add_argument("input", help="Input MoTeC .ld path")
-    ld_to_iracing.add_argument("-o", "--output", required=True)
-    target = ld_to_iracing.add_mutually_exclusive_group(required=True)
-    target.add_argument(
-        "--template",
-        help="Valid target-car and target-track BLAP/OLAP",
-    )
-    target.add_argument(
-        "--target-profile",
-        help="Reusable profile created by 'ghost-car iracing profile'",
-    )
-    ld_to_iracing.add_argument("--template-body-offset", type=parse_int)
-    _add_motec_options(ld_to_iracing)
-    _add_ibt_alignment_options(ld_to_iracing)
-    _add_iracing_conversion_options(ld_to_iracing)
-    ld_to_iracing.set_defaults(handler=_handle_ld_to_iracing)
 
     return parser
 
