@@ -1,4 +1,4 @@
-# Ghost Car
+# GhostCarGenerator
 
 Ghost Car is a Python package and CLI for iRacing BLAP/OLAP files.
 It supports lossless binary-to-JSON round trips and conversion of MoTeC LD
