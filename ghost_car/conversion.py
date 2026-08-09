@@ -160,11 +160,15 @@ def build_canonical_blap(
     gear_thresholds_kph: Sequence[float] = (),
     default_brake: float = 0.0,
     default_throttle: float = 0.0,
-    system_raw: int = 0xFF,
+    clutch_raw: int = 0xFF,
     brake_light_threshold: int = 10,
     yaw_offset_deg: float = 0.0,
     pitch_offset_deg: float = 0.0,
     roll_offset_deg: float = 0.0,
+    distance_map: Optional[Dict[str, Sequence[float]]] = None,
+    lateral_offset_source: str = "auto",
+    apply_alignment_rotation: bool = True,
+    sector_boundary_source: str = "generated",
 ) -> Dict[str, Any]:
     if yaw_source not in ("tangent", "input", "template"):
         raise ValueError("Yaw source must be tangent, input, or template")
@@ -172,6 +176,12 @@ def build_canonical_blap(
         raise ValueError("Pitch source must be tangent, input, or template")
     if roll_source not in ("zero", "input", "template"):
         raise ValueError("Roll source must be zero, input, or template")
+    if lateral_offset_source not in ("auto", "alignment", "template", "zero"):
+        raise ValueError(
+            "Lateral-offset source must be auto, alignment, template, or zero"
+        )
+    if sector_boundary_source not in ("generated", "template", "zero"):
+        raise ValueError("Sector-boundary source must be generated, template, or zero")
     distances = cumulative_distances(points)
     raw_total = distances[-1]
     template_sectors = template.get("summary", {}).get("sectors", [])
@@ -196,14 +206,141 @@ def build_canonical_blap(
     track_length = sector_ends[-1] - track_start
     if track_length <= 0:
         raise ValueError("Template track length must be positive")
+    mapped_targets = None
+    mapped_sources = None
+    mapped_lateral_offsets = None
+    alignment_rotation_rad = 0.0
+    if distance_map is not None:
+        mapped_targets = [float(value) for value in distance_map["targetDistanceM"]]
+        mapped_sources = [float(value) for value in distance_map["sourceDistanceM"]]
+        if len(mapped_targets) != len(mapped_sources) or len(mapped_targets) < 2:
+            raise ValueError("Distance map arrays must have the same length >= 2")
+        if any(
+            current <= previous
+            for previous, current in zip(mapped_targets, mapped_targets[1:])
+        ):
+            raise ValueError("Distance-map target distances must be strictly increasing")
+        if any(
+            current <= previous
+            for previous, current in zip(mapped_sources, mapped_sources[1:])
+        ):
+            raise ValueError("Distance-map source distances must be strictly increasing")
+        tolerance = max(1e-6, track_length * 1e-6)
+        if abs(mapped_targets[0]) > tolerance or abs(mapped_targets[-1] - track_length) > tolerance:
+            raise ValueError("Distance-map target endpoints must span the template track")
+        if abs(mapped_sources[0]) > tolerance or abs(mapped_sources[-1] - raw_total) > tolerance:
+            raise ValueError("Distance-map source endpoints must span the input lap")
+        if "lateralOffsetM" in distance_map:
+            mapped_lateral_offsets = [
+                float(value) for value in distance_map["lateralOffsetM"]
+            ]
+            if len(mapped_lateral_offsets) != len(mapped_targets):
+                raise ValueError(
+                    "Distance-map lateral offsets must match its distance arrays"
+                )
+        if apply_alignment_rotation:
+            alignment_rotation_rad = math.radians(
+                float(distance_map.get("headingRotationDeg", 0.0))
+            )
+
+    def source_distance(target_distance: float) -> float:
+        relative_target = target_distance - track_start
+        if mapped_targets is None or mapped_sources is None:
+            return raw_total * (relative_target / track_length)
+        if relative_target <= mapped_targets[0]:
+            return mapped_sources[0]
+        if relative_target >= mapped_targets[-1]:
+            return mapped_sources[-1]
+        left = max(0, bisect.bisect_right(mapped_targets, relative_target) - 1)
+        right = min(len(mapped_targets) - 1, left + 1)
+        span = mapped_targets[right] - mapped_targets[left]
+        fraction = (
+            (relative_target - mapped_targets[left]) / span if span else 0.0
+        )
+        return mapped_sources[left] + fraction * (
+            mapped_sources[right] - mapped_sources[left]
+        )
+
     template_samples = template.get("samples", [])
+    template_distances = []
+    template_lateral_offsets = []
+    template_sample_index = 0
+    for sector in template_sectors:
+        start = float(sector["startDistanceM"])
+        end = float(sector["endDistanceM"])
+        bins = int(sector["numBins"])
+        for bin_index in range(bins):
+            fraction = bin_index / max(1, bins - 1)
+            distance = start + fraction * (end - start)
+            sample = (
+                template_samples[template_sample_index]
+                if template_sample_index < len(template_samples)
+                else {}
+            )
+            offset = float(
+                sample.get("lateralOffsetM", sample.get("deltaS", 0.0))
+            )
+            if template_distances and abs(distance - template_distances[-1]) <= 1e-6:
+                template_lateral_offsets[-1] = 0.5 * (
+                    template_lateral_offsets[-1] + offset
+                )
+            else:
+                template_distances.append(distance)
+                template_lateral_offsets.append(offset)
+            template_sample_index += 1
+
+    def interpolate_series(
+        grid: Sequence[float],
+        values: Sequence[float],
+        target: float,
+    ) -> float:
+        if target <= grid[0]:
+            return float(values[0])
+        if target >= grid[-1]:
+            return float(values[-1])
+        left = max(0, bisect.bisect_right(grid, target) - 1)
+        right = min(len(grid) - 1, left + 1)
+        span = grid[right] - grid[left]
+        fraction = (target - grid[left]) / span if span else 0.0
+        return float(values[left]) + fraction * (
+            float(values[right]) - float(values[left])
+        )
+
+    resolved_lateral_source = lateral_offset_source
+    if resolved_lateral_source == "auto":
+        resolved_lateral_source = (
+            "alignment" if mapped_lateral_offsets is not None else "template"
+        )
+    if resolved_lateral_source == "alignment" and mapped_lateral_offsets is None:
+        raise ValueError(
+            "Alignment lateral offsets require a fitted target-track reference"
+        )
+
+    def lateral_offset(target_distance: float) -> float:
+        if resolved_lateral_source == "zero":
+            return 0.0
+        if resolved_lateral_source == "alignment":
+            return interpolate_series(
+                mapped_targets,
+                mapped_lateral_offsets,
+                target_distance - track_start,
+            )
+        if not template_distances:
+            raise ValueError("Template has no samples for lateral-offset passthrough")
+        return interpolate_series(
+            template_distances,
+            template_lateral_offsets,
+            target_distance,
+        )
+
     sectors = []
     resampled_points = []
+    sample_target_distances = []
     sector_times = []
     previous_end = track_start
-    previous_raw_end = 0.0
+    previous_raw_end = source_distance(track_start)
     for index, (end, bins) in enumerate(zip(sector_ends, sector_bins)):
-        raw_end = raw_total * ((end - track_start) / track_length)
+        raw_end = source_distance(end)
         raw_start = previous_raw_end
         start_time = float(interpolate_point(points, distances, raw_start).get("timeS", 0.0))
         end_time = float(interpolate_point(points, distances, raw_end).get("timeS", 0.0))
@@ -211,9 +348,11 @@ def build_canonical_blap(
         local_points = []
         for bin_index in range(bins):
             fraction = bin_index / max(1, bins - 1)
-            raw_distance = raw_start + fraction * (raw_end - raw_start)
+            target_distance = previous_end + fraction * (end - previous_end)
+            raw_distance = source_distance(target_distance)
             point = interpolate_point(points, distances, raw_distance)
             local_points.append(point)
+            sample_target_distances.append(target_distance)
             times.append(float(point.get("timeS", 0.0)) - start_time)
         times = polynomial_smooth(times, smoothing_window, smoothing_order)
         if times:
@@ -235,8 +374,14 @@ def build_canonical_blap(
                 "sectorLengthM": end - previous_end,
                 "numBins": bins,
                 "sampleSpacingM": (end - previous_end) / max(1, bins - 1),
-                "unknownFloat1": template_sector.get("unknownFloat1", 0.0),
-                "unknownFloat2": template_sector.get("unknownFloat2", 0.0),
+                "startBoundaryVerticalOffsetM": template_sector.get(
+                    "startBoundaryVerticalOffsetM",
+                    template_sector.get("unknownFloat1", 0.0),
+                ),
+                "endBoundaryVerticalOffsetM": template_sector.get(
+                    "endBoundaryVerticalOffsetM",
+                    template_sector.get("unknownFloat2", 0.0),
+                ),
                 "sectorBestTimeS": end_time - start_time,
                 "recordFlags": template_sector.get("recordFlags", 0),
             }
@@ -262,6 +407,8 @@ def build_canonical_blap(
             yaw = float(point.get("headingRad", tangent["yaw"]))
         else:
             yaw = tangent["yaw"]
+        if yaw_source != "template":
+            yaw += alignment_rotation_rad
         if pitch_source == "template":
             pitch = float(reference.get("pitchRad", 0.0))
         elif pitch_source == "input":
@@ -275,13 +422,12 @@ def build_canonical_blap(
         else:
             roll = 0.0
         time_s = sector_times[index]
-        reference_time = float(reference.get("timeInSectorS", time_s))
         brake = _control_raw(point.get("brake", default_brake), control_scale)
         throttle = _control_raw(point.get("throttle", default_throttle), control_scale)
         gear = _gear_for_point(point, default_gear, gear_thresholds_kph)
         flags = (
             ((gear & 0xFF) << 24)
-            | ((int(system_raw) & 0xFF) << 16)
+            | ((int(clutch_raw) & 0xFF) << 16)
             | ((brake & 0xFF) << 8)
             | (throttle & 0xFF)
         )
@@ -293,20 +439,60 @@ def build_canonical_blap(
                 "globalBinIndex": index,
                 "sectorIndex": sector_index + 1,
                 "timeInSectorS": time_s,
-                "deltaS": time_s - reference_time,
+                "lateralOffsetM": lateral_offset(sample_target_distances[index]),
                 "yawRad": yaw,
                 "pitchRad": pitch,
                 "rollRad": roll,
                 "reserved": 0.0,
                 "flags": flags,
                 "gear": gear,
-                "systemRaw": int(system_raw) & 0xFF,
+                "clutchRaw": int(clutch_raw) & 0xFF,
                 "brakeRaw": brake,
                 "throttleRaw": throttle,
                 "brakeLightOn": brake > brake_light_threshold,
             }
         )
         sector_bin += 1
+
+    boundary_cross_slope = None
+    if sector_boundary_source == "zero":
+        for sector in sectors:
+            sector["startBoundaryVerticalOffsetM"] = 0.0
+            sector["endBoundaryVerticalOffsetM"] = 0.0
+    elif sector_boundary_source == "generated":
+        template_start_lateral = template_lateral_offsets[0]
+        template_end_lateral = template_lateral_offsets[-1]
+        template_start_vertical = float(
+            template_sectors[0].get(
+                "startBoundaryVerticalOffsetM",
+                template_sectors[0].get("unknownFloat1", 0.0),
+            )
+        )
+        template_end_vertical = float(
+            template_sectors[-1].get(
+                "endBoundaryVerticalOffsetM",
+                template_sectors[-1].get("unknownFloat2", 0.0),
+            )
+        )
+        denominator = (
+            template_start_lateral * template_start_lateral
+            + template_end_lateral * template_end_lateral
+        )
+        if denominator <= 1e-12:
+            raise ValueError(
+                "Target profile cannot identify its start/finish cross-slope; "
+                "use --sector-boundary-source template or zero"
+            )
+        boundary_cross_slope = (
+            template_start_lateral * template_start_vertical
+            + template_end_lateral * template_end_vertical
+        ) / denominator
+        sectors[0]["startBoundaryVerticalOffsetM"] = (
+            boundary_cross_slope * float(samples[0]["lateralOffsetM"])
+        )
+        sectors[-1]["endBoundaryVerticalOffsetM"] = (
+            boundary_cross_slope * float(samples[-1]["lateralOffsetM"])
+        )
 
     header = dict(template.get("header", {}))
     if header_overrides:
@@ -319,11 +505,20 @@ def build_canonical_blap(
         "header": header,
         "summary": {
             "bestLapS": last_time - first_time,
-            "tableTypeCount": template.get("summary", {}).get("tableTypeCount", 0),
+            "tableVersionCandidate": template.get("summary", {}).get(
+                "tableVersionCandidate",
+                template.get("summary", {}).get("tableTypeCount", 0),
+            ),
             "sectorCount": len(sectors),
             "totalTrackLengthM": sector_ends[-1],
             "totalBins": len(samples),
             "sectors": sectors,
+            "boundaryCrossSlope": boundary_cross_slope,
+            "boundaryCrossSlopeDeg": (
+                math.degrees(math.atan(boundary_cross_slope))
+                if boundary_cross_slope is not None
+                else None
+            ),
         },
         "samples": samples,
         "binary": dict(template.get("binary", {})),

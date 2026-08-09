@@ -59,7 +59,7 @@ def parse_sectors(raw: bytes, count: int) -> List[Dict[str, Any]]:
     for index in range(count):
         offset = TABLE_RECORDS + index * TABLE_RECORD_SIZE
         values = struct.unpack_from("<ffIffffI", raw, offset)
-        start, end, bins, spacing, unknown_1, unknown_2, best_time, flags = values
+        start, end, bins, spacing, boundary_start, boundary_end, best_time, flags = values
         result.append(
             {
                 "sectorIndex": index + 1,
@@ -68,8 +68,8 @@ def parse_sectors(raw: bytes, count: int) -> List[Dict[str, Any]]:
                 "sectorLengthM": end - start,
                 "numBins": bins,
                 "sampleSpacingM": spacing,
-                "unknownFloat1": unknown_1,
-                "unknownFloat2": unknown_2,
+                "startBoundaryVerticalOffsetM": boundary_start,
+                "endBoundaryVerticalOffsetM": boundary_end,
                 "sectorBestTimeS": best_time,
                 "recordFlags": flags,
             }
@@ -94,7 +94,9 @@ def parse_blap(
     bin_in_sector = 0
     for index in range(total_bins):
         offset = body_offset + index * SAMPLE_SIZE
-        time_s, delta_s, yaw, pitch, roll, reserved, flags = SAMPLE.unpack_from(raw, offset)
+        time_s, lateral_offset_m, yaw, pitch, roll, reserved, flags = SAMPLE.unpack_from(
+            raw, offset
+        )
         while (
             sector_index + 1 < len(sectors)
             and bin_in_sector >= sectors[sector_index]["numBins"]
@@ -112,14 +114,14 @@ def parse_blap(
                 "globalBinIndex": index,
                 "sectorIndex": sector_index + 1 if sectors else 0,
                 "timeInSectorS": time_s,
-                "deltaS": delta_s,
+                "lateralOffsetM": lateral_offset_m,
                 "yawRad": yaw,
                 "pitchRad": pitch,
                 "rollRad": roll,
                 "reserved": reserved,
                 "flags": flags,
                 "gear": (flags >> 24) & 0xFF,
-                "systemRaw": (flags >> 16) & 0xFF,
+                "clutchRaw": (flags >> 16) & 0xFF,
                 "brakeRaw": brake_raw,
                 "throttleRaw": flags & 0xFF,
                 "brakeLightOn": brake_raw > brake_light_threshold,
@@ -145,7 +147,9 @@ def parse_blap(
         },
         "summary": {
             "bestLapS": struct.unpack_from("<f", raw, TABLE_HEADER + 4)[0],
-            "tableTypeCount": struct.unpack_from("<I", raw, TABLE_HEADER + 8)[0],
+            "tableVersionCandidate": struct.unpack_from(
+                "<I", raw, TABLE_HEADER + 8
+            )[0],
             "sectorCount": record_count,
             "totalTrackLengthM": sectors[-1]["endDistanceM"] if sectors else 0.0,
             "totalBins": total_bins,
@@ -213,8 +217,14 @@ def patch_summary(prefix: bytearray, summary: Dict[str, Any]) -> None:
         number = float(summary["bestLapS"])
         if struct.unpack_from("<f", prefix, TABLE_HEADER + 4)[0] != number:
             struct.pack_into("<f", prefix, TABLE_HEADER + 4, number)
-    if "tableTypeCount" in summary:
-        number = int(summary["tableTypeCount"])
+    table_value = value(
+        summary,
+        "tableVersionCandidate",
+        "table_version_candidate",
+        "tableTypeCount",
+    )
+    if table_value is not None:
+        number = int(table_value)
         if struct.unpack_from("<I", prefix, TABLE_HEADER + 8)[0] != number:
             struct.pack_into("<I", prefix, TABLE_HEADER + 8, number)
     if sectors is None:
@@ -238,8 +248,24 @@ def patch_summary(prefix: bytearray, summary: Dict[str, Any]) -> None:
                     default=(end - start) / max(1, bins - 1),
                 )
             ),
-            float(value(sector, "unknownFloat1", default=current[4])),
-            float(value(sector, "unknownFloat2", default=current[5])),
+            float(
+                value(
+                    sector,
+                    "startBoundaryVerticalOffsetM",
+                    "start_boundary_vertical_offset_m",
+                    "unknownFloat1",
+                    default=current[4],
+                )
+            ),
+            float(
+                value(
+                    sector,
+                    "endBoundaryVerticalOffsetM",
+                    "end_boundary_vertical_offset_m",
+                    "unknownFloat2",
+                    default=current[5],
+                )
+            ),
             float(
                 value(
                     sector,
@@ -288,8 +314,11 @@ def pack_blap(
     data: Dict[str, Any],
     template_path: Optional[Union[str, os.PathLike]] = None,
     body_offset: Optional[int] = None,
-    default_system_raw: int = 0xFF,
+    default_clutch_raw: int = 0xFF,
+    default_system_raw: Optional[int] = None,
 ) -> bytes:
+    if default_system_raw is not None:
+        default_clutch_raw = int(default_system_raw)
     prefix, resolved = get_prefix(data, template_path, body_offset)
     patch_header(prefix, data.get("header", {}))
     patch_summary(prefix, data.get("summary", {}))
@@ -310,19 +339,38 @@ def pack_blap(
         flags = sample.get("flags")
         if flags is None:
             gear = int(value(sample, "gear", default=0)) & 0xFF
-            system = int(
-                value(sample, "systemRaw", "system_raw", default=default_system_raw)
+            clutch = int(
+                value(
+                    sample,
+                    "clutchRaw",
+                    "clutch_raw",
+                    "auxiliaryRaw",
+                    "auxiliary_raw",
+                    "systemRaw",
+                    "system_raw",
+                    default=default_clutch_raw,
+                )
             ) & 0xFF
             brake = int(value(sample, "brakeRaw", "brake_raw", default=0)) & 0xFF
             throttle = int(
                 value(sample, "throttleRaw", "throttle_raw", default=0)
             ) & 0xFF
-            flags = (gear << 24) | (system << 16) | (brake << 8) | throttle
+            flags = (gear << 24) | (clutch << 16) | (brake << 8) | throttle
         SAMPLE.pack_into(
             body,
             index * SAMPLE_SIZE,
             float(value(sample, "timeInSectorS", "time_in_sector_s", default=0.0)),
-            float(value(sample, "deltaS", "delta_s", default=0.0)),
+            float(
+                value(
+                    sample,
+                    "lateralOffsetM",
+                    "lateral_offset_m",
+                    # Backward compatibility for JSON decoded by ghost-car <= 0.1.0.
+                    "deltaS",
+                    "delta_s",
+                    default=0.0,
+                )
+            ),
             float(value(sample, "yawRad", "yaw_rad", default=0.0)),
             float(value(sample, "pitchRad", "pitch_rad", default=0.0)),
             float(value(sample, "rollRad", "roll_rad", default=0.0)),

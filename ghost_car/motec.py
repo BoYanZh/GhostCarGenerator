@@ -13,6 +13,9 @@ CHANNEL_ALIASES = {
     "latitude": ("GPS Latitude", "GPS_Lat", "Latitude", "Pos_Lat"),
     "longitude": ("GPS Longitude", "GPS_Long", "Longitude", "Pos_Long"),
     "altitude": ("GPS Altitude", "GPS_Alt", "Altitude", "Pos_Alt"),
+    "x": ("Position X", "Pos X"),
+    "y": ("Position Y", "Pos Y"),
+    "z": ("Position Z", "Pos Z"),
     "speed": ("Ground Speed", "GPS Speed", "Speed", "Veh_Speed"),
     "heading": ("GPS Heading", "Heading", "Yaw"),
     "pitch": ("Pitch", "GPS Pitch"),
@@ -133,16 +136,24 @@ def _load_ldx_lap_intervals(
             raise FileNotFoundError("LDX file not found: {}".format(candidate))
         return []
     root = ElementTree.parse(str(candidate)).getroot()
-    marker_times = []
+    preferred_marker_times = []
+    fallback_marker_times = []
     for group in root.findall(".//MarkerGroup"):
         if str(group.get("Name", "")).casefold() != "beacons":
             continue
         for marker in group.findall("Marker"):
-            if str(marker.get("Name", "")).casefold() != "start/finish":
-                continue
             value = marker.get("Time")
-            if value is not None:
-                marker_times.append(float(value) / time_scale)
+            if value is None:
+                continue
+            marker_time = float(value) / time_scale
+            fallback_marker_times.append(marker_time)
+            if str(marker.get("Name", "")).casefold() == "start/finish":
+                preferred_marker_times.append(marker_time)
+    marker_times = (
+        preferred_marker_times
+        if len(preferred_marker_times) >= 2
+        else fallback_marker_times
+    )
     marker_times = sorted(set(marker_times))
     return [
         {
@@ -214,9 +225,24 @@ def extract_motec_points(
     }
     latitude = _channel_data(selected_channels["latitude"])
     longitude = _channel_data(selected_channels["longitude"])
-    if latitude is None or longitude is None:
-        raise ValueError("MoTeC log does not contain configured latitude/longitude channels")
-    sample_count = min(len(latitude), len(longitude))
+    cartesian_x = _channel_data(selected_channels["x"])
+    cartesian_y = _channel_data(selected_channels["y"])
+    cartesian_z = _channel_data(selected_channels["z"])
+    uses_geodetic = latitude is not None and longitude is not None
+    uses_cartesian = cartesian_x is not None and cartesian_y is not None
+    if not uses_geodetic and not uses_cartesian:
+        raise ValueError(
+            "MoTeC log requires latitude/longitude or configured x/y position channels"
+        )
+    if uses_geodetic:
+        sample_count = min(len(latitude), len(longitude))
+        position_frequency_channel = selected_channels["latitude"]
+    else:
+        coordinate_series = [cartesian_x, cartesian_y]
+        if cartesian_z is not None:
+            coordinate_series.append(cartesian_z)
+        sample_count = min(len(series) for series in coordinate_series)
+        position_frequency_channel = selected_channels["x"]
     if earth_radius_m <= 0:
         raise ValueError("Earth radius must be positive")
     if not 0.0 < min_lap_distance_ratio <= 1.0:
@@ -228,19 +254,29 @@ def extract_motec_points(
     gps_steps = []
     for previous in range(sample_count - 1):
         current = previous + 1
-        mean_latitude = math.radians(
-            (float(latitude[previous]) + float(latitude[current])) * 0.5
-        )
-        dx = (
-            math.radians(float(longitude[current]) - float(longitude[previous]))
-            * earth_radius_m
-            * math.cos(mean_latitude)
-        )
-        dy = (
-            math.radians(float(latitude[current]) - float(latitude[previous]))
-            * earth_radius_m
-        )
-        gps_steps.append(math.hypot(dx, dy))
+        if uses_geodetic:
+            mean_latitude = math.radians(
+                (float(latitude[previous]) + float(latitude[current])) * 0.5
+            )
+            dx = (
+                math.radians(float(longitude[current]) - float(longitude[previous]))
+                * earth_radius_m
+                * math.cos(mean_latitude)
+            )
+            dy = (
+                math.radians(float(latitude[current]) - float(latitude[previous]))
+                * earth_radius_m
+            )
+            gps_steps.append(math.hypot(dx, dy))
+        else:
+            dx = float(cartesian_x[current]) - float(cartesian_x[previous])
+            dy = float(cartesian_y[current]) - float(cartesian_y[previous])
+            dz = (
+                float(cartesian_z[current]) - float(cartesian_z[previous])
+                if cartesian_z is not None
+                else 0.0
+            )
+            gps_steps.append(math.sqrt(dx * dx + dy * dy + dz * dz))
     positive_steps = [distance for distance in gps_steps if distance > 0]
     automatic_step_limit = (
         statistics.median(positive_steps) * gps_step_outlier_factor
@@ -248,9 +284,9 @@ def extract_motec_points(
         else float("inf")
     )
     step_limit = max_gps_step_m if max_gps_step_m is not None else automatic_step_limit
-    frequency = float(getattr(selected_channels["latitude"], "freq", 0.0))
+    frequency = float(getattr(position_frequency_channel, "freq", 0.0))
     if frequency <= 0:
-        raise ValueError("Latitude channel frequency must be positive")
+        raise ValueError("Position channel frequency must be positive")
     time_step = 1.0 / frequency
     lap_values = _channel_data(selected_channels["lap"])
     running_time = _channel_data(selected_channels["time"])
@@ -258,7 +294,7 @@ def extract_motec_points(
     selected_lap = None
     selection_source = "all"
     ldx_interval = None
-    if target_lap is None and lap_selection != "all" and running_time is not None:
+    if lap_selection != "all":
         intervals = _load_ldx_lap_intervals(
             ld_path,
             ldx_path,
@@ -271,11 +307,18 @@ def extract_motec_points(
             if min_lap_seconds <= interval["durationS"] <= max_lap_seconds
         ]
         if valid_intervals:
-            ldx_interval = (
-                min(valid_intervals, key=lambda item: item["durationS"])
-                if lap_selection == "fastest"
-                else valid_intervals[0]
-            )
+            if target_lap is not None:
+                ldx_interval = next(
+                    (item for item in valid_intervals if int(item["lap"]) == target_lap),
+                    None,
+                )
+            else:
+                ldx_interval = (
+                    min(valid_intervals, key=lambda item: item["durationS"])
+                    if lap_selection == "fastest"
+                    else valid_intervals[0]
+                )
+        if ldx_interval is not None:
             selected_lap = int(ldx_interval["lap"])
             selection_source = "ldx"
     if ldx_interval is None and lap_values is not None and len(lap_values) >= sample_count:
@@ -310,9 +353,12 @@ def extract_motec_points(
             indices = [index for index in indices if int(lap_values[index]) == selected_lap]
     descriptors = []
     if ldx_interval is not None:
-        if len(running_time) < sample_count:
-            raise ValueError("Running-time channel is shorter than GPS channels")
-        times = [float(value) for value in running_time[:sample_count]]
+        if running_time is None:
+            times = [index * time_step for index in range(sample_count)]
+        else:
+            if len(running_time) < sample_count:
+                raise ValueError("Running-time channel is shorter than position channels")
+            times = [float(value) for value in running_time[:sample_count]]
         if any(current < previous for previous, current in zip(times, times[1:])):
             raise ValueError("Running-time channel must be monotonic for LDX selection")
         start_time = float(ldx_interval["startS"])
@@ -345,28 +391,47 @@ def extract_motec_points(
     brake = _channel_data(selected_channels["brake"])
     throttle = _channel_data(selected_channels["throttle"])
     first_descriptor = descriptors[0]
-    first_latitude = float(_sample_series(latitude, first_descriptor, 0.0))
-    first_longitude = float(_sample_series(longitude, first_descriptor, 0.0))
-    lat0 = first_latitude if origin_latitude is None else origin_latitude
-    lon0 = first_longitude if origin_longitude is None else origin_longitude
-    first_altitude = float(_sample_series(altitude, first_descriptor, 0.0))
-    alt0 = first_altitude if origin_altitude is None else origin_altitude
-    cos_latitude = math.cos(math.radians(lat0))
+    if uses_geodetic:
+        first_latitude = float(_sample_series(latitude, first_descriptor, 0.0))
+        first_longitude = float(_sample_series(longitude, first_descriptor, 0.0))
+        lat0 = first_latitude if origin_latitude is None else origin_latitude
+        lon0 = first_longitude if origin_longitude is None else origin_longitude
+        first_altitude = float(_sample_series(altitude, first_descriptor, 0.0))
+        alt0 = first_altitude if origin_altitude is None else origin_altitude
+        cos_latitude = math.cos(math.radians(lat0))
+        coordinate_origin = {
+            "latitudeDeg": float(lat0),
+            "longitudeDeg": float(lon0),
+            "altitudeM": float(alt0),
+        }
+    else:
+        x0 = float(_sample_series(cartesian_x, first_descriptor, 0.0))
+        y0 = float(_sample_series(cartesian_y, first_descriptor, 0.0))
+        z0 = float(_sample_series(cartesian_z, first_descriptor, 0.0))
+        coordinate_origin = {"xM": x0, "yM": y0, "zM": z0}
     detected_speed_unit = ""
     if speed is not None:
         detected_speed_unit = str(getattr(selected_channels["speed"], "unit", "") or "")
     selected_speed_unit = detected_speed_unit if speed_unit == "auto" else speed_unit
     points = []
     for descriptor in descriptors:
-        lat = float(_sample_series(latitude, descriptor, lat0))
-        lon = float(_sample_series(longitude, descriptor, lon0))
-        alt = float(_sample_series(altitude, descriptor, alt0))
+        if uses_geodetic:
+            lat = float(_sample_series(latitude, descriptor, lat0))
+            lon = float(_sample_series(longitude, descriptor, lon0))
+            alt = float(_sample_series(altitude, descriptor, alt0))
+            x_m = math.radians(lon - lon0) * earth_radius_m * cos_latitude
+            y_m = math.radians(lat - lat0) * earth_radius_m
+            z_m = alt - alt0
+        else:
+            x_m = float(_sample_series(cartesian_x, descriptor, x0)) - x0
+            y_m = float(_sample_series(cartesian_y, descriptor, y0)) - y0
+            z_m = float(_sample_series(cartesian_z, descriptor, z0)) - z0
         speed_value = _sample_series(speed, descriptor, 0.0)
         point = {
             "timeS": descriptor[3],
-            "xM": math.radians(lon - lon0) * earth_radius_m * cos_latitude,
-            "yM": math.radians(lat - lat0) * earth_radius_m,
-            "zM": alt - alt0,
+            "xM": x_m,
+            "yM": y_m,
+            "zM": z_m,
             "speedMS": _speed_to_mps(float(speed_value), selected_speed_unit)
             if speed is not None
             else 0.0,
@@ -390,11 +455,8 @@ def extract_motec_points(
         "selectionSource": selection_source,
         "lapTimeS": float(points[-1]["timeS"]),
         "frequencyHz": frequency,
-        "origin": {
-            "latitudeDeg": float(lat0),
-            "longitudeDeg": float(lon0),
-            "altitudeM": float(alt0),
-        },
+        "origin": coordinate_origin,
+        "coordinateSystem": "geodetic" if uses_geodetic else "cartesian",
         "metadata": {
             "driverName": _metadata_value(ld.head, "driver"),
             "carName": _metadata_value(ld.head, "vehicleid", "vehicle"),
