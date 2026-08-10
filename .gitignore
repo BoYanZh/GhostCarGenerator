@@ -24,6 +24,10 @@ analysis_report.md
 *.tmp
 *.log
 
+# Sanitized, vehicle-independent public track references
+!track_references/
+!track_references/*.json
+
 # OS generated files
 .DS_Store
 Thumbs.db

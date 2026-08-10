@@ -30,6 +30,7 @@ ghost-car
 │   └── create
 └── advanced
     ├── convert
+    ├── profile
     └── encode
 ~~~
 
@@ -41,6 +42,7 @@ ghost-car convert --help
 ghost-car inspect --help
 ghost-car profile create --help
 ghost-car advanced convert --help
+ghost-car advanced profile --help
 ghost-car advanced encode --help
 ~~~
 
@@ -88,9 +90,48 @@ ghost-car profile create target.blap `
 The primary input alone supplies the verified binary prefix, sector grid, and
 target car/track metadata. Additional laps affect only the averaged reference
 spline. Their track identifiers and lengths must match the primary layout.
+
+For a more accurate absolute reference spline, record two laps with deliberately
+different lines and save both the BLAP/OLAP and IBT from each lap:
+
+~~~powershell
+ghost-car profile create left.blap `
+  --matched-ibt left.ibt `
+  --matched-pair right.blap right.ibt `
+  -o target-profile.json
+~~~
+
+Each BLAP/IBT pair must describe the same lap. The CLI selects the complete IBT
+lap whose duration is closest to the BLAP best-lap time; use
+`--matched-ibt-lap` if the primary IBT is ambiguous. The two lines do not need
+to touch the track edges, but they should differ laterally by at least one metre
+over a useful part of the lap. Record both pairs on the same layout and simulator
+build, without moving or rewriting either source file.
+
+Matched reconstruction projects every IBT GPS path into one shared WGS84 local
+frame, then solves the common iRacing reference spline from the absolute paths
+and their BLAP lateral offsets. The output profile records fit residuals,
+available lateral separation, the shared GPS origin, and hashes of every source
+file. Expert separation, smoothing, lap-time, and residual limits are available
+through `ghost-car advanced profile`.
+
 The profile replaces a live template during later conversions. LD vehicle,
 venue, and driver strings are recorded as provenance but do not replace target
 metadata unless an explicit header override is supplied.
+
+### Public track-reference artifacts
+
+The repository may publish a sanitized track-reference artifact separately from
+a target profile. For example,
+`track_references/lagunaseca-2026.axis.json` contains only a local closed
+east/north axis, lap fraction, layout identifier, and track length. It contains
+no BLAP prefix, vehicle metadata, GPS origin, source-file hashes, or Formula Vee
+provenance, and is not itself an iRacing lapfile or target profile.
+
+The axis is layout-specific rather than vehicle-specific. A target profile still
+needs a valid target-car BLAP/OLAP prefix and should remain private unless its
+redistribution is permitted. Even a sanitized derived axis should be published
+only after checking the applicable simulator terms.
 
 ## MoTeC LD to iRacing
 
@@ -193,3 +234,27 @@ but it does store signed lateral position relative to an internal track spline.
 | `ldparser/` | MoTeC parser Git submodule |
 | `docs/` | Reverse-engineering notes and support boundaries |
 | `pyproject.toml` | Package metadata and console entry point |
+
+## Legal and usage notice
+
+GhostCarGenerator is an independent interoperability and research project. It
+is not affiliated with, authorized by, or endorsed by iRacing.com Motorsport
+Simulations, LLC. iRacing and other product names and trademarks belong to
+their respective owners.
+
+Use this software only with files and content you have lawfully obtained and
+only where permitted by applicable law and the agreements governing the
+relevant software. You are responsible for your use of the tool and for
+compliance with those agreements.
+
+This repository does not distribute iRacing BLAP/OLAP files, target profiles,
+opaque binary prefixes, vehicle or track assets, or other proprietary game
+data. Do not publish or redistribute those materials. A target profile can
+contain an opaque prefix copied from the source lap file and should be treated
+as private local data.
+
+The project does not bypass DRM or anti-cheat systems, inspect process memory,
+intercept network traffic, modify the iRacing client, or install files into it.
+It is not intended for cheating, competitive advantage, disruption, or use in
+official competition. No warranty is provided, including any warranty that a
+generated file will remain compatible with future software versions.
