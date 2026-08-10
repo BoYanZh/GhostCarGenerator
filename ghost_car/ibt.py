@@ -11,6 +11,7 @@ __all__ = [
 
 import math
 import mmap
+import numpy as np
 import struct
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -24,16 +25,6 @@ _IBT_TYPES = {
     4: "<f4",
     5: "<f8",
 }
-
-
-def _numpy():
-    try:
-        import numpy
-    except ImportError as error:
-        raise ImportError(
-            "Ghost Car requires NumPy; reinstall the package dependencies"
-        ) from error
-    return numpy
 
 
 def _yaml_value(text: str, key: str) -> str:
@@ -56,7 +47,6 @@ def load_ibt_reference(
     max_lap_time_difference_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Load one complete IBT lap as a local east/north GPS path."""
-    np = _numpy()
     if lap_selection not in ("fastest", "first"):
         raise ValueError("IBT lap selection must be fastest or first")
     if target_lap is not None and target_lap <= 0:
@@ -249,7 +239,6 @@ def load_ibt_reference(
 
 
 def _cumulative_distances(points: Sequence[Dict[str, Any]]):
-    np = _numpy()
     xyz = np.asarray(
         [
             [
@@ -267,7 +256,6 @@ def _cumulative_distances(points: Sequence[Dict[str, Any]]):
 
 
 def _fit_similarity(source, target, allow_scale: bool):
-    np = _numpy()
     source_mean = np.mean(source, axis=0)
     target_mean = np.mean(target, axis=0)
     centered_source = source - source_mean
@@ -288,7 +276,6 @@ def _fit_similarity(source, target, allow_scale: bool):
 
 
 def _project_polyline(queries, path, chunk_size: int = 128):
-    np = _numpy()
     starts = path[:-1]
     vectors = path[1:] - starts
     lengths_squared = np.sum(vectors * vectors, axis=1)
@@ -321,7 +308,6 @@ def _project_polyline(queries, path, chunk_size: int = 128):
 
 
 def _moving_average(values, window: int):
-    np = _numpy()
     if window <= 1:
         return values.copy()
     if window % 2 == 0:
@@ -332,7 +318,6 @@ def _moving_average(values, window: int):
 
 
 def _isotonic(values, endpoint_weight: float):
-    np = _numpy()
     blocks = []
     for index, value in enumerate(values):
         weight = endpoint_weight if index in (0, len(values) - 1) else 1.0
@@ -365,7 +350,6 @@ def build_blap_track_reference(
     that term from an official lap gives a track-relative spline that can be
     used to project an external path into BLAP coordinates.
     """
-    np = _numpy()
     if heading_smoothing_distance_m < 0:
         raise ValueError("Reference-heading smoothing distance cannot be negative")
     sectors = template.get("summary", {}).get("sectors", [])
@@ -451,7 +435,6 @@ def average_track_references(
     references: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Average compatible inferred splines to reduce per-lap yaw/slip bias."""
-    np = _numpy()
     if not references:
         raise ValueError("At least one track reference is required")
     if len(references) == 1:
@@ -488,7 +471,6 @@ def average_track_references(
 
 
 def _periodic_interp(target, source_fraction, source_values):
-    np = _numpy()
     fraction = np.mod(
         np.asarray(source_fraction, dtype=np.float64),
         1.0,
@@ -524,7 +506,6 @@ def _periodic_interp(target, source_fraction, source_values):
 
 
 def _circular_moving_average(values, window: int):
-    np = _numpy()
     array = np.asarray(values, dtype=np.float64)
     if window <= 1:
         return array.copy()
@@ -538,7 +519,6 @@ def _circular_moving_average(values, window: int):
 
 
 def _geodetic_to_enu(latitude, longitude, altitude, origin):
-    np = _numpy()
     semi_major = 6378137.0
     flattening = 1.0 / 298.257223563
     eccentricity_squared = flattening * (2.0 - flattening)
@@ -595,7 +575,6 @@ def _geodetic_to_enu(latitude, longitude, altitude, origin):
 
 
 def _blap_lateral_series(template: Dict[str, Any]):
-    np = _numpy()
     sectors = template.get("summary", {}).get("sectors", [])
     samples = template.get("samples", [])
     expected = sum(int(sector["numBins"]) for sector in sectors)
@@ -658,7 +637,6 @@ def build_matched_blap_ibt_track_reference(
     max_iterations: int = 5,
 ) -> Dict[str, Any]:
     """Recover a shared spline from matched BLAP offsets and IBT GPS paths."""
-    np = _numpy()
     if len(pairs) < 2:
         raise ValueError("Matched reconstruction requires at least two BLAP/IBT pairs")
     if smoothing_distance_m < 0 or min_lateral_separation_m <= 0:
@@ -873,7 +851,6 @@ def fit_ibt_distance_map(
     lateral_smoothing_distance_m: float = 8.0,
 ) -> Dict[str, Any]:
     """Fit source distance and signed lateral offset to a reference path."""
-    np = _numpy()
     if len(points) < 2:
         raise ValueError("At least two source points are required for IBT alignment")
     if target_track_length_m <= 0 or sample_spacing_m <= 0:
@@ -1053,7 +1030,6 @@ def combine_alignment_maps(
     lateral: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Use one fit for distance correspondence and another for BLAP offset."""
-    np = _numpy()
     source = np.asarray(longitudinal["sourceDistanceM"], dtype=np.float64)
     lateral_source = np.asarray(lateral["sourceDistanceM"], dtype=np.float64)
     lateral_value = np.asarray(lateral["lateralOffsetM"], dtype=np.float64)
