@@ -1,5 +1,7 @@
 """MoTeC LD loading isolated from the optional ldparser dependency."""
 
+__all__ = ["parse_channel_overrides", "extract_motec_points"]
+
 import bisect
 import importlib.util
 import math

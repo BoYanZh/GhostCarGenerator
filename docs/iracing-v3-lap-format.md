@@ -50,6 +50,31 @@ its distance map and the BLAP-spline lateral map are combined by source
 distance; target distance is not a valid join key between independently fitted
 maps.
 
+When the BLAP and IBT record the same lap, the IBT GPS path supplies the absolute
+driven position `R_j(s)` and the BLAP supplies its signed lateral offset
+`d_j(s)`. For a common reference spline `C(s)` and its unit left normal `N(s)`:
+
+~~~text
+R_j(s) = C(s) + d_j(s) N(s)
+~~~
+
+With two laterally distinct matched pairs, the pointwise unconstrained solution
+is:
+
+~~~text
+N(s) = (R_1(s) - R_2(s)) / (d_1(s) - d_2(s))
+C(s) = (d_1(s) R_2(s) - d_2(s) R_1(s)) / (d_1(s) - d_2(s))
+~~~
+
+The denominator becomes poorly conditioned where the two laps use nearly the
+same line. ghost-car therefore projects all IBT latitude/longitude/altitude
+samples into one shared WGS84 ENU frame, fits `R` against `d` across all pairs,
+uses only sufficiently separated regions to establish normal direction, and
+enforces a smooth closed spline whose normal is perpendicular to its tangent.
+The two laps need not be the extreme left and right track edges; any meaningful
+line separation is usable. More than two matched pairs make the least-squares
+fit overdetermined and improve its diagnostics.
+
 For a closed lap, distance-map correction must also be continuous at the
 start/finish boundary. Anchoring only the final sample to zero creates an
 artificial local distance stretch and therefore a speed spike because BLAP

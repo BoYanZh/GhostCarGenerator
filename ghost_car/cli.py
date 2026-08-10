@@ -12,6 +12,7 @@ from .conversion import build_canonical_blap
 from .ibt import (
     average_track_references,
     build_blap_track_reference,
+    build_matched_blap_ibt_track_reference,
     combine_alignment_maps,
     fit_ibt_distance_map,
     load_ibt_reference,
@@ -253,6 +254,112 @@ def _set_ld_to_iracing_defaults(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_profile_inputs(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("input", help="Valid target-car and target-track BLAP/OLAP")
+    parser.add_argument("-o", "--output", required=True, help="Output profile JSON")
+    parser.add_argument(
+        "--reference-lap",
+        action="append",
+        default=[],
+        help=(
+            "Additional same-layout BLAP/OLAP used to average the inferred "
+            "track spline; repeat as needed"
+        ),
+    )
+    parser.add_argument(
+        "--matched-ibt",
+        help="IBT containing the same lap as the primary BLAP/OLAP",
+    )
+    parser.add_argument(
+        "--matched-pair",
+        action="append",
+        nargs=2,
+        default=[],
+        metavar=("BLAP", "IBT"),
+        help="Additional matched BLAP/OLAP and IBT pair; repeat as needed",
+    )
+    parser.add_argument(
+        "--matched-ibt-lap",
+        type=int,
+        help="Complete IBT lap ordinal for the primary matched pair",
+    )
+
+
+def _add_profile_tuning_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--matched-max-lap-time-difference-s",
+        type=float,
+        default=0.25,
+        help="Maximum BLAP-to-IBT lap-time difference",
+    )
+    parser.add_argument(
+        "--matched-ibt-min-lap-seconds",
+        type=float,
+        default=60.0,
+    )
+    parser.add_argument(
+        "--matched-ibt-max-lap-seconds",
+        type=float,
+        default=300.0,
+    )
+    parser.add_argument(
+        "--matched-smoothing-distance-m",
+        type=float,
+        default=8.0,
+    )
+    parser.add_argument(
+        "--matched-min-lateral-separation-m",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--matched-min-usable-fraction",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--matched-max-iterations",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--matched-max-fit-rmse-m",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--matched-max-fit-p95-m",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--reference-heading-smoothing-distance-m",
+        type=float,
+        default=8.0,
+    )
+    parser.add_argument(
+        "--no-reference-loop-closure",
+        action="store_false",
+        dest="reference_loop_closure",
+        help="Do not distribute inferred reference-spline closure error",
+    )
+    parser.set_defaults(reference_loop_closure=True)
+    parser.add_argument(
+        "--max-reference-track-length-difference-m",
+        type=float,
+        default=0.01,
+        help="Maximum allowed track-length difference for an additional lap",
+    )
+    parser.add_argument("--body-offset", type=parse_int)
+    parser.add_argument("--indent", type=int, default=2)
+
+
+def _set_profile_tuning_defaults(parser: argparse.ArgumentParser) -> None:
+    expert = argparse.ArgumentParser(add_help=False)
+    _add_profile_tuning_options(expert)
+    parser.set_defaults(**vars(expert.parse_args([])))
+
+
 def _extract_motec(
     args: argparse.Namespace,
     profile_origin: Optional[Dict[str, float]] = None,
@@ -394,6 +501,8 @@ def _validate_alignment(
 
 
 def _handle_iracing_profile(args: argparse.Namespace) -> None:
+    if args.matched_ibt_lap is not None and not args.matched_ibt:
+        raise ValueError("--matched-ibt-lap requires --matched-ibt")
     if args.max_reference_track_length_difference_m < 0:
         raise ValueError(
             "Maximum reference track-length difference cannot be negative"
@@ -411,17 +520,13 @@ def _handle_iracing_profile(args: argparse.Namespace) -> None:
     primary_track_length = float(primary_sectors[-1]["endDistanceM"]) - float(
         primary_sectors[0].get("startDistanceM", 0.0)
     )
-    reference_paths = [source_path] + [
-        Path(value).expanduser() for value in args.reference_lap
-    ]
-    references = []
-    reference_sources = []
     primary_track_name = template.get("header", {}).get("trackName", "")
-    for reference_path in reference_paths:
+
+    def load_reference_blap(reference_path: Path, primary: bool = False):
         reference_raw = reference_path.read_bytes()
         reference_template = (
             template
-            if reference_path == source_path
+            if primary
             else parse_blap(reference_raw, include_prefix=False)
         )
         reference_track_name = reference_template.get("header", {}).get(
@@ -451,22 +556,148 @@ def _handle_iracing_profile(args: argparse.Namespace) -> None:
                     args.max_reference_track_length_difference_m,
                 )
             )
-        references.append(
-            build_blap_track_reference(
-                reference_template,
-                heading_smoothing_distance_m=(
-                    args.reference_heading_smoothing_distance_m
+        return reference_raw, reference_template
+
+    matched_mode = bool(args.matched_ibt or args.matched_pair)
+    if matched_mode and not args.matched_ibt:
+        raise ValueError("--matched-ibt is required when --matched-pair is used")
+    if args.matched_ibt and not args.matched_pair:
+        raise ValueError(
+            "Matched reconstruction requires --matched-ibt and at least one "
+            "--matched-pair BLAP IBT"
+        )
+    if matched_mode and args.reference_lap:
+        raise ValueError(
+            "--reference-lap cannot be combined with matched BLAP/IBT reconstruction"
+        )
+
+    reference_sources = []
+    if matched_mode:
+        if args.matched_max_fit_rmse_m <= 0 or args.matched_max_fit_p95_m <= 0:
+            raise ValueError("Matched fit residual limits must be positive")
+        pair_specs = [
+            (source_path, Path(args.matched_ibt).expanduser(), args.matched_ibt_lap)
+        ] + [
+            (Path(blap_path).expanduser(), Path(ibt_path).expanduser(), None)
+            for blap_path, ibt_path in args.matched_pair
+        ]
+        matched_pairs = []
+        ibt_track_name = None
+        for pair_index, (blap_path, ibt_path, ibt_lap) in enumerate(pair_specs):
+            blap_raw, blap_template = load_reference_blap(
+                blap_path,
+                primary=pair_index == 0,
+            )
+            blap_lap_time = float(
+                blap_template.get("summary", {}).get("bestLapS", 0.0)
+            )
+            if blap_lap_time <= 0:
+                raise ValueError(
+                    "Matched BLAP {} has no valid best-lap time".format(blap_path)
+                )
+            ibt = load_ibt_reference(
+                str(ibt_path),
+                target_lap=ibt_lap,
+                min_lap_seconds=args.matched_ibt_min_lap_seconds,
+                max_lap_seconds=args.matched_ibt_max_lap_seconds,
+                target_lap_time_s=blap_lap_time,
+                max_lap_time_difference_s=(
+                    args.matched_max_lap_time_difference_s
                 ),
-                close_loop=args.reference_loop_closure,
+            )
+            current_ibt_track_name = ibt.get("metadata", {}).get("trackName", "")
+            if current_ibt_track_name:
+                if ibt_track_name is None:
+                    ibt_track_name = current_ibt_track_name
+                elif current_ibt_track_name != ibt_track_name:
+                    raise ValueError(
+                        "Matched IBT track {!r} does not match {!r}".format(
+                            current_ibt_track_name,
+                            ibt_track_name,
+                        )
+                    )
+            matched_pairs.append(
+                {
+                    "template": blap_template,
+                    "ibt": ibt,
+                }
+            )
+            ibt_raw = ibt_path.read_bytes()
+            reference_sources.append(
+                {
+                    "blapFileName": blap_path.name,
+                    "blapSha256": hashlib.sha256(blap_raw).hexdigest(),
+                    "blapLapTimeS": blap_lap_time,
+                    "ibtFileName": ibt_path.name,
+                    "ibtSha256": hashlib.sha256(ibt_raw).hexdigest(),
+                    "ibtSelectedLap": ibt["selectedLap"],
+                    "ibtLapTimeS": ibt["lapTimeS"],
+                    "lapTimeDifferenceS": abs(
+                        float(ibt["lapTimeS"]) - blap_lap_time
+                    ),
+                }
+            )
+        track_reference = build_matched_blap_ibt_track_reference(
+            matched_pairs,
+            smoothing_distance_m=args.matched_smoothing_distance_m,
+            min_lateral_separation_m=args.matched_min_lateral_separation_m,
+            min_usable_fraction=args.matched_min_usable_fraction,
+            max_track_length_difference_m=(
+                args.max_reference_track_length_difference_m
+            ),
+            max_iterations=args.matched_max_iterations,
+        )
+        diagnostics = track_reference["diagnostics"]
+        if (
+            diagnostics["fitRmseM"] > args.matched_max_fit_rmse_m
+            or diagnostics["fitP95M"] > args.matched_max_fit_p95_m
+        ):
+            raise ValueError(
+                "Matched reconstruction rejected: RMSE {:.3f}m (limit {:.3f}m), "
+                "p95 {:.3f}m (limit {:.3f}m)".format(
+                    diagnostics["fitRmseM"],
+                    args.matched_max_fit_rmse_m,
+                    diagnostics["fitP95M"],
+                    args.matched_max_fit_p95_m,
+                )
+            )
+        print(
+            "Matched reconstruction: {} pairs, usable {:.1%}, RMSE {:.3f}m, "
+            "p95 {:.3f}m, axis-length error {:+.3f}m".format(
+                diagnostics["pairCount"],
+                diagnostics["usableFraction"],
+                diagnostics["fitRmseM"],
+                diagnostics["fitP95M"],
+                diagnostics["axisLengthDifferenceM"],
             )
         )
-        reference_sources.append(
-            {
-                "fileName": reference_path.name,
-                "sha256": hashlib.sha256(reference_raw).hexdigest(),
-            }
-        )
-    track_reference = average_track_references(references)
+    else:
+        reference_paths = [source_path] + [
+            Path(value).expanduser() for value in args.reference_lap
+        ]
+        references = []
+        for reference_index, reference_path in enumerate(reference_paths):
+            reference_raw, reference_template = load_reference_blap(
+                reference_path,
+                primary=reference_index == 0,
+            )
+            references.append(
+                build_blap_track_reference(
+                    reference_template,
+                    heading_smoothing_distance_m=(
+                        args.reference_heading_smoothing_distance_m
+                    ),
+                    close_loop=args.reference_loop_closure,
+                )
+            )
+            reference_sources.append(
+                {
+                    "fileName": reference_path.name,
+                    "sha256": hashlib.sha256(reference_raw).hexdigest(),
+                }
+            )
+        track_reference = average_track_references(references)
+
     profile = {
         "format": _TARGET_PROFILE_FORMAT,
         "sourceSha256": hashlib.sha256(raw).hexdigest(),
@@ -723,37 +954,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "create",
         help="Create a target profile from a valid BLAP/OLAP",
     )
-    create_profile.add_argument("input", help="Valid target-car and target-track BLAP/OLAP")
-    create_profile.add_argument("-o", "--output", required=True, help="Output profile JSON")
-    create_profile.add_argument(
-        "--reference-lap",
-        action="append",
-        default=[],
-        help=(
-            "Additional same-layout BLAP/OLAP used to average the inferred "
-            "track spline; repeat as needed"
-        ),
-    )
-    create_profile.add_argument(
-        "--reference-heading-smoothing-distance-m",
-        type=float,
-        default=8.0,
-    )
-    create_profile.add_argument(
-        "--no-reference-loop-closure",
-        action="store_false",
-        dest="reference_loop_closure",
-        help="Do not distribute inferred reference-spline closure error",
-    )
-    create_profile.set_defaults(reference_loop_closure=True)
-    create_profile.add_argument(
-        "--max-reference-track-length-difference-m",
-        type=float,
-        default=0.01,
-        help="Maximum allowed track-length difference for an additional lap",
-    )
-    create_profile.add_argument("--body-offset", type=parse_int)
-    create_profile.add_argument("--indent", type=int, default=2)
+    _add_profile_inputs(create_profile)
+    _set_profile_tuning_defaults(create_profile)
     create_profile.set_defaults(handler=_handle_iracing_profile)
 
     advanced = commands.add_parser("advanced", help="Expert and format-engineering commands")
@@ -778,9 +980,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_iracing_conversion_options(advanced_convert)
     advanced_convert.set_defaults(handler=_handle_ld_to_iracing)
 
+    advanced_profile = advanced_commands.add_parser(
+        "profile",
+        help="Create a target profile with all expert controls",
+    )
+    _add_profile_inputs(advanced_profile)
+    _add_profile_tuning_options(advanced_profile)
+    advanced_profile.set_defaults(handler=_handle_iracing_profile)
+
     encode = advanced_commands.add_parser(
         "encode",
-        help="Encode Canonical JSON to BLAP/OLAP",
+        help=argparse.SUPPRESS,
     )
     encode.add_argument("input", help="Input Canonical JSON path")
     encode.add_argument("-o", "--output", required=True, help="Output .blap/.olap path")
@@ -800,6 +1010,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Raw clutch byte in flags bits 16..23; other names are legacy aliases",
     )
     encode.set_defaults(handler=_handle_iracing_encode)
+    advanced_commands._choices_actions[:] = [
+        action
+        for action in advanced_commands._choices_actions
+        if action.dest != "encode"
+    ]
+    advanced_commands.metavar = "{convert,profile}"
 
     return parser
 
