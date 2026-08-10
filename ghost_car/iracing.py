@@ -7,7 +7,7 @@ import math
 import os
 import struct
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 TABLE_HEADER = 0x5B0

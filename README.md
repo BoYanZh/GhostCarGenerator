@@ -30,8 +30,7 @@ ghost-car
 │   └── create
 └── advanced
     ├── convert
-    ├── profile
-    └── encode
+    └── profile
 ~~~
 
 The common workflow stays at the top level. Format-engineering and tuning
@@ -43,7 +42,6 @@ ghost-car inspect --help
 ghost-car profile create --help
 ghost-car advanced convert --help
 ghost-car advanced profile --help
-ghost-car advanced encode --help
 ~~~
 
 PowerShell uses the backtick character (ASCII 96) for line continuation. It must
@@ -57,6 +55,10 @@ line break.
 ghost-car inspect input.blap -o lap.json
 ghost-car advanced encode lap.json -o rebuilt.blap
 ~~~
+
+The low-level `advanced encode` compatibility command is intentionally hidden
+from normal command help; invoke it explicitly only when rebuilding a canonical
+JSON file.
 
 The canonical JSON retains the opaque binary prefix by default, enabling an
 exact round trip for observed iRacing v3 files. Use `--omit-prefix` when the

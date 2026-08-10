@@ -14,7 +14,7 @@ import mmap
 import numpy as np
 import struct
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 
 
 _IBT_TYPES = {
