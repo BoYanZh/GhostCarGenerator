@@ -30,7 +30,8 @@ ghost-car
 │   └── create
 └── advanced
     ├── convert
-    └── profile
+    ├── profile
+    └── constrain
 ~~~
 
 The common workflow stays at the top level. Format-engineering and tuning
@@ -42,6 +43,7 @@ ghost-car inspect --help
 ghost-car profile create --help
 ghost-car advanced convert --help
 ghost-car advanced profile --help
+ghost-car advanced constrain --help
 ~~~
 
 PowerShell uses the backtick character (ASCII 96) for line continuation. It must
@@ -223,6 +225,52 @@ options to control reference-lap selection and fitting. Absolute GPS is used
 only for longitudinal correspondence. BLAP/OLAP does not store absolute XYZ,
 but it does store signed lateral position relative to an internal track spline.
 
+## Constraining a lap within track-edge boundaries
+
+Real-world GPS laps can drift several metres sideways while keeping a
+plausible heading. When left/right edge reference laps are available for the
+same layout (for example, two deliberately wide laps recorded with a lighter
+car), their signed lateral offsets define the drivable corridor. The corridor
+command keeps a lap inside that corridor without distorting it:
+
+~~~powershell
+ghost-car advanced constrain telemetry.blap `
+  --left left-edge.blap `
+  --right right-edge.blap `
+  -o constrained.blap
+~~~
+
+`--mode translate` (default) shifts the whole lap by one constant lateral
+amount so the maximum excursion outside the corridor is minimized; the lap
+shape, yaw, timing, and controls are preserved exactly. This matches the
+typical GPS-drift error model: position drifts, heading does not.
+`--mode clamp` clips per-bin excursions and smooths the correction instead;
+use it only when the line shape itself needs local correction.
+`--tolerance-m` widens the corridor on both sides (1 m by default) because
+edge laps normally do not use the full curbs. All inputs must share the same
+track identifier and sector grid.
+
+## Keeping generated files recognizable by iRacing
+
+The BLAP header records the target car, track layout, and content build
+dates. A lap generated against one car's template is not necessarily
+recognized by iRacing for a different car, even when the layout matches.
+To keep a generated lap associated with a specific car, repack it with a
+native lap file of that car as the template:
+
+~~~powershell
+ghost-car advanced constrain telemetry.blap `
+  --left left-edge.blap `
+  --right right-edge.blap `
+  --template native-car.blap `
+  -o constrained.blap
+~~~
+
+The output then reuses the native lap's binary prefix and header (car, track,
+build dates, sector flags) while retaining the constrained lateral offsets.
+The same applies when any other command produces a lap whose header does not
+match the target vehicle.
+
 ## Package layout
 
 | Path | Responsibility |
@@ -231,6 +279,7 @@ but it does store signed lateral position relative to an internal track spline.
 | `ghost_car/iracing.py` | Lossless iRacing BLAP/OLAP codec |
 | `ghost_car/conversion.py` | Resampling, smoothing, pose, and control conversion |
 | `ghost_car/ibt.py` | Native IBT GPS parsing and least-squares/ICP path alignment |
+| `ghost_car/corridor.py` | Corridor-constrained lateral-offset correction |
 | `ghost_car/motec.py` | MoTeC loading, channel mapping, GPS cleanup, and lap selection |
 | `ghost_car/__main__.py` | `python -m ghost_car` entry point |
 | `ldparser/` | MoTeC parser Git submodule |

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import __version__
+from .corridor import constrain_blap, constraint_diagnostics_text
 from .iracing import pack_blap, parse_blap, parse_int
 from .conversion import build_canonical_blap
 from .ibt import (
@@ -908,6 +909,23 @@ def _handle_ld_to_iracing(args: argparse.Namespace) -> None:
     _write_iracing_result(args, canonical)
 
 
+def _handle_iracing_constrain(args: argparse.Namespace) -> None:
+    result = constrain_blap(
+        source_path=args.input,
+        left_path=args.left,
+        right_path=args.right,
+        mode=args.mode,
+        tolerance_m=args.tolerance_m,
+        smooth_bins=args.smooth_bins,
+        template_path=args.template,
+    )
+    output_path = Path(args.output).expanduser()
+    output_path.write_bytes(result["_raw"])
+    diagnostics = result["_diagnostics"]
+    print("Constrained {} -> {}".format(args.input, output_path))
+    print(constraint_diagnostics_text(diagnostics))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ghost-car",
@@ -988,6 +1006,46 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_tuning_options(advanced_profile)
     advanced_profile.set_defaults(handler=_handle_iracing_profile)
 
+    advanced_constrain = advanced_commands.add_parser(
+        "constrain",
+        help="Constrain a lap within left/right track-edge boundary laps",
+    )
+    advanced_constrain.add_argument("input", help="Input .blap/.olap path to constrain")
+    advanced_constrain.add_argument(
+        "--left", required=True, help="Left track-edge boundary .blap/.olap"
+    )
+    advanced_constrain.add_argument(
+        "--right", required=True, help="Right track-edge boundary .blap/.olap"
+    )
+    advanced_constrain.add_argument("-o", "--output", required=True)
+    advanced_constrain.add_argument(
+        "--mode",
+        choices=("translate", "clamp"),
+        default="translate",
+        help=(
+            "translate: shift the whole lap laterally to minimize the maximum "
+            "out-of-corridor excursion (shape preserved); "
+            "clamp: clip per-bin excursions and smooth the correction"
+        ),
+    )
+    advanced_constrain.add_argument(
+        "--tolerance-m",
+        type=float,
+        default=1.0,
+        help="Extra corridor width on each side in metres",
+    )
+    advanced_constrain.add_argument(
+        "--smooth-bins",
+        type=int,
+        default=6,
+        help="Moving-average window (bins) used in clamp mode",
+    )
+    advanced_constrain.add_argument(
+        "--template",
+        help="Optional BLAP used as the output binary prefix and header template",
+    )
+    advanced_constrain.set_defaults(handler=_handle_iracing_constrain)
+
     encode = advanced_commands.add_parser(
         "encode",
         help=argparse.SUPPRESS,
@@ -1015,7 +1073,7 @@ def _build_parser() -> argparse.ArgumentParser:
         for action in advanced_commands._choices_actions
         if action.dest != "encode"
     ]
-    advanced_commands.metavar = "{convert,profile}"
+    advanced_commands.metavar = "{convert,profile,constrain}"
 
     return parser
 

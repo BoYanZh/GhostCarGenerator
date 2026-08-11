@@ -11,12 +11,17 @@ dist/
 # Telemetry, ghost and binary replay files
 *.blap
 *.olap
+*.ld
+*.ldx
 *.blapta
 *.olapta
 *.ghost
 
 # Data directory
 data/
+
+# One-off analysis and experiment scripts
+scratch/
 
 # Temporary JSON outputs & report files
 *.json
