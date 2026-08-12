@@ -1,12 +1,18 @@
 # GhostCarGenerator
 
-Ghost Car is a Python package and CLI for iRacing BLAP/OLAP files.
-It supports lossless binary-to-JSON round trips and conversion of MoTeC LD
-telemetry into an iRacing lap using a target-track BLAP/OLAP template.
+Ghost Car is a Python package and CLI for iRacing BLAP/OLAP and Assetto
+Corsa replay interoperability. It supports lossless iRacing binary-to-JSON
+round trips and template-based conversion of MoTeC LD telemetry.
 
 Assetto Corsa ghost files are intentionally not supported. The verified format
 observations and the engineering reasons for that decision are recorded in
 [docs/assetto-corsa-ghost-notes.md](docs/assetto-corsa-ghost-notes.md).
+
+Assetto Corsa `.acreplay` files support inspection and template-based MoTeC
+LD conversion. A converted circuit lap has been validated in-game with the
+recorded line, yaw, pedals, rpm, gear, body pitch, and wheel pose. The format
+notes and acceptance limits are in
+[docs/assetto-corsa-replay-notes.md](docs/assetto-corsa-replay-notes.md).
 
 ## Requirements
 
@@ -26,6 +32,9 @@ The installed `ghost-car` command and `python -m ghost_car` are equivalent.
 ghost-car
 ├── convert
 ├── inspect
+├── replay
+│   ├── inspect
+│   └── convert
 ├── profile
 │   └── create
 └── advanced
@@ -40,6 +49,8 @@ controls are isolated under `advanced`:
 ~~~powershell
 ghost-car convert --help
 ghost-car inspect --help
+ghost-car replay inspect --help
+ghost-car replay convert --help
 ghost-car profile create --help
 ghost-car advanced convert --help
 ghost-car advanced profile --help
@@ -69,6 +80,69 @@ prefix is not needed; encoding such JSON requires `--template`.
 The second sample float is a signed lateral offset in metres relative to the
 iRacing track spline. It is exposed as `lateralOffsetM`; `deltaS` is accepted
 only when reading JSON produced by ghost-car 0.1.0 or older.
+
+## Assetto Corsa replay inspection and LD conversion
+
+`replay inspect` decodes the version-16 `.acreplay` core and CSP extension
+container:
+
+~~~powershell
+ghost-car replay inspect replay.acreplay -o replay.json --max-frames 1000
+~~~
+
+Use `--max-frames 0` to decode every frame and `--include-raw-frames` to keep
+the original 256 bytes per frame. The format notes are in
+[docs/assetto-corsa-replay-notes.md](docs/assetto-corsa-replay-notes.md).
+
+`replay convert` needs a native replay recorded with the target car and exact
+track layout. A calibrated track JSON is recommended because it preserves the
+GPS line in AC world coordinates and verifies the layout:
+
+~~~powershell
+ghost-car replay convert native-template.acreplay telemetry.ld `
+  --gps-track calibrated-track.json `
+  --lap 2 `
+  --wheel-steer-multiplier 2.0 `
+  -o converted.acreplay
+~~~
+
+GPS altitude and Assetto Corsa world height do not share a reliable datum.
+The default `--height-mode track` keeps GPS X/Z but takes Y from the nearest
+segment of the calibrated AC reference path. This prevents a car from floating
+above or clipping through the track when the GPS elevation profile differs.
+`gps-offset` retains the GPS elevation shape while removing its median datum
+offset; `gps` keeps the raw mapped height. Use `--height-offset-m` only for a
+small final body-height correction. Generated files still require an in-game
+acceptance check because CSP replay rules are partly reverse-engineered.
+
+LD GPS X/Z and heading are filtered on their native sample grid before the
+15 ms replay resample. The default 0.75 s zero-phase quadratic window removes
+visible sample-to-sample lateral wander without joining the end of a lap back
+to its start; override it with `--position-smoothing-s` when needed. Both
+world-coordinate wheel-position blocks use the same-car template's median
+body-local wheel centres and follow the replacement body's full yaw, pitch,
+and roll. This intentionally fixes suspension travel instead of
+time-compressing an unrelated template drive into the generated lap. Body
+pitch follows the smoothed tangent of the height-aligned 3D path because some
+LD exports contain no useful pitch channel. Wheel yaw is rebuilt from the
+replacement body yaw and an automatically calibrated same-car template
+steering ratio. `--wheel-steer-multiplier` optionally scales only the rendered
+front-wheel yaw while leaving the recorded steering field unchanged; its
+default is 1.0. A 2.0 value maps the tested LD lap's 6.9-degree peak to the
+native GR86 example's approximately 13.4--13.9-degree on-track P99 range.
+Unsupported per-wheel slip channels are cleared instead of replaying unrelated
+template skids and smoke. When the template frame count changes, each wheel
+rotation is selected as one complete native YXZ triplet; its three Euler
+components are never interpolated independently across wheel roll
+singularities.
+
+The replay `gas` byte represents driver accelerator input. Automatic channel
+selection therefore accepts accelerator/pedal names but does not silently use
+an engine `Throttle Pos` channel. A stable non-zero pedal-sensor rest position
+is calibrated to zero with a small dead zone, short missing runs are linearly
+filled, and gas/brake are normalized independently into their 0--255 fields.
+Use `--channel throttle=CHANNEL_NAME` only when an explicit non-standard pedal
+channel is required.
 
 ## Reusable iRacing target profiles
 
@@ -277,6 +351,9 @@ match the target vehicle.
 | --- | --- |
 | `ghost_car/cli.py` | CLI parsing, file I/O, and command dispatch |
 | `ghost_car/iracing.py` | Lossless iRacing BLAP/OLAP codec |
+| `ghost_car/acreplay.py` | Assetto Corsa .acreplay parser |
+| `ghost_car/replay_writer.py` | Template-preserving replay morph and resampling |
+| `ghost_car/ld_replay.py` | MoTeC-to-replay alignment, height correction, and conversion |
 | `ghost_car/conversion.py` | Resampling, smoothing, pose, and control conversion |
 | `ghost_car/ibt.py` | Native IBT GPS parsing and least-squares/ICP path alignment |
 | `ghost_car/corridor.py` | Corridor-constrained lateral-offset correction |

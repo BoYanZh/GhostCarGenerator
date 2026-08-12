@@ -23,15 +23,25 @@ CHANNEL_ALIASES = {
     "pitch": ("Pitch", "GPS Pitch"),
     "roll": ("Roll", "GPS Roll"),
     "gear": ("Gear", "n_Gear"),
+    "rpm": ("Engine RPM", "RPM", "Eng_RPM", "Engine Speed"),
+    "steering": (
+        "Steering Wheel Angle",
+        "Steering",
+        "Steer Angle",
+        "Steer",
+        "Steering Angle",
+    ),
     "brake": ("Brake Pos", "Brake_Pos", "Brake", "Brake Press FL", "Brake_Press"),
+    # The public role name stays "throttle" for CLI compatibility, but AC's
+    # replay gas byte is driver input. Do not silently substitute an engine
+    # throttle-plate channel such as "Throttle Pos".
     "throttle": (
         "Accelerator Pos",
         "Accelerator_Pos",
+        "Accelerator Pedal Position",
         "Accel Pos",
         "Accel_Pos",
-        "Throttle Pos",
-        "Throttle_Pos",
-        "Throttle",
+        "Gas Pedal Position",
     ),
     "lap": ("Lap Number", "Lap_Num", "Lap"),
     "time": ("Running Time", "Time", "Session Time"),
@@ -398,6 +408,8 @@ def extract_motec_points(
     pitch = _channel_data(selected_channels["pitch"])
     roll = _channel_data(selected_channels["roll"])
     gear = _channel_data(selected_channels["gear"])
+    rpm = _channel_data(selected_channels["rpm"])
+    steering = _channel_data(selected_channels["steering"])
     brake = _channel_data(selected_channels["brake"])
     throttle = _channel_data(selected_channels["throttle"])
     first_descriptor = descriptors[0]
@@ -437,6 +449,9 @@ def extract_motec_points(
             y_m = float(_sample_series(cartesian_y, descriptor, y0)) - y0
             z_m = float(_sample_series(cartesian_z, descriptor, z0)) - z0
         speed_value = _sample_series(speed, descriptor, 0.0)
+        steering_value = _sample_series(steering, descriptor, 0.0)
+        steering_unit = str(getattr(selected_channels["steering"], "unit", "") or "")
+        steer_radians = math.radians(steering_value) if "deg" in steering_unit else steering_value
         point = {
             "timeS": descriptor[3],
             "xM": x_m,
@@ -448,6 +463,10 @@ def extract_motec_points(
             "brake": float(_sample_series(brake, descriptor, 0.0)),
             "throttle": float(_sample_series(throttle, descriptor, 0.0)),
             "gear": _sample_series(gear, descriptor, None),
+            "rpm": float(_sample_series(rpm, descriptor, 0.0))
+            if rpm is not None
+            else None,
+            "steerRad": steer_radians if steering is not None else None,
             "pitchRad": float(_sample_series(pitch, descriptor, 0.0)),
             "rollRad": float(_sample_series(roll, descriptor, 0.0)),
         }

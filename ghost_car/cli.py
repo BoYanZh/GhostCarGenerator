@@ -1,12 +1,14 @@
 """Single hierarchical command-line interface for ghost-car."""
 
 import argparse
+import base64
 import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import __version__
+from .acreplay import parse_acreplay
 from .corridor import constrain_blap, constraint_diagnostics_text
 from .iracing import pack_blap, parse_blap, parse_int
 from .conversion import build_canonical_blap
@@ -18,6 +20,7 @@ from .ibt import (
     fit_ibt_distance_map,
     load_ibt_reference,
 )
+from .ld_replay import convert_ld_to_acreplay
 from .motec import extract_motec_points, parse_channel_overrides
 
 
@@ -926,6 +929,68 @@ def _handle_iracing_constrain(args: argparse.Namespace) -> None:
     print(constraint_diagnostics_text(diagnostics))
 
 
+def _handle_replay_inspect(args: argparse.Namespace) -> None:
+    decoded = parse_acreplay(
+        Path(args.input).expanduser(),
+        max_frames=args.max_frames,
+        include_raw_frames=args.include_raw_frames,
+    )
+    csp = decoded.get("csp")
+    if csp is not None:
+        for record in csp.get("records", []):
+            payload = record.pop("payload", b"")
+            record["payloadBase64"] = base64.b64encode(payload).decode("ascii")
+    text = json.dumps(decoded, indent=args.indent, ensure_ascii=False)
+    if args.output:
+        output_path = Path(args.output).expanduser()
+        output_path.write_text(text, encoding="utf-8")
+        print("Converted {} -> {}".format(args.input, output_path))
+    else:
+        print(text)
+
+
+def _handle_replay_convert(args: argparse.Namespace) -> None:
+    result = convert_ld_to_acreplay(
+        template_path=Path(args.template).expanduser(),
+        ld_path=Path(args.input).expanduser(),
+        output_path=Path(args.output).expanduser(),
+        car_index=args.car,
+        lap=args.lap,
+        channel_overrides=parse_channel_overrides(args.channel),
+        gps_track_path=Path(args.gps_track).expanduser() if args.gps_track else None,
+        height_mode=args.height_mode,
+        height_offset_m=args.height_offset_m,
+        position_smoothing_s=args.position_smoothing_s,
+        wheel_steer_multiplier=args.wheel_steer_multiplier,
+    )
+    print(
+        "Converted LD lap {selectedLap} ({lapTimeS:.2f}s) -> {output} "
+        "({frameCount} frames)".format(**result)
+    )
+    print(
+        "Alignment: {alignmentMethod}, horizontal RMSE "
+        "{horizontalAlignmentRmseM:.2f}m".format(**result)
+    )
+    print(
+        "Height: {heightMode}, datum {verticalDatumOffsetM:+.2f}m, "
+        "before RMSE {beforeVerticalRmseM:.2f}m, after RMSE "
+        "{afterVerticalRmseM:.2f}m, offset {heightOffsetM:+.2f}m".format(
+            **result
+        )
+    )
+    print(
+        "Position smoothing: {positionSmoothingS:.2f}s / "
+        "{positionSmoothingSamples} samples, RMS adjustment "
+        "{positionSmoothingRmsM:.2f}m, P95 {positionSmoothingP95M:.2f}m".format(
+            **result
+        )
+    )
+    print(
+        "Front-wheel steering visual multiplier: "
+        "{wheelSteerMultiplier:.2f}x".format(**result)
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ghost-car",
@@ -965,6 +1030,92 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--omit-prefix", action="store_true")
     inspect.add_argument("--brake-light-threshold", type=int, default=10)
     inspect.set_defaults(handler=_handle_iracing_decode)
+
+    replay = commands.add_parser(
+        "replay",
+        help="Inspect and generate Assetto Corsa .acreplay files",
+    )
+    replay_commands = replay.add_subparsers(dest="replay_command", required=True)
+    replay_inspect = replay_commands.add_parser(
+        "inspect",
+        help="Decode an .acreplay header, cars, and CSP extension records",
+    )
+    replay_inspect.add_argument("input", help="Input .acreplay path")
+    replay_inspect.add_argument("-o", "--output", help="Output JSON path; defaults to stdout")
+    replay_inspect.add_argument("--indent", type=int, default=2, help="JSON indentation")
+    replay_inspect.add_argument(
+        "--max-frames",
+        type=int,
+        default=1000,
+        help="Decode at most this many physics frames per car (0 = all)",
+    )
+    replay_inspect.add_argument(
+        "--include-raw-frames",
+        action="store_true",
+        help="Attach raw 256-byte hex per decoded frame",
+    )
+    replay_inspect.set_defaults(handler=_handle_replay_inspect)
+
+    replay_convert = replay_commands.add_parser(
+        "convert",
+        help="Convert a MoTeC LD lap using a native replay template",
+    )
+    replay_convert.add_argument("template", help="Native same-layout .acreplay template")
+    replay_convert.add_argument("input", help="Input MoTeC .ld path")
+    replay_convert.add_argument("-o", "--output", required=True, help="Output .acreplay path")
+    replay_convert.add_argument(
+        "--car",
+        type=int,
+        default=0,
+        help="Zero-based template car index to replace",
+    )
+    replay_convert.add_argument(
+        "--lap",
+        type=int,
+        help="Specific numbered LD lap; defaults to fastest",
+    )
+    replay_convert.add_argument(
+        "--gps-track",
+        help="Calibrated track.json with origin, ENU-to-AC transform, and AC path",
+    )
+    replay_convert.add_argument(
+        "--height-mode",
+        choices=("track", "gps-offset", "gps"),
+        default="track",
+        help=(
+            "Vertical mapping: AC reference path (default), GPS profile with "
+            "datum correction, or raw mapped GPS"
+        ),
+    )
+    replay_convert.add_argument(
+        "--height-offset-m",
+        type=float,
+        default=0.0,
+        help="Final vertical body offset in metres after height mapping",
+    )
+    replay_convert.add_argument(
+        "--position-smoothing-s",
+        type=float,
+        default=0.75,
+        help="Zero-phase GPS X/Z and yaw smoothing window in seconds",
+    )
+    replay_convert.add_argument(
+        "--wheel-steer-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Visual multiplier for calibrated front-wheel yaw; leaves the "
+            "recorded steering field unchanged"
+        ),
+    )
+    replay_convert.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="ROLE=NAME",
+        help="Override an LD channel; repeat for multiple roles",
+    )
+    replay_convert.set_defaults(handler=_handle_replay_convert)
 
     profile = commands.add_parser("profile", help="Manage reusable target profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)

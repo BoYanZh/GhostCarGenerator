@@ -1,0 +1,189 @@
+# LD → Assetto Corsa replay: handoff notes
+
+Status: the end-to-end pipeline works in-game and is exposed as
+`ghost-car replay convert`. A MoTeC LD lap can be converted into a playable
+Assetto Corsa `.acreplay` that reproduces the recorded GPS line, wrapped yaw,
+pedals, rpm, gear, track-derived pitch, stable wheel centres, and visible front
+steering. The final in-game check confirmed the accepted 2.0x visual steering
+scale, correct pitch direction, stable wheel height, aligned rear wheels, no
+false skid smoke, and no wheel-axis/camber flashing.
+
+This document is for a follow-up agent. Read
+`docs/assetto-corsa-replay-notes.md` for the format facts and the crash
+post-mortems, and `README.md` for the package overview.
+
+## Current state (what works)
+
+- `ghost_car/acreplay.py` - read-only parser: header, global frame
+  data, per-car 256-byte physics frames, CSP extension records
+  (decompression, per-frame sizes, EXTRASTREAM chunk ids).
+- `ghost-car replay inspect <file>` - CLI JSON dump of the above.
+- `ghost_car/motec.py` - `extract_motec_points` now also returns rpm
+  and `steerRad` (aliases `rpm` / `steering`).
+- `ghost_car/replay_writer.py` - template-based writer:
+  - `morph` patches one car's pose fields in place (byte-for-byte
+    faithful elsewhere);
+  - `resample` rebuilds the file at a new frame count (car frames,
+    global sun data, per-frame CSP streams, EXTRASTREAM length,
+    session data table, footer offset).
+- `ghost_car/ld_replay.py` - LD → replay:
+  `extract_motec_points` → GPS transform (rigid fit, or
+  `--gps-track track.json` ENU→AC matrix) → 15 ms resample → yaw from
+  GPS heading/path → `morph`.
+- `ghost-car replay convert` - formal CLI, including calibrated track
+  transforms, track-layout validation, and three height modes.
+- Tests: parser/writer, height/alignment, pose/control, and corridor coverage.
+
+## Private validation inputs
+
+- LD + LDX recording ignored by Git
+- Calibrated track reference (origin + ENU→AC matrix + centerline), ignored by
+  Git
+- Native same-car, same-layout AC template replay outside the repository
+- Reference conversion command:
+
+~~~powershell
+python -m ghost_car replay convert `
+  native-template.acreplay `
+  telemetry.ld `
+  -o scratch\converted.acreplay `
+  --gps-track private-track-reference.json --lap 2 `
+  --wheel-steer-multiplier 2.0
+~~~
+
+Copy the output into the AC replay folder and play it. Validated
+metrics include a 3.29 m RMSE to the track centerline, a one-lap yaw sweep,
+and CSP stream lengths consistent with the frame count. Native replays,
+telemetry, track references, and generated outputs must remain private.
+
+## Hard-won facts (do not re-derive)
+
+1. Frame-header timestamps must be 0 (all native files store 0).
+2. Body yaw must be wrapped to [-pi, pi]; out-of-range yaw is silently
+   ignored by the game. Native multi-lap recordings store the wrapped
+   range too. Yaw convention: forward = (-sin(yaw), cos(yaw)).
+3. Frame trailing byte (offset 255) is a constant flag (observed 1);
+   preserve it.
+4. EXTRASTREAM decompressed size = ceil(numFrames / 16) per car; CSP
+   indexes it by frame (stale length = out-of-bounds crash).
+5. Session data table between the last car and the CSP INI blob:
+   `u32 groupCount` then `groupCount × numCars × 20 bytes`, each entry
+   `[u32 typeIndex][u32 ×4]`. Dropping it makes the loader read the INI
+   length as groupCount and crash on a garbage type index (NULL deref
+   at `[rdi+0x1000]`). Copy it verbatim; the CSP footer offset points
+   past it.
+6. CSP footer: `__AC_SHADERS_PATCH_v1__` (24 bytes) + u32 offset + u32
+   version(1). The offset field's low byte is often 0x21 ('!'), which
+   looks like a 25-byte marker in hex dumps; it is not.
+7. EXT_PERCAR streams should be rebuilt field-wise (f32/f16
+   interpolated, integer/byte fields held at first-frame values); yaw
+   must be unwrapped at the LD's native cadence before interpolation to
+   the replay grid.
+8. In-game validation is the only real acceptance gate; structurally
+   valid files can still be rejected (see the crash history in the
+   notes). Test changes in-game, not just by parsing.
+
+## Completed formalization
+
+### A. Formalize: CLI command + tests
+
+Completed in `ghost_car/replay_writer.py`, `ghost_car/ld_replay.py`, and
+`ghost-car replay convert`. Synthetic tests cover morph/resample, opaque
+trailing-data preservation, mixed CSP record resizing, height modes, yaw
+wrapping, and controls. A track JSON is checked against the template's track
+and layout.
+
+The default `--height-mode track` preserves GPS X/Z while taking Y from the
+nearest AC reference-path segment. Validation diagnostics changed
+vertical RMSE from 1.16 m to 0.00 m relative to that reference. The
+`gps-offset` and `gps` modes remain available for comparison.
+
+Wheel world positions now use median same-car template offsets fixed in body
+space, avoiding time-compressed suspension movement. Their local-position
+error is at most 1.62 mm and their relative-height step is 1.22 mm at P95,
+3.61 mm maximum. GPS X/Z and yaw use a 0.75 s zero-phase quadratic filter; lap
+start and finish are fitted independently and are never treated as a closed
+loop. On the validation lap, the P95 horizontal adjustment was 0.32 m, maximum
+0.47 m, and the lateral acceleration-noise proxy fell by about 90%.
+
+The current LD source has zero pitch and roll, so pitch is derived from the
+smoothed aligned-track tangent. It spans approximately -3.31 to +3.42 degrees
+between P05 and P95, correlates 0.9978 with path grade, and has 0.138-degree
+RMSE. Roll remains zero for this source.
+
+The replay `gas` byte is mapped from driver accelerator input, not electronic
+throttle-plate position. Default aliases intentionally exclude `Throttle Pos`.
+The converter detects a stable low pedal-sensor rest cluster, maps it through
+a 2% dead zone to zero, interpolates short missing runs, and normalizes gas and
+brake independently. On the private validation sample, zero-gas frames changed
+from 0.7% before calibration to 25.3%, close to 21.4% in the native reference;
+WOT frames remained 51.3% and there were no isolated one-frame zero glitches.
+
+Both YXZ wheel-rotation blocks are now updated too. The writer infers each
+front wheel's road-wheel/steering-wheel yaw scale from the same-car template,
+then applies replacement body yaw, calibrated toe, and the LD steering angle.
+The physical scale is approximately 0.078 in the native example and 0.077 in
+the generated replay, so the calibration itself is correct. The optional
+`--wheel-steer-multiplier` changes only rendered front-wheel yaw, not the
+stored LD steering field. A 2.0 multiplier maps the generated 6.9-degree peak
+to the native example's 13.4--13.9-degree on-track P99 range. The resulting
+front-wheel P95/maximum are 8.76/13.71 degrees; both rear wheels still differ
+from body yaw by 0 degrees. LD has no trustworthy per-wheel slip channels, so
+slip angle, slip ratio, and nd-slip are explicitly zeroed; the old tested
+output contained unrelated template values large enough to trigger continuous
+smoke.
+
+Wheel rotations must not use the generic numeric interpolation path. Native
+rolling wheels repeatedly cross YXZ singularities; interpolating x/y/z
+separately made the dynamic axle differ from the static axle by 116--118
+degrees at P95. The resampler now selects each 12-value static/dynamic rotation
+block from one nearest native frame, then `morph` applies body/steering yaw to
+that complete pose. Validation P95 axle error is 0.153--0.158 degrees, matching
+the native template's approximately 0.145 degrees; P05 cosine similarity is
+0.999996.
+
+## Validation status and future work
+
+### B. Visual quality pass — completed
+
+- In-game validation confirmed that fixed body-local wheel centres remove
+  vertical bouncing and track-derived body pitch has the correct direction.
+- The 2.0x front-wheel steering scale is visible and has the correct sign. Its
+  P95 magnitude is 8.76--8.79 degrees and maximum is 13.69--13.71 degrees,
+  matching the large-but-normal tail of the native same-car example.
+- Rear wheels remain aligned with the body, false skid smoke is absent, and
+  wheel-axis/camber flashing is eliminated.
+- Rolling rotation is still inherited from the native template; synthesize it
+  from speed and effective tire radius only if the next visual check shows an
+  obvious wheel-spin-rate mismatch.
+- Derive roll from a trustworthy bank/attitude source only if a later visual
+  pass shows that zero roll is inadequate.
+- Compare the generated frames against the same-lap ghost frame by
+  frame (the ghost has the native body orientation and wheel
+  positions).
+- Confirm speed consistency: the velocity vector is written from the
+  LD speed channel; the game may derive rendering speed from frame
+  deltas instead.
+
+### C. Multi-lap and extended features
+
+- Convert consecutive laps from the LDX lap markers (extend the
+  LDX lap-interval handling in `extract_motec_points`), producing a
+  multi-lap replay.
+- Write sector/lap times into the frame `currentLapTimeMs` fields from
+  the LDX splits (currently a linear 15 ms ramp).
+- Validate the non-GPS rigid-fit path (`--gps-track` absent) in-game
+  with a matching-track template.
+- Handle EXT_PERCAR versions 1-5 (currently 0 bytes/frame in the
+  community table).
+
+## Constraints and cautions
+
+- Do not distribute native replays, track references, or template
+  files (personal data / possibly licensed content). The
+  `track_references/` publishing pattern in this repo shows the
+  sanitized form.
+- The parser supports CSP version-16 files only; vanilla (non-CSP)
+  replays were not sampled.
+- Anything generated must be validated in the actual game before it is
+  called supported; see the crash history for what that looks like.
