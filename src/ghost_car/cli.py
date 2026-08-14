@@ -1017,6 +1017,7 @@ def _handle_replay_convert(args: argparse.Namespace) -> None:
         height_mode=args.height_mode,
         height_offset_m=args.height_offset_m,
         position_smoothing_s=args.position_smoothing_s,
+        yaw_smoothing_s=args.yaw_smoothing_s,
         wheel_steer_multiplier=args.wheel_steer_multiplier,
         track_surface_path=args.track_surface,
     )
@@ -1366,8 +1367,17 @@ def _build_parser() -> argparse.ArgumentParser:
     replay_convert.add_argument(
         "--position-smoothing-s",
         type=float,
-        default=0.75,
+        default=1.0,
         help="Zero-phase GPS X/Z and yaw smoothing window in seconds",
+    )
+    replay_convert.add_argument(
+        "--yaw-smoothing-s",
+        type=float,
+        default=1.0,
+        help=(
+            "Zero-phase body-yaw smoothing window in seconds; kept separate "
+            "from GPS position smoothing to preserve lap line differences"
+        ),
     )
     replay_convert.add_argument(
         "--wheel-steer-multiplier",

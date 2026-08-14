@@ -244,9 +244,11 @@ terrain KN5; the surfaces share AC world coordinates and are combined without
 using AI lane files.
 
 LD GPS X/Z and heading are filtered on their native sample grid before the
-15 ms replay resample. The default 0.75 s zero-phase quadratic window removes
+15 ms replay resample. The default 1.0 s zero-phase quadratic window removes
 visible sample-to-sample lateral wander without joining the end of a lap back
-to its start; override it with `--position-smoothing-s` when needed. Both
+to its start; override it with `--position-smoothing-s` when needed. Body yaw
+uses a separate 1.0 s default window (`--yaw-smoothing-s`) so multi-car replay
+body orientation is stable without over-smoothing genuine lap-line differences. Both
 world-coordinate wheel-position blocks use the same-car template's median
 body-local wheel centres and follow the replacement body's full yaw, pitch,
 and roll. Wheel orientation likewise uses a robust fixed body-local template

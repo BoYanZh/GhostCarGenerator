@@ -639,7 +639,8 @@ def convert_ld_to_acreplay(
     gps_track_path=None,
     height_mode="track",
     height_offset_m=0.0,
-    position_smoothing_s=0.75,
+    position_smoothing_s=1.0,
+    yaw_smoothing_s=1.0,
     wheel_steer_multiplier=1.0,
     track_surface_path=None,
 ):
@@ -816,7 +817,7 @@ def convert_ld_to_acreplay(
                 source_points,
                 source_xyz,
                 item["rotation"],
-                yaw_smoothing_s=position_smoothing_s,
+                yaw_smoothing_s=yaw_smoothing_s,
             )
             built_poses.append(poses)
             built_counts.append(current_frame_count)
@@ -845,7 +846,7 @@ def convert_ld_to_acreplay(
             item["source"]["points"],
             item["xyz"],
             item["rotation"],
-            yaw_smoothing_s=position_smoothing_s,
+            yaw_smoothing_s=yaw_smoothing_s,
         )
         poses_by_car = None
         per_car = []
