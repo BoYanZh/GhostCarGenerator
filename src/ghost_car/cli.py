@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import __version__
+from .ac_track import calibrate_track
 from .acreplay import parse_acreplay
 from .corridor import constrain_blap, constraint_diagnostics_text
 from .iracing import pack_blap, parse_blap, parse_int
@@ -20,7 +21,8 @@ from .ibt import (
     fit_ibt_distance_map,
     load_ibt_reference,
 )
-from .ld_replay import convert_ld_to_acreplay
+from .ld_replay import convert_ld_to_acreplay, offset_track_calibration
+from .kn5 import export_kn5_surface
 from .motec import extract_motec_points, parse_channel_overrides
 
 
@@ -949,6 +951,56 @@ def _handle_replay_inspect(args: argparse.Namespace) -> None:
         print(text)
 
 
+def _handle_replay_export_kn5_surface(args: argparse.Namespace) -> None:
+    result = export_kn5_surface(
+        Path(args.input).expanduser(),
+        Path(args.output).expanduser(),
+        mesh_pattern=args.mesh_pattern,
+    )
+    print(
+        "Exported {meshCount} KN5 meshes, {vertexCount} vertices, "
+        "{triangleCount} triangles -> {output}".format(**result)
+    )
+
+
+def _handle_replay_calibrate_track(args: argparse.Namespace) -> None:
+    result = calibrate_track(
+        reference_path=Path(args.reference).expanduser(),
+        ld_paths=[Path(item).expanduser() for item in args.input],
+        laps=args.lap,
+        reference_car=args.reference_car,
+        reference_lap=args.reference_lap,
+        track_name=args.track_name,
+        layout=args.layout,
+        alignment_samples=args.alignment_samples,
+        allow_scale=args.allow_scale,
+        max_scale_error=args.max_scale_error,
+        max_rmse_m=args.max_rmse_m,
+        parser_path=args.ldparser_path,
+        channel_overrides=parse_channel_overrides(args.channel),
+    )
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    calibration = result["calibration"]
+    print(
+        "Calibrated {sourceCount} LD lap(s): ordered RMSE {orderedRmseM:.3f}m, "
+        "nearest P95 {nearestP95M:.3f}m, scale {scale:.6f} -> {output}".format(
+            output=output, **calibration
+        )
+    )
+    for index, source in enumerate(calibration["sources"], 1):
+        print(
+            "  Source {index}: lap {selectedLap}, {lapTimeS:.3f}s, nearest "
+            "RMSE {nearestRmseM:.3f}m, P95 {nearestP95M:.3f}m".format(
+                index=index, **source
+            )
+        )
+
+
 def _handle_replay_convert(args: argparse.Namespace) -> None:
     result = convert_ld_to_acreplay(
         template_path=Path(args.template).expanduser(),
@@ -956,17 +1008,72 @@ def _handle_replay_convert(args: argparse.Namespace) -> None:
         output_path=Path(args.output).expanduser(),
         car_index=args.car,
         lap=args.lap,
+        session=args.session,
+        compare_laps=args.compare_laps,
+        compare_skins=args.compare_skins,
+        compare_sync=args.compare_sync,
         channel_overrides=parse_channel_overrides(args.channel),
         gps_track_path=Path(args.gps_track).expanduser() if args.gps_track else None,
         height_mode=args.height_mode,
         height_offset_m=args.height_offset_m,
         position_smoothing_s=args.position_smoothing_s,
         wheel_steer_multiplier=args.wheel_steer_multiplier,
+        track_surface_path=args.track_surface,
     )
-    print(
-        "Converted LD lap {selectedLap} ({lapTimeS:.2f}s) -> {output} "
-        "({frameCount} frames)".format(**result)
-    )
+    if result["mode"] == "compare":
+        print(
+            "Converted LD laps {laps} into {carCount} {compareSync} cars "
+            "({lapTimeS:.2f}s) -> {output} ({frameCount} frames)".format(
+                laps=", ".join(str(item) for item in result["selectedLaps"]),
+                **result
+            )
+        )
+        for item in result["perCar"]:
+            print(
+                "  Lap {selectedLap}: source {lapTimeS:.2f}s, alignment RMSE "
+                "{horizontalAlignmentRmseM:.2f}m".format(**item)
+            )
+    elif result["mode"] == "session":
+        print(
+            "Converted full LD session ({lapTimeS:.2f}s) -> {output} "
+            "({frameCount} frames)".format(**result)
+        )
+        segments = result.get("sessionSegments", [])
+        out_lap = next(
+            (item for item in segments if item["kind"] == "out-lap"), None
+        )
+        timed_laps = [
+            item for item in segments if item["kind"] == "timed-lap"
+        ]
+        in_lap = next(
+            (item for item in segments if item["kind"] == "in-lap"), None
+        )
+        if out_lap is not None:
+            print(
+                "  Included out lap: {durationS:.2f}s "
+                "({startS:.2f}-{endS:.2f}s)".format(**out_lap)
+            )
+        if timed_laps:
+            print(
+                "  Included timed laps: {} ({:.2f}s total)".format(
+                    len(timed_laps),
+                    sum(item["durationS"] for item in timed_laps),
+                )
+            )
+        if in_lap is not None:
+            print(
+                "  Included in lap: {durationS:.2f}s "
+                "({startS:.2f}-{endS:.2f}s)".format(**in_lap)
+            )
+        if not segments:
+            print(
+                "  Included first through last LD sample; no LDX lap boundaries found"
+            )
+    else:
+        print(
+            "Converted LD lap {selectedLap} ({lapTimeS:.2f}s) -> {output} "
+            "({frameCount} frames)".format(**result)
+        )
     print(
         "Alignment: {alignmentMethod}, horizontal RMSE "
         "{horizontalAlignmentRmseM:.2f}m".format(**result)
@@ -978,6 +1085,12 @@ def _handle_replay_convert(args: argparse.Namespace) -> None:
             **result
         )
     )
+    if result["heightMode"] == "kn5":
+        print(
+            "KN5 surface: {surfaceMatchedPoints}/{surfaceTotalPoints} points "
+            "({surfaceMatchRatio:.2%}), body clearance "
+            "{surfaceBodyClearanceM:.3f}m".format(**result)
+        )
     print(
         "Position smoothing: {positionSmoothingS:.2f}s / "
         "{positionSmoothingSamples} samples, RMS adjustment "
@@ -988,6 +1101,33 @@ def _handle_replay_convert(args: argparse.Namespace) -> None:
     print(
         "Front-wheel steering visual multiplier: "
         "{wheelSteerMultiplier:.2f}x".format(**result)
+    )
+
+
+def _handle_replay_offset_track(args: argparse.Namespace) -> None:
+    input_path = Path(args.input).expanduser()
+    output_path = Path(args.output).expanduser()
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("Track offset output must be a new file")
+    with input_path.open(encoding="utf-8") as handle:
+        track_ref = json.load(handle)
+    adjusted = offset_track_calibration(
+        track_ref, x_m=args.x_m, z_m=args.z_m
+    )
+    output_path.write_text(
+        json.dumps(adjusted, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    cumulative = adjusted["calibration"]["manualOffsetAcM"]
+    print(
+        "Wrote {output}; applied AC offset X {x_m:+.3f}m, Z {z_m:+.3f}m "
+        "(cumulative X {total_x:+.3f}m, Z {total_z:+.3f}m)".format(
+            output=output_path,
+            x_m=args.x_m,
+            z_m=args.z_m,
+            total_x=cumulative["x"],
+            total_z=cumulative["z"],
+        )
     )
 
 
@@ -1056,9 +1196,100 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     replay_inspect.set_defaults(handler=_handle_replay_inspect)
 
+    replay_export_surface = replay_commands.add_parser(
+        "export-kn5-surface",
+        help="Extract road-height geometry from KN5 using pure Python",
+    )
+    replay_export_surface.add_argument("input", help="Input Assetto Corsa .kn5")
+    replay_export_surface.add_argument(
+        "-o", "--output", required=True, help="Output .gcsurface path"
+    )
+    replay_export_surface.add_argument(
+        "--mesh-pattern",
+        default=r"^(1ROAD|1PIT)",
+        help="Case-insensitive regex selecting KN5 mesh names",
+    )
+    replay_export_surface.set_defaults(handler=_handle_replay_export_kn5_surface)
+
+    replay_calibrate = replay_commands.add_parser(
+        "calibrate-track",
+        help="Fit one shared GPS-to-AC transform from one or more complete LD laps",
+    )
+    replay_calibrate.add_argument(
+        "reference",
+        help="Native full-lap .acreplay, calibrated track.json, or track package",
+    )
+    replay_calibrate.add_argument(
+        "input", nargs="+", help="One or more MoTeC .ld files"
+    )
+    replay_calibrate.add_argument(
+        "-o", "--output", required=True, help="Output calibrated track.json"
+    )
+    replay_calibrate.add_argument(
+        "--lap",
+        type=int,
+        action="append",
+        help="LD lap number; repeat per input, or specify once for all inputs",
+    )
+    replay_calibrate.add_argument(
+        "--reference-car", type=int, default=0, help="Zero-based replay car index"
+    )
+    replay_calibrate.add_argument(
+        "--reference-lap", type=int, help="Raw currentLap value in reference replay"
+    )
+    replay_calibrate.add_argument("--track-name", help="AC track identifier override")
+    replay_calibrate.add_argument("--layout", help="AC layout identifier override")
+    replay_calibrate.add_argument(
+        "--alignment-samples", type=int, default=500, help="Closed-path fit samples"
+    )
+    replay_calibrate.add_argument(
+        "--allow-scale",
+        action="store_true",
+        help="Fit horizontal scale in addition to rotation/reflection/translation",
+    )
+    replay_calibrate.add_argument(
+        "--max-scale-error",
+        type=float,
+        default=0.03,
+        help="Maximum absolute fitted scale error from 1.0",
+    )
+    replay_calibrate.add_argument(
+        "--max-rmse-m",
+        type=float,
+        default=8.0,
+        help="Reject an ordered trajectory fit above this RMSE",
+    )
+    replay_calibrate.add_argument(
+        "--ldparser-path", help="Directory containing ldparser.py"
+    )
+    replay_calibrate.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="ROLE=NAME",
+        help="Override an LD channel; repeat for multiple roles",
+    )
+    replay_calibrate.set_defaults(handler=_handle_replay_calibrate_track)
+
+    replay_offset = replay_commands.add_parser(
+        "offset-track",
+        help="Create a track JSON with a manual AC-world X/Z correction",
+    )
+    replay_offset.add_argument("input", help="Input calibrated track.json")
+    replay_offset.add_argument(
+        "-o", "--output", required=True, help="New corrected track.json path"
+    )
+    replay_offset.add_argument(
+        "--x-m", type=float, default=0.0, help="Metres added to AC world X"
+    )
+    replay_offset.add_argument(
+        "--z-m", type=float, default=0.0, help="Metres added to AC world Z"
+    )
+    replay_offset.set_defaults(handler=_handle_replay_offset_track)
+
     replay_convert = replay_commands.add_parser(
         "convert",
-        help="Convert a MoTeC LD lap using a native replay template",
+        help="Convert MoTeC LD laps or sessions using a native replay template",
     )
     replay_convert.add_argument("template", help="Native same-layout .acreplay template")
     replay_convert.add_argument("input", help="Input MoTeC .ld path")
@@ -1069,22 +1300,61 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Zero-based template car index to replace",
     )
-    replay_convert.add_argument(
+    replay_target = replay_convert.add_mutually_exclusive_group()
+    replay_target.add_argument(
         "--lap",
         type=int,
         help="Specific numbered LD lap; defaults to fastest",
     )
+    replay_target.add_argument(
+        "--session",
+        action="store_true",
+        help="Convert the complete LD recording from session start to end",
+    )
+    replay_target.add_argument(
+        "--compare-laps",
+        type=int,
+        nargs="+",
+        metavar="LAP",
+        help=(
+            "Put 2-16 laps into one replay as comparison cars; "
+            "requires --gps-track"
+        ),
+    )
+    replay_convert.add_argument(
+        "--compare-skins",
+        nargs="+",
+        metavar="SKIN",
+        help="Optional skin IDs corresponding to --compare-laps",
+    )
+    replay_convert.add_argument(
+        "--compare-sync",
+        choices=("time", "progress"),
+        default="time",
+        help=(
+            "Comparison timing: actual lap times (default), or equal track "
+            "progress for line-only comparison"
+        ),
+    )
     replay_convert.add_argument(
         "--gps-track",
-        help="Calibrated track.json with origin, ENU-to-AC transform, and AC path",
+        help="Calibrated track.json or package directory with surfaces",
     )
     replay_convert.add_argument(
         "--height-mode",
-        choices=("track", "gps-offset", "gps"),
+        choices=("track", "kn5", "gps-offset", "gps"),
         default="track",
         help=(
-            "Vertical mapping: AC reference path (default), GPS profile with "
-            "datum correction, or raw mapped GPS"
+            "Vertical mapping: AC reference path (default), KN5-derived road "
+            "surface, GPS profile with datum correction, or raw mapped GPS"
+        ),
+    )
+    replay_convert.add_argument(
+        "--track-surface",
+        action="append",
+        help=(
+            "KN5-derived .gcsurface; repeat for main track and terrain files; "
+            "required by --height-mode kn5"
         ),
     )
     replay_convert.add_argument(

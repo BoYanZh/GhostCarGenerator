@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# Binary telemetry, simulator, and generated replay formats.
+*.ibt binary
+*.ld binary
+*.ldx binary
+*.blap binary
+*.olap binary
+*.ghost binary
+*.acreplay binary
+*.kn5 binary
+*.gcsurface binary

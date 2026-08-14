@@ -7,11 +7,9 @@ are supported by `ghost_car.acreplay` and `ghost_car.replay_writer`.
 
 ## Verified sample set
 
-All observations were reproduced across 31 locally recorded version-16 files:
-9 single-car circuit replays (198-210 track objects, up to 88,599 frames,
-241 MB) and 22 replays across multiple circuit/road/custom layouts, including
-4-car race replays (0 track objects, 2,438 frames). All files carry the CSP
-container footer; vanilla (non-CSP) files were not sampled.
+All observations were reproduced across a varied local set of version-16
+single-car and multi-car circuit/road/custom-layout replays. All sampled files
+carry the CSP container footer; vanilla (non-CSP) files were not sampled.
 
 ## File layout
 
@@ -103,13 +101,25 @@ and by decoding real files:
 | 255 | 1 | - | padding |
 
 `f16` is IEEE-754 binary16. Rotations are stored YXZ; the parser returns
-XYZ. Status bit field (little endian), as decoded by the community:
+XYZ. The core status bit field is little endian. Community parsing plus the
+sampled native replay corpus currently supports:
 
 ~~~text
-bit 0..1 unused; bit 2 unknown; bit 3 horn; bits 4..5 camera direction
-(0 forward, 1 left, 2 right, 3 back); bits 6..7 unknown; bit 8 gearbox
-being damaged; bit 9 unknown; bit 10 unknown; bit 11 lights; bits 12..15 unused
+bits 0..1 reserved; bit 2 session/control-mode flag (low confidence);
+bit 3 horn; bits 4..5 camera direction (0 forward, 1 left, 2 right, 3 back);
+bit 6 downshift request/process; bit 7 upshift request/process; bit 8 reserved;
+bit 9 gearbox being damaged (community mapping, no local positive sample);
+bit 10 unresolved persistent vehicle-state latch; bit 11 lap-boundary pulse;
+bit 12 lights (community mapping, no local positive sample); bits 13..15 reserved
 ~~~
+
+The bit-11 inference is strong rather than nominal: all observed positive
+frames occur where currentLap changes or the current-lap timer
+resets. Bits 6 and 7 form short runs around downshifts and upshifts,
+respectively. Padding at offsets 18, 218, 247, and 250 remains zero in every
+sampled native frame; offset 255 remains one and is treated as a frame-validity
+sentinel. These observations are specific to the sampled version-16 CSP recordings
+and do not prove behavior for every car or replay version.
 
 Wing data is `numWings * 4` bytes between frames and after the last
 frame; wing semantics were not investigated.
@@ -198,7 +208,8 @@ The replay stores full physics state, not inputs, at a fixed cadence
 | track objects, weather strings | template replay of the same track |
 | EXT_PERFRAME / PERRACEFRAME / EXTRASTREAM | resized template records |
 | slip angle/ratio/nd-slip | zero: LD has no trustworthy per-wheel source |
-| load, damage, fuel, status bits | retained/resampled from the template |
+| load, damage, fuel | retained/resampled from the template |
+| status / unknown2 bitfields | nearest template frame; generated cars clear horn and rebuild the bit-11 lap pulse |
 
 The main risk is not byte layout but acceptance: the runtime may ignore
 structurally valid files, as documented for the ghost format in
@@ -229,55 +240,49 @@ modes:
   selected by nearest frame so every source record remains byte-valid.
   EXTRASTREAM is resized to `ceil(frames / 16)`; the session data table is
   copied verbatim and the footer offset is rewritten.
+- `replicate_car` turns a single-car template into up to 16 comparison cars.
+  It clones the complete car frame section, rebuilds the native 20-byte-per-car
+  session table, creates `[CAR_N]` INI sections, updates `[RACE] CARS`, and
+  emits one indexed EXT_PERCAR plus one incrementing-ID EXTRASTREAM per car.
 
 `ghost_car/ld_replay.py` provides the formal LD conversion pipeline and the
 `ghost-car replay convert` command. GPS elevation is not assumed to share the
 AC world-height datum. The default track-height mode projects each converted
 X/Z sample onto the nearest segment of the AC reference path and uses that
-interpolated Y. On the validation lap, the uncorrected vertical
-RMSE relative to the AC reference was 1.16 m, with local errors from about
--1.9 m to +2.7 m; a constant offset did not materially reduce that error.
+interpolated Y. Local validation showed that the vertical error changes around
+the lap, so a single constant GPS-altitude offset is insufficient.
 
 The body pose cannot be patched alone: both 12-float wheel-position blocks
 contain AC-world coordinates. Leaving them unchanged put the generated body's
 wheels hundreds of metres away on the template trajectory. Replaying every
 template suspension sample also compressed a long unrelated drive into the
-136-second generated lap, causing 10--15 mm P95 and 43--73 mm maximum wheel
-height steps per frame. The writer now takes each wheel centre's median
+generated lap, causing visible wheel-height steps. The writer now takes each
+wheel centre's median
 body-local template position and transforms it with the replacement body's
-full yaw, pitch, and roll. On the validation output the maximum local-position
-error is 1.62 mm and the relative-height step is 1.22 mm at P95, 3.61 mm
-maximum; the remaining error is consistent with replay angle quantization.
+full yaw, pitch, and roll. The remaining local-position error and height steps
+are consistent with replay angle quantization.
 
-The tested LD file contains zero pitch and roll throughout, although the
-aligned track grade spans about -3.4 to +3.5 degrees. Body pitch is therefore
-derived from the smoothed tangent of the height-aligned 3D path. Validation
-pitch/grade correlation is 0.9978 with 0.138-degree RMSE. Roll remains the LD
-value and is zero for this source.
+Some LD exports contain no useful pitch signal. Body pitch is therefore
+derived from the smoothed tangent of the height-aligned 3D path, which closely
+tracks the reconstructed grade in local validation. Roll remains the LD value.
 
-The two YXZ wheel-rotation blocks are world-space too. Native GR86 data shows
+The two YXZ wheel-rotation blocks are world-space too. Native same-car data shows
 rear static-wheel yaw tracking body yaw and front static-wheel yaw adding a
 same-sign road-wheel angle. The writer robustly calibrates the two front
 road-wheel/steering-wheel scales from the same-car template, applies the new
 body yaw and steering angle to both static and rolling rotations, and preserves
-the rolling rotation's offset. The native and generated calibration factors
-are approximately 0.078 and 0.077, respectively. A separate visual multiplier
-can therefore make low-amplitude LD steering visible without corrupting that
-calibration or the stored steering field. The 2.0 validation output reaches
-8.76--8.79 degrees at P95 and 13.69--13.71 degrees maximum, matching the native
-example's approximately 13.4--13.9-degree on-track P99 range. Rear-to-body yaw
-error remains 0 degrees. Because LD does not provide compatible per-wheel
+the rolling rotation's offset. A separate visual multiplier can therefore
+make low-amplitude LD steering visible without corrupting that calibration or
+the stored steering field. Rear wheels continue to track body yaw. Because LD
+does not provide compatible per-wheel
 slip, the target car's slip angle, slip ratio, and nd-slip are zeroed to prevent
 unrelated template skid smoke.
 
 Component-wise wheel Euler interpolation is invalid even though each component
 is numeric. A rolling wheel repeatedly changes YXZ representation at gimbal
-singularities. On the first generated output, the dynamic-vs-static wheel-axis
-P95 error was 116--118 degrees and the per-frame axle jump was about 116
-degrees. Selecting complete native rotation triplets before applying the rigid
-body/steering yaw reduced those values to 0.153--0.158 and 0.62--0.69 degrees,
-respectively. The native template's dynamic-vs-static axle P95 error is about
-0.145 degrees.
+singularities. Selecting complete native rotation triplets before applying the
+rigid body/steering yaw removes the extreme axle-axis discontinuities and
+brings the generated error in line with the native template.
 
 Raw 20 Hz GPS also produced visible sample-to-sample lateral wander, amplified
 by interpolation onto the 15 ms replay grid. X/Z and heading now use a 0.75 s
@@ -289,7 +294,7 @@ treated as a closed curve and different start/end lines are not blended.
 ### In-game validation results
 
 Private validation artifacts were generated from single-car templates and
-parse cleanly with the read-only parser. In-game results on an 8-car race
+parse cleanly with the read-only parser. In-game results on a multi-car race
 replay:
 
 - Position changes are applied; the game plays a morphed car around an
@@ -322,10 +327,53 @@ is derived from the fitted path (smoothed, wrapped), and `morph` writes the
 file. The pipeline produced structurally valid files from multiple private LD
 samples (gear mapped iRacing -1/0/1.. -> AC 0/1/2..).
 
-A same-layout validation used an ignored local LD/LDX lap mapped through an
-ignored calibrated track reference. The output path matches the reference
-with 3.29 m RMSE, completes exactly one yaw sweep, and loads and plays
-correctly in-game. The template replay must be recorded on the exact same
+The converter also supports a full-session mode and two multi-car comparison
+timings. Full-session timing comes from the monotonic LD running-time channel;
+the 0-based AC current-lap field and current-lap timer are reset when the LD
+lap channel changes. The default actual-time comparison preserves each lap's
+recorded timing, holds completed cars at their final pose, and runs until the
+slowest selected lap finishes. Progress comparison instead retimes each path
+to the fastest selected duration using shared track station, keeping cars at
+equivalent progress for a line-only view. Neither mode forces an endpoint to
+meet the other. Comparison requires the shared GPS-to-AC track calibration so
+per-lap rigid fitting cannot absorb line differences. Selected-lap local GPS
+coordinates are translated from their lap origin to the shared track origin
+before applying the ENU-to-AC matrix.
+
+A track JSON's horizontal `enuToAc.matrix` is authoritative when supplied.
+`replay offset-track` can make a measured shared X/Z translation correction by
+changing only matrix elements `[0][3]` and `[2][3]` in a new file. It does not
+move `referencePathAc`, alter the fit rotation/reflection, or independently
+align laps. The cumulative manual correction is stored in
+`calibration.manualOffsetAcM` for auditability and reversal.
+
+`replay calibrate-track` formalizes the trajectory-shape calibration. Its AC
+reference can be a native full-lap replay, a track JSON, or a package directory.
+One or more selected LD laps are moved into a shared geodetic ENU frame,
+represented as closed paths, resampled to equal-distance stations, and combined
+with a pointwise median. The fitter searches circular phase and forward/reversed
+correspondence, solving rotation or reflection plus translation for every
+candidate. Scale is fixed at one unless explicitly enabled and bounded.
+
+The output stores the winning phase/reflection, ordered residual, aggregate and
+per-source nearest-path errors, and source/target lengths. It deliberately omits
+source filenames, hashes, selected lap numbers, and lap times, and never fits
+separate per-lap
+transforms. AC height and the 3D reference path come from the native AC
+reference; GPS altitude remains a separate conversion concern.
+
+A track package consists of a manifest, calibration JSON, and optional
+`.gcsurface` files in one directory. Both legacy `package.json`/`track.json` and
+bundled `manifest.json`/`calibration.json` names are supported. `--gps-track`
+accepts a directory, JSON, or `builtin:` resource. Package surfaces are resolved
+relative to the manifest and loaded automatically for KN5 height mode. The
+repository's KN5 extractor directly
+parses KN5 v1-v6 node geometry in Python, skips textures/materials, applies base
+node transforms, filters renderable meshes by regex, and writes `GCSURF1`.
+
+A same-layout validation used ignored local inputs. The output path stayed
+within the configured reference tolerance, completed one yaw sweep, and loaded
+and played correctly in-game. The template replay must be recorded on the exact same
 track layout as the LD lap.
 
 ### Resample crash cause (session data table between cars and CSP section)

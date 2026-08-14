@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "track": {
+    "name": "thunderhill_raceway_park",
+    "layout": "threemilebypass"
+  },
+  "trackReference": "calibration.json",
+  "surfaces": [
+    "road-pit.gcsurface",
+    "terrain-drive.gcsurface"
+  ],
+  "surfaceSources": [
+    {
+      "kn5": "thunderhill_track.kn5",
+      "meshPattern": "^(1ROAD|1PIT)",
+      "output": "road-pit.gcsurface"
+    },
+    {
+      "kn5": "thunderhill_terrain.kn5",
+      "meshPattern": "^(1ROAD|1GRASS|GRASS)",
+      "output": "terrain-drive.gcsurface"
+    }
+  ]
+}

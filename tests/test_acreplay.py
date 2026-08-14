@@ -1,15 +1,12 @@
 """Tests for the Assetto Corsa .acreplay parser."""
 
 import struct
-import sys
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ghost_car.acreplay import (
     CAR_FRAME,
@@ -24,11 +21,14 @@ from ghost_car.acreplay import (
     parse_header,
 )
 from ghost_car.replay_writer import (
+    _ac_rotation_angles,
     _ac_rotation_matrix,
     _estimate_wheel_yaw_calibration,
+    _synthesize_wheel_rolling,
     locate,
     morph,
     patch_frame,
+    replicate_car,
     resample,
 )
 
@@ -262,6 +262,77 @@ class AcreplayFooterTest(unittest.TestCase):
 
 
 class AcreplayWriterTest(unittest.TestCase):
+    def test_replicate_car_rebuilds_multicar_metadata_and_csp_streams(self):
+        raw = build_replay(num_frames=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "template.acreplay"
+            output = Path(tmp) / "three_cars.acreplay"
+            template.write_bytes(raw)
+
+            replicate_car(
+                template,
+                output,
+                driver_names=["Lap 1", "Lap 2", "Lap 3"],
+                skin_ids=["skin_01", "skin_02", "skin_03"],
+            )
+
+            decoded = parse_acreplay(output, max_frames=1)
+            self.assertEqual(decoded["header"]["numCars"], 3)
+            self.assertEqual(
+                [car["driverName"] for car in decoded["cars"]],
+                ["Lap 1", "Lap 2", "Lap 3"],
+            )
+            self.assertEqual(
+                [car["carSkinID"] for car in decoded["cars"]],
+                ["skin_01", "skin_02", "skin_03"],
+            )
+            ini = decoded["csp"]["iniText"]
+            self.assertIn("[CAR_2]", ini)
+            self.assertIn("DRIVER_NAME=Lap 3", ini)
+            self.assertIn("CARS=3", ini)
+            records = decoded["csp"]["records"]
+            self.assertEqual(
+                [record["name"] for record in records
+                 if record["name"].startswith("EXT_PERCAR")],
+                ["EXT_PERCAR_v7:0", "EXT_PERCAR_v7:1", "EXT_PERCAR_v7:2"],
+            )
+            extra = [
+                record for record in records
+                if record["name"] == "EXT_EXTRASTREAM_v1"
+            ]
+            self.assertEqual(len(extra), 3)
+            self.assertEqual(
+                [record["streamId"] for record in extra],
+                [0xAAAAAAAA, 0xAAAAAAAB, 0xAAAAAAAC],
+            )
+
+    def test_morph_patches_multiple_cars_independently(self):
+        raw = build_replay(num_frames=3, cars=["Lap 1", "Lap 2"])
+        first = [
+            {"positionM": [10.0 + index, 2.0, 3.0]}
+            for index in range(3)
+        ]
+        second = [
+            {"positionM": [20.0 + index, 4.0, 6.0]}
+            for index in range(3)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "template.acreplay"
+            output = Path(tmp) / "morphed.acreplay"
+            template.write_bytes(raw)
+
+            morph(template, output, poses_by_car={0: first, 1: second})
+
+            decoded = parse_acreplay(output, max_frames=0)
+            self.assertEqual(
+                decoded["cars"][0]["frames"][2]["positionM"],
+                [12.0, 2.0, 3.0],
+            )
+            self.assertEqual(
+                decoded["cars"][1]["frames"][2]["positionM"],
+                [22.0, 4.0, 6.0],
+            )
+
     def test_patch_frame_keeps_fixed_wheel_centres_in_body_space(self):
         frame = build_frame(0, 10.0, 2.0, 30.0)
         offsets = np.asarray(
@@ -361,6 +432,131 @@ class AcreplayWriterTest(unittest.TestCase):
         self.assertEqual(patched["slipRatio"], [0.0] * 4)
         self.assertEqual(patched["ndSlip"], [0.0] * 4)
 
+    def test_patch_frame_rotates_complete_wheel_pose_with_new_body(self):
+        raw = bytearray(build_frame(0, 0.0, 0.0, 0.0))
+        old_body = [0.25, 0.4, -0.1]
+        new_body = [-0.2, -0.7, 0.15]
+        struct.pack_into("<3e", raw, 12, old_body[1], old_body[0], old_body[2])
+        for wheel in range(4):
+            struct.pack_into(
+                "<3e",
+                raw,
+                68 + wheel * 6,
+                old_body[1],
+                old_body[0],
+                old_body[2],
+            )
+        calibration = [
+            {"toeRad": 0.0, "steerPerSteeringRad": 0.0}
+            for _ in range(4)
+        ]
+
+        patched = parse_car_frame(
+            patch_frame(
+                bytes(raw),
+                {"rotationRad": new_body, "steerAngleDeg": 0.0},
+                calibration,
+            ),
+            0,
+        )
+
+        expected = _ac_rotation_matrix(patched["rotationRad"])
+        for wheel in range(4):
+            actual = _ac_rotation_matrix(
+                patched["wheelStaticRotationRad"][wheel]
+            )
+            np.testing.assert_allclose(actual, expected, atol=0.003)
+
+    def test_patch_frame_uses_fixed_body_local_wheel_orientation(self):
+        raw = bytearray(build_frame(0, 0.0, 0.0, 0.0))
+        struct.pack_into("<3e", raw, 12, 0.4, 0.25, -0.1)
+        for wheel in range(4):
+            struct.pack_into(
+                "<3e", raw, 68 + wheel * 6, -2.0, 0.7, 1.0
+            )
+        new_body = [-0.2, -0.7, 0.15]
+        calibration = [
+            {"toeRad": 0.0, "steerPerSteeringRad": 0.0}
+            for _ in range(4)
+        ]
+
+        patched = parse_car_frame(
+            patch_frame(
+                bytes(raw),
+                {"rotationRad": new_body, "steerAngleDeg": 0.0},
+                calibration,
+                wheel_rotation_offsets=[np.eye(3) for _ in range(4)],
+            ),
+            0,
+        )
+
+        expected = _ac_rotation_matrix(patched["rotationRad"])
+        for wheel in range(4):
+            actual = _ac_rotation_matrix(
+                patched["wheelStaticRotationRad"][wheel]
+            )
+            np.testing.assert_allclose(actual, expected, atol=0.003)
+
+    def test_patch_frame_stops_wheel_rotation_and_angular_velocity(self):
+        raw = bytearray(build_frame(0, 0.0, 0.0, 0.0))
+        struct.pack_into("<4e", raw, 172, 90.0, 91.0, 92.0, 93.0)
+        for wheel in range(4):
+            struct.pack_into(
+                "<3e", raw, 68 + wheel * 6, 0.2, 0.1, -0.05
+            )
+            struct.pack_into(
+                "<3e", raw, 140 + wheel * 6, -2.0, 0.7, 1.0
+            )
+        calibration = [
+            {"toeRad": 0.0, "steerPerSteeringRad": 0.0}
+            for _ in range(4)
+        ]
+
+        patched = parse_car_frame(
+            patch_frame(
+                bytes(raw),
+                {
+                    "rotationRad": [0.0, 0.0, 0.0],
+                    "steerAngleDeg": 0.0,
+                    "wheelAngularVelocityRads": [0.0] * 4,
+                    "wheelRollAngleRad": [0.0] * 4,
+                },
+                calibration,
+                wheel_rotation_offsets=[np.eye(3) for _ in range(4)],
+            ),
+            0,
+        )
+
+        np.testing.assert_allclose(patched["wheelAngularVelocityRads"], 0.0)
+        for wheel in range(4):
+            np.testing.assert_allclose(
+                _ac_rotation_matrix(patched["wheelRotationRad"][wheel]),
+                _ac_rotation_matrix(
+                    patched["wheelStaticRotationRad"][wheel]
+                ),
+                atol=0.003,
+            )
+
+    def test_synthesize_wheel_rolling_follows_vehicle_speed(self):
+        poses = [
+            {"velocityMS": [0.0, 0.0, 0.0]},
+            {"velocityMS": [10.0, 0.0, 0.0]},
+            {"velocityMS": [10.0, 0.0, 0.0]},
+        ]
+        calibration = [
+            {"radiusM": 0.5, "direction": 1.0}
+            for _ in range(4)
+        ]
+
+        result = _synthesize_wheel_rolling(poses, 0.1, calibration)
+
+        np.testing.assert_allclose(result[0]["wheelAngularVelocityRads"], 0.0)
+        np.testing.assert_allclose(result[1]["wheelAngularVelocityRads"], 20.0)
+        np.testing.assert_allclose(result[2]["wheelAngularVelocityRads"], 20.0)
+        np.testing.assert_allclose(result[0]["wheelRollAngleRad"], 0.0)
+        np.testing.assert_allclose(result[1]["wheelRollAngleRad"], 1.0)
+        np.testing.assert_allclose(result[2]["wheelRollAngleRad"], 3.0)
+
     def test_patch_frame_scales_front_wheel_yaw_without_changing_steer(self):
         raw = bytearray(build_frame(0, 0.0, 0.0, 0.0))
         calibration = [
@@ -382,18 +578,46 @@ class AcreplayWriterTest(unittest.TestCase):
 
         expected_front_yaw = 0.08 * np.radians(30.0) * 2.0
         self.assertAlmostEqual(patched["steerAngleDeg"], 30.0, delta=0.01)
+        body_rotation = _ac_rotation_matrix(patched["rotationRad"])
         for wheel in (0, 1):
+            wheel_rotation = _ac_rotation_matrix(
+                patched["wheelStaticRotationRad"][wheel]
+            )
+            relative_yaw = _ac_rotation_angles(
+                body_rotation.T @ wheel_rotation
+            )[1]
             self.assertAlmostEqual(
-                patched["wheelStaticRotationRad"][wheel][1],
+                relative_yaw,
                 expected_front_yaw,
                 delta=0.001,
             )
         for wheel in (2, 3):
+            wheel_rotation = _ac_rotation_matrix(
+                patched["wheelStaticRotationRad"][wheel]
+            )
+            relative_yaw = _ac_rotation_angles(
+                body_rotation.T @ wheel_rotation
+            )[1]
             self.assertAlmostEqual(
-                patched["wheelStaticRotationRad"][wheel][1],
+                relative_yaw,
                 0.0,
                 delta=0.001,
             )
+
+    def test_patch_frame_clears_horn_and_rebuilds_lap_boundary_status(self):
+        raw = bytearray(build_frame(0, 0.0, 0.0, 0.0))
+        preserved = (1 << 6) | (1 << 10)
+        struct.pack_into("<H", raw, 248, preserved | (1 << 3) | (1 << 11))
+
+        regular = parse_car_frame(
+            patch_frame(bytes(raw), {"lapBoundaryPulse": False}), 0
+        )
+        boundary = parse_car_frame(
+            patch_frame(bytes(raw), {"lapBoundaryPulse": True}), 0
+        )
+
+        self.assertEqual(regular["status"], preserved)
+        self.assertEqual(boundary["status"], preserved | (1 << 11))
 
     def test_wheel_yaw_calibration_recovers_template_steering_scale(self):
         frames = []
@@ -534,6 +758,30 @@ class AcreplayWriterTest(unittest.TestCase):
                 for frame in original
             ]
             self.assertIn(tuple(middle["wheelRotationRad"][0]), native)
+
+    def test_resample_selects_status_bitfields_without_interpolating_them(self):
+        raw = bytearray(build_replay(num_frames=2))
+        car = locate(raw)["cars"][0]
+        frame_offset = car["start"] + len(car["headerBytes"])
+        source_statuses = (0, 1024)
+        for index, status in enumerate(source_statuses):
+            struct.pack_into(
+                "<H", raw, frame_offset + FRAME_HEADER.size + 248, status
+            )
+            frame_offset += FRAME_HEADER.size + CAR_FRAME_SIZE
+            if index == 0:
+                frame_offset += car["numWings"] * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "template.acreplay"
+            output = Path(tmp) / "resampled.acreplay"
+            template.write_bytes(raw)
+            resample(template, output, 129)
+            statuses = {
+                frame["status"]
+                for frame in parse_acreplay(output, max_frames=0)["cars"][0]["frames"]
+            }
+            self.assertLessEqual(statuses, set(source_statuses))
 
 
 if __name__ == "__main__":

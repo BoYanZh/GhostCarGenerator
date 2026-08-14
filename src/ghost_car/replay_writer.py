@@ -24,11 +24,13 @@ __all__ = [
     "morph",
     "pack_car_frame",
     "patch_frame",
+    "replicate_car",
     "resample",
 ]
 
 import json
 import math
+import re
 import struct
 import zlib
 from pathlib import Path
@@ -41,6 +43,7 @@ from .acreplay import (
     FRAME_HEADER_SIZE,
     POSTFIX,
     find_csp_data_offset,
+    parse_acreplay,
     parse_car_frame,
     parse_header,
 )
@@ -49,6 +52,8 @@ GLOBAL_FRAME_BASE_BYTES = 4
 TRACK_OBJECT_BYTES = 12
 CSP_TRAILING_ENTRY_BYTES = 8
 DEFAULT_WHEEL_STEER_PER_STEERING_RAD = 0.08
+STATUS_HORN = 1 << 3
+STATUS_LAP_BOUNDARY = 1 << 11
 
 
 def _lstring_bytes(text):
@@ -160,6 +165,23 @@ def _ac_rotation_matrix(rotation):
     return rotate_y @ rotate_x @ rotate_z
 
 
+def _ac_rotation_angles(matrix):
+    """Return AC YXZ Euler angles for a body-to-world rotation matrix."""
+    rotation = np.asarray(matrix, dtype=np.float64)
+    if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
+        raise ValueError("AC rotation matrix must be finite and 3x3")
+    pitch = math.asin(max(-1.0, min(1.0, float(rotation[1, 2]))))
+    if abs(math.cos(pitch)) > 1e-7:
+        yaw = math.atan2(-float(rotation[0, 2]), float(rotation[2, 2]))
+        roll = math.atan2(-float(rotation[1, 0]), float(rotation[1, 1]))
+    else:
+        # At pitch gimbal lock, choose roll zero and preserve the combined
+        # horizontal rotation in yaw. The resulting matrix is equivalent.
+        yaw = math.atan2(float(rotation[2, 0]), float(rotation[0, 0]))
+        roll = 0.0
+    return [pitch, _wrap_pi(yaw), _wrap_pi(roll)]
+
+
 def _estimate_wheel_position_offsets(frame_bytes):
     """Estimate stable wheel centres in the template body's local space."""
     frames = [parse_car_frame(frame, 0) for frame in frame_bytes]
@@ -249,6 +271,119 @@ def _estimate_wheel_yaw_calibration(frame_bytes):
     return calibration
 
 
+def _nearest_rotation(matrix):
+    """Project a finite 3x3 matrix onto the nearest proper rotation."""
+    u, _, vt = np.linalg.svd(np.asarray(matrix, dtype=np.float64))
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    return rotation
+
+
+def _estimate_wheel_rotation_offsets(frame_bytes, yaw_calibration):
+    """Estimate stable no-steer wheel orientations in the body's frame."""
+    frames = [parse_car_frame(frame, 0) for frame in frame_bytes]
+    if not frames:
+        raise ValueError("Wheel rotation calibration needs at least one frame")
+    samples = [[], [], [], []]
+    for frame in frames:
+        body_rotation = _ac_rotation_matrix(frame["rotationRad"])
+        steer_rad = math.radians(frame["steerAngleDeg"])
+        for wheel, calibration in enumerate(yaw_calibration):
+            relative_yaw = (
+                calibration["toeRad"]
+                + calibration["steerPerSteeringRad"] * steer_rad
+            )
+            static_rotation = _ac_rotation_matrix(
+                frame["wheelStaticRotationRad"][wheel]
+            )
+            local_rotation = body_rotation.T @ static_rotation
+            no_steer = (
+                _ac_rotation_matrix([0.0, -relative_yaw, 0.0])
+                @ local_rotation
+            )
+            samples[wheel].append(no_steer)
+    return [
+        _nearest_rotation(np.median(np.asarray(wheel_samples), axis=0))
+        for wheel_samples in samples
+    ]
+
+
+def _estimate_wheel_rolling_calibration(frame_bytes):
+    """Estimate effective rolling radius and stored rotation direction."""
+    frames = [parse_car_frame(frame, 0) for frame in frame_bytes]
+    if not frames:
+        raise ValueError("Wheel rolling calibration needs at least one frame")
+    speed = np.linalg.norm(
+        np.asarray([frame["velocityMS"] for frame in frames], dtype=np.float64),
+        axis=1,
+    )
+    angular = np.asarray(
+        [frame["wheelAngularVelocityRads"] for frame in frames],
+        dtype=np.float64,
+    )
+    calibration = []
+    for wheel in range(4):
+        usable = (
+            np.isfinite(speed)
+            & np.isfinite(angular[:, wheel])
+            & (speed >= 5.0)
+            & (np.abs(angular[:, wheel]) >= 5.0)
+        )
+        ratios = speed[usable] / np.abs(angular[usable, wheel])
+        plausible = ratios[(ratios >= 0.15) & (ratios <= 0.6)]
+        radius = float(np.median(plausible)) if len(plausible) else 0.32
+        direction = (
+            float(np.sign(np.median(angular[usable, wheel])))
+            if np.any(usable)
+            else 1.0
+        )
+        calibration.append(
+            {"radiusM": radius, "direction": direction or 1.0}
+        )
+    return calibration
+
+
+def _synthesize_wheel_rolling(
+    poses, interval_s, rolling_calibration, stationary_speed_mps=0.25
+):
+    """Derive coherent wheel angular velocity and roll phase from car speed."""
+    interval = float(interval_s)
+    if interval <= 0.0:
+        raise ValueError("Replay interval must be positive")
+    if len(rolling_calibration) != 4:
+        raise ValueError("Wheel rolling calibration requires four wheels")
+    angles = np.zeros(4, dtype=np.float64)
+    previous_angular = np.zeros(4, dtype=np.float64)
+    result = []
+    for index, pose in enumerate(poses):
+        speed = float(
+            np.linalg.norm(
+                np.asarray(pose.get("velocityMS", [0.0, 0.0, 0.0]), dtype=float)
+            )
+        )
+        if speed < stationary_speed_mps:
+            angular = np.zeros(4, dtype=np.float64)
+        else:
+            angular = np.asarray(
+                [
+                    item["direction"] * speed / item["radiusM"]
+                    for item in rolling_calibration
+                ],
+                dtype=np.float64,
+            )
+        if index:
+            angles += 0.5 * (previous_angular + angular) * interval
+            angles = (angles + math.pi) % (2.0 * math.pi) - math.pi
+        item = dict(pose)
+        item["wheelAngularVelocityRads"] = angular.tolist()
+        item["wheelRollAngleRad"] = angles.tolist()
+        result.append(item)
+        previous_angular = angular
+    return result
+
+
 def synth_poses(layout, car_index, mode, speed_ms, json_path=None):
     """Generate pose overrides for every frame of one car."""
     num_frames = layout["cars"][car_index]["numFrames"]
@@ -328,6 +463,7 @@ def patch_frame(
     wheel_yaw_calibration=None,
     wheel_position_offsets=None,
     wheel_steer_multiplier=1.0,
+    wheel_rotation_offsets=None,
 ):
     """Overwrite pose fields inside one 256-byte frame (in place)."""
     if wheel_steer_multiplier <= 0.0:
@@ -378,8 +514,10 @@ def patch_frame(
                 struct.pack_into("<12f", data, offset, *transformed)
         struct.pack_into("<3f", data, 0, *pose["positionM"])
     if "rotationRad" in pose or "steerAngleDeg" in pose:
-        old_body_yaw = original["rotationRad"][1]
-        new_body_yaw = pose.get("rotationRad", original["rotationRad"])[1]
+        old_body_rotation = _ac_rotation_matrix(original["rotationRad"])
+        new_body_rotation = _ac_rotation_matrix(
+            pose.get("rotationRad", original["rotationRad"])
+        )
         steer_rad = math.radians(
             pose.get("steerAngleDeg", original["steerAngleDeg"])
         )
@@ -388,30 +526,77 @@ def patch_frame(
                 {
                     "toeRad": _wrap_pi(
                         original["wheelStaticRotationRad"][wheel][1]
-                        - old_body_yaw
+                        - original["rotationRad"][1]
                     ),
                     "steerPerSteeringRad": 0.0,
                 }
                 for wheel in range(4)
             ]
         for wheel, calibration in enumerate(wheel_yaw_calibration):
-            desired_static_yaw = _wrap_pi(
-                new_body_yaw
-                + calibration["toeRad"]
+            desired_relative_yaw = _wrap_pi(
+                calibration["toeRad"]
                 + calibration["steerPerSteeringRad"]
                 * steer_rad
                 * wheel_steer_multiplier
             )
-            old_static_yaw = original["wheelStaticRotationRad"][wheel][1]
-            yaw_delta = _wrap_pi(desired_static_yaw - old_static_yaw)
-            dynamic_yaw = _wrap_pi(
-                original["wheelRotationRad"][wheel][1] + yaw_delta
+            old_static_rotation = _ac_rotation_matrix(
+                original["wheelStaticRotationRad"][wheel]
             )
-            # Both rotation triplets are stored YXZ, so yaw is the first
-            # binary16 value. Adding world yaw preserves the dynamic wheel's
-            # rolling orientation instead of replacing it.
-            struct.pack_into("<e", data, 68 + wheel * 6, desired_static_yaw)
-            struct.pack_into("<e", data, 140 + wheel * 6, dynamic_yaw)
+            old_dynamic_rotation = _ac_rotation_matrix(
+                original["wheelRotationRad"][wheel]
+            )
+            if wheel_rotation_offsets is None:
+                local_static_rotation = (
+                    old_body_rotation.T @ old_static_rotation
+                )
+                old_relative_yaw = _ac_rotation_angles(
+                    local_static_rotation
+                )[1]
+                local_static_rotation = (
+                    _ac_rotation_matrix(
+                        [
+                            0.0,
+                            _wrap_pi(
+                                desired_relative_yaw - old_relative_yaw
+                            ),
+                            0.0,
+                        ]
+                    )
+                    @ local_static_rotation
+                )
+            else:
+                local_static_rotation = (
+                    _ac_rotation_matrix([0.0, desired_relative_yaw, 0.0])
+                    @ np.asarray(
+                        wheel_rotation_offsets[wheel], dtype=np.float64
+                    )
+                )
+            new_static_rotation = new_body_rotation @ local_static_rotation
+            if "wheelRollAngleRad" in pose:
+                rolling_rotation = _ac_rotation_matrix(
+                    [float(pose["wheelRollAngleRad"][wheel]), 0.0, 0.0]
+                )
+            else:
+                rolling_rotation = old_static_rotation.T @ old_dynamic_rotation
+            new_dynamic_rotation = new_static_rotation @ rolling_rotation
+            static_angles = _ac_rotation_angles(new_static_rotation)
+            dynamic_angles = _ac_rotation_angles(new_dynamic_rotation)
+            struct.pack_into(
+                "<3e",
+                data,
+                68 + wheel * 6,
+                static_angles[1],
+                static_angles[0],
+                static_angles[2],
+            )
+            struct.pack_into(
+                "<3e",
+                data,
+                140 + wheel * 6,
+                dynamic_angles[1],
+                dynamic_angles[0],
+                dynamic_angles[2],
+            )
     if "rotationRad" in pose:
         rx, ry, rz = pose["rotationRad"]
         struct.pack_into("<3e", data, 12, ry, rx, rz)  # stored YXZ
@@ -419,6 +604,10 @@ def patch_frame(
         struct.pack_into("<3e", data, 164, *pose["velocityMS"])
     if "rpm" in pose:
         struct.pack_into("<e", data, 170, float(pose["rpm"]))
+    if "wheelAngularVelocityRads" in pose:
+        struct.pack_into(
+            "<4e", data, 172, *pose["wheelAngularVelocityRads"]
+        )
     if "steerAngleDeg" in pose:
         struct.pack_into("<e", data, 212, float(pose["steerAngleDeg"]))
     for key, offset in (
@@ -436,6 +625,17 @@ def patch_frame(
         data[244] = int(pose["gas"])
     if "brake" in pose:
         data[245] = int(pose["brake"])
+    if "currentLap" in pose:
+        data[246] = int(pose["currentLap"])
+    # LD telemetry has no horn channel. Bit 11 is a one-frame lap-boundary
+    # pulse in native recordings, so LD poses rebuild it from their lap
+    # sequence instead of inheriting an unrelated template timestamp.
+    status = original["status"] & ~STATUS_HORN
+    if "lapBoundaryPulse" in pose:
+        status &= ~STATUS_LAP_BOUNDARY
+        if pose["lapBoundaryPulse"]:
+            status |= STATUS_LAP_BOUNDARY
+    struct.pack_into("<H", data, 248, status)
     return bytes(data)
 
 
@@ -448,27 +648,54 @@ def morph(
     json_path=None,
     poses=None,
     wheel_steer_multiplier=1.0,
+    poses_by_car=None,
 ):
     if wheel_steer_multiplier <= 0.0:
         raise ValueError("Wheel steering multiplier must be positive")
     raw = Path(template_path).read_bytes()
     layout = locate(raw)
-    if car_index < 0 or car_index >= len(layout["cars"]):
-        raise ValueError("car index {} out of range".format(car_index))
-    if poses is None:
-        poses = synth_poses(layout, car_index, mode, speed_ms, json_path)
-    elif len(poses) != layout["cars"][car_index]["numFrames"]:
-        raise ValueError(
-            "Pose count {} does not match template frame count {}".format(
-                len(poses), layout["cars"][car_index]["numFrames"]
+    if poses_by_car is not None and (poses is not None or json_path is not None):
+        raise ValueError("poses_by_car cannot be combined with poses or json_path")
+    if poses_by_car is None:
+        if car_index < 0 or car_index >= len(layout["cars"]):
+            raise ValueError("car index {} out of range".format(car_index))
+        if poses is None:
+            poses = synth_poses(layout, car_index, mode, speed_ms, json_path)
+        poses_by_car = {car_index: poses}
+    else:
+        poses_by_car = dict(poses_by_car)
+        if not poses_by_car:
+            raise ValueError("poses_by_car needs at least one car")
+    calibration = {}
+    position_offsets = {}
+    rotation_offsets = {}
+    rolling_calibration = {}
+    for target_car, target_poses in poses_by_car.items():
+        if target_car < 0 or target_car >= len(layout["cars"]):
+            raise ValueError("car index {} out of range".format(target_car))
+        expected = layout["cars"][target_car]["numFrames"]
+        if len(target_poses) != expected:
+            raise ValueError(
+                "Pose count {} does not match car {} frame count {}".format(
+                    len(target_poses), target_car, expected
+                )
             )
+        frames = [
+            frame for _, frame in layout["cars"][target_car]["frames"]
+        ]
+        calibration[target_car] = _estimate_wheel_yaw_calibration(frames)
+        position_offsets[target_car] = _estimate_wheel_position_offsets(frames)
+        rotation_offsets[target_car] = _estimate_wheel_rotation_offsets(
+            frames, calibration[target_car]
         )
-    wheel_yaw_calibration = _estimate_wheel_yaw_calibration(
-        [frame for _, frame in layout["cars"][car_index]["frames"]]
-    )
-    wheel_position_offsets = _estimate_wheel_position_offsets(
-        [frame for _, frame in layout["cars"][car_index]["frames"]]
-    )
+        rolling_calibration[target_car] = _estimate_wheel_rolling_calibration(
+            frames
+        )
+        poses_by_car[target_car] = _synthesize_wheel_rolling(
+            target_poses,
+            layout["header"]["recordingIntervalMs"] / 1000.0,
+            rolling_calibration[target_car],
+        )
     out = bytearray()
     out += layout["headerBytes"]
     out += layout["globalBytes"]
@@ -476,13 +703,14 @@ def morph(
         out += car_layout["headerBytes"]
         for index in range(car_layout["numFrames"]):
             frame_header, frame = car_layout["frames"][index]
-            if ci == car_index and index < len(poses):
+            if ci in poses_by_car:
                 frame = patch_frame(
                     frame,
-                    poses[index],
-                    wheel_yaw_calibration,
-                    wheel_position_offsets,
+                    poses_by_car[ci][index],
+                    calibration[ci],
+                    position_offsets[ci],
                     wheel_steer_multiplier,
+                    rotation_offsets[ci],
                 )
             out += frame_header + frame
             out += car_layout["wings"][index]
@@ -502,6 +730,173 @@ def car_section_size(layout):
         + c["trailing"] * CSP_TRAILING_ENTRY_BYTES
         for c in layout["cars"]
     )
+
+
+def _pack_car_header(car, num_frames, num_wings, driver_name, skin_id):
+    out = bytearray()
+    for value in (
+        car["carID"],
+        driver_name,
+        car["nationCode"],
+        car["driverTeam"],
+        skin_id,
+    ):
+        out += _lstring_bytes(value)
+    out += struct.pack("<II", num_frames, num_wings)
+    return bytes(out)
+
+
+def _set_ini_value(text, section, key, value):
+    pattern = re.compile(
+        r"(?ms)(^\[{}\]\s*$.*?)(?=^\[|\Z)".format(re.escape(section))
+    )
+    match = pattern.search(text)
+    if match is None:
+        return (
+            text.rstrip()
+            + "\n\n[{}]\n{}={}\n".format(section, key, value)
+        )
+    block = match.group(1)
+    key_pattern = re.compile(r"(?m)^{}=.*$".format(re.escape(key)))
+    replacement = "{}={}".format(key, value)
+    if key_pattern.search(block):
+        block = key_pattern.sub(replacement, block, count=1)
+    else:
+        block = block.rstrip() + "\n" + replacement + "\n\n"
+    return text[:match.start(1)] + block + text[match.end(1):]
+
+
+def _replicate_session_ini(ini_text, car, driver_names, skin_ids):
+    match = re.search(r"(?ms)^\[CAR_0\]\s*$.*?(?=^\[|\Z)", ini_text)
+    if match is None:
+        raise ValueError("Template session INI has no CAR_0 section")
+    source = match.group(0)
+    blocks = []
+    for index, (driver_name, skin_id) in enumerate(zip(driver_names, skin_ids)):
+        block = re.sub(r"(?m)^\[CAR_0\]$", "[CAR_{}]".format(index), source)
+        block = re.sub(
+            r"(?m)^DRIVER_NAME=.*$", "DRIVER_NAME={}".format(driver_name), block
+        )
+        block = re.sub(r"(?m)^SKIN=.*$", "SKIN={}".format(skin_id), block)
+        if index > 0:
+            if re.search(r"(?m)^MODEL=", block):
+                block = re.sub(
+                    r"(?m)^MODEL=.*$", "MODEL={}".format(car["carID"]), block
+                )
+            else:
+                block = block.rstrip() + "\nMODEL={}\n".format(car["carID"])
+            block = re.sub(r"(?m)^__CM_DRIVEN_DISTANCE=.*\n?", "", block)
+            if "AI_LEVEL=" not in block:
+                block = block.rstrip() + "\nAI_AGGRESSION=0\nAI_LEVEL=100\n"
+        blocks.append(block.rstrip() + "\n\n")
+    ini_text = ini_text[:match.start()] + "".join(blocks) + ini_text[match.end():]
+    ini_text = _set_ini_value(ini_text, "RACE", "CARS", len(driver_names))
+    return ini_text
+
+
+def _replace_csp_ini(prelude, ini_text):
+    offset = 0
+    while offset + 4 <= len(prelude):
+        (length,) = struct.unpack_from("<I", prelude, offset)
+        end = offset + 4 + length
+        if end > len(prelude):
+            raise ValueError("CSP prelude string overruns its byte range")
+        if length > 255:
+            return prelude[:offset] + _lstring_bytes(ini_text) + prelude[end:]
+        offset = end
+    raise ValueError("CSP prelude has no session INI blob")
+
+
+def _extension_record_bytes(name, payload):
+    return _lstring_bytes(name.decode("ascii")) + struct.pack("<I", len(payload)) + payload
+
+
+def replicate_car(
+    template_path,
+    output_path,
+    driver_names,
+    skin_ids=None,
+    source_car=0,
+):
+    """Replicate a single template car into multiple replay comparison cars."""
+    names = [str(name) for name in driver_names]
+    if not names:
+        raise ValueError("At least one driver name is required")
+    if len(names) > 16:
+        raise ValueError("At most 16 comparison cars are supported")
+    raw = Path(template_path).read_bytes()
+    layout = locate(raw)
+    if len(layout["cars"]) != 1 or source_car != 0:
+        raise ValueError("Car replication currently requires a single-car template")
+    parsed = parse_acreplay(template_path, max_frames=1)
+    car = parsed["cars"][source_car]
+    skins = (
+        [car["carSkinID"]] * len(names)
+        if skin_ids is None
+        else [str(skin) for skin in skin_ids]
+    )
+    if len(skins) != len(names):
+        raise ValueError("Skin count must match comparison car count")
+
+    header = dict(layout["header"])
+    header["numCars"] = len(names)
+    source = layout["cars"][source_car]
+    out = bytearray(pack_header(header))
+    out += layout["globalBytes"]
+    for driver_name, skin_id in zip(names, skins):
+        out += _pack_car_header(
+            car, source["numFrames"], source["numWings"], driver_name, skin_id
+        )
+        for index, (frame_header, frame) in enumerate(source["frames"]):
+            out += frame_header + frame + source["wings"][index]
+        out += source["trailingBytes"]
+
+    # Native race replays begin with one classification group. Each 20-byte
+    # entry points to the next car, wrapping the final car to zero.
+    out += struct.pack("<I", 1)
+    for index in range(len(names)):
+        out += struct.pack("<5I", (index + 1) % len(names), 0, 1, 0, 0)
+
+    prelude_end, records = _walk_csp_records(raw, layout["cspOffset"])
+    prelude = raw[layout["cspOffset"]:prelude_end]
+    ini = _replicate_session_ini(parsed["csp"]["iniText"], car, names, skins)
+    csp_offset = len(out)
+    out += _replace_csp_ini(prelude, ini)
+    per_car = next(
+        (record for record in records if record["name"].startswith(b"EXT_PERCAR")),
+        None,
+    )
+    extra = next(
+        (record for record in records if record["name"].startswith(b"EXT_EXTRASTREAM")),
+        None,
+    )
+    inserted_per_car = False
+    inserted_extra = False
+    for record in records:
+        if record["name"].startswith(b"EXT_PERCAR"):
+            if not inserted_per_car:
+                prefix = per_car["name"].split(b":", 1)[0]
+                for index in range(len(names)):
+                    out += _extension_record_bytes(
+                        prefix + b":" + str(index).encode("ascii"), per_car["payload"]
+                    )
+                inserted_per_car = True
+            continue
+        if record["name"].startswith(b"EXT_EXTRASTREAM"):
+            if not inserted_extra:
+                base_id, metadata = struct.unpack_from("<II", extra["payload"])
+                stream = extra["payload"][8:]
+                for index in range(len(names)):
+                    payload = struct.pack("<II", base_id + index, metadata) + stream
+                    out += _extension_record_bytes(extra["name"], payload)
+                inserted_extra = True
+            continue
+        out += _extension_record_bytes(record["name"], record["payload"])
+    tail = bytearray(raw[layout["footer"]:])
+    struct.pack_into("<I", tail, len(POSTFIX), csp_offset)
+    out += tail
+    Path(output_path).write_bytes(out)
+    return len(out)
 
 
 def pack_car_frame(frame):
@@ -648,6 +1043,10 @@ def resample(template_path, output_path, num_frames, stream_content="interp"):
         ).astype(int)
         for start, end in ((18, 30), (42, 54)):
             new_matrix[:, start:end] = matrix[nearest, start:end]
+        # status and unknown2 are u16 bitfields, not continuous quantities.
+        # Interpolating them manufactures bit combinations that can activate
+        # controls such as the horn and lights for single frames.
+        new_matrix[:, 100:102] = matrix[nearest, 100:102]
         new_frames = _matrix_to_frames(new_matrix)
         for frame in new_frames:
             # Trailing byte is a constant flag in native recordings; the

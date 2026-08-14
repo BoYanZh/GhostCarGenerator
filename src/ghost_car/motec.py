@@ -1,6 +1,10 @@
 """MoTeC LD loading isolated from the optional ldparser dependency."""
 
-__all__ = ["parse_channel_overrides", "extract_motec_points"]
+__all__ = [
+    "parse_channel_overrides",
+    "extract_motec_points",
+    "session_segment_diagnostics",
+]
 
 import bisect
 import importlib.util
@@ -9,6 +13,8 @@ import statistics
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 
 CHANNEL_ALIASES = {
@@ -49,35 +55,25 @@ CHANNEL_ALIASES = {
 
 
 def load_ld_data(parser_path: Optional[str] = None):
-    candidates = []
     if parser_path:
         supplied = Path(parser_path).expanduser().resolve()
-        candidates.append(supplied / "ldparser.py" if supplied.is_dir() else supplied)
-    package_root = Path(__file__).resolve().parent
-    candidates.extend(
-        (
-            package_root.parent / "ldparser" / "ldparser.py",
-            package_root / "ldparser" / "ldparser.py",
-        )
-    )
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        spec = importlib.util.spec_from_file_location("_ghost_car_ldparser", str(candidate))
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        if hasattr(module, "ldData"):
-            return module.ldData
+        candidate = supplied / "ldparser.py" if supplied.is_dir() else supplied
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "_ghost_car_ldparser", str(candidate)
+            )
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "ldData"):
+                    return module.ldData
+        raise ImportError("Unable to load ldparser from {}".format(supplied))
     try:
-        from ldparser.ldparser import ldData
+        from ._vendor.ldparser import ldData
+
         return ldData
-    except (ImportError, AttributeError):
-        pass
-    raise ImportError(
-        "Unable to load ldparser. Initialize the git submodule or pass --ldparser-path."
-    )
+    except (ImportError, AttributeError) as exc:
+        raise ImportError("Unable to load the bundled ldparser") from exc
 
 
 def parse_channel_overrides(items: Sequence[str]) -> Dict[str, str]:
@@ -185,6 +181,63 @@ def _load_ldx_lap_intervals(
         for index, (start, end) in enumerate(zip(marker_times, marker_times[1:]))
         if end > start
     ]
+
+
+def session_segment_diagnostics(
+    duration_s: float,
+    timed_lap_intervals: Sequence[Dict[str, float]],
+    time_origin_s: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Classify a full recording around the timed laps marked by its LDX file."""
+    duration = float(duration_s)
+    time_origin = float(time_origin_s)
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ValueError("Session duration must be finite and non-negative")
+    if not math.isfinite(time_origin):
+        raise ValueError("Session time origin must be finite")
+
+    timed_segments = []
+    for interval in timed_lap_intervals:
+        start = max(0.0, min(duration, float(interval["startS"]) - time_origin))
+        end = max(0.0, min(duration, float(interval["endS"]) - time_origin))
+        if end <= start:
+            continue
+        timed_segments.append(
+            {
+                "kind": "timed-lap",
+                "lap": int(interval["lap"]),
+                "startS": start,
+                "endS": end,
+                "durationS": end - start,
+            }
+        )
+    timed_segments.sort(key=lambda item: (item["startS"], item["endS"]))
+    if not timed_segments:
+        return []
+
+    segments: List[Dict[str, Any]] = []
+    first_start = float(timed_segments[0]["startS"])
+    if first_start > 0.0:
+        segments.append(
+            {
+                "kind": "out-lap",
+                "startS": 0.0,
+                "endS": first_start,
+                "durationS": first_start,
+            }
+        )
+    segments.extend(timed_segments)
+    last_end = max(float(item["endS"]) for item in timed_segments)
+    if last_end < duration:
+        segments.append(
+            {
+                "kind": "in-lap",
+                "startS": last_end,
+                "endS": duration,
+                "durationS": duration - last_end,
+            }
+        )
+    return segments
 
 
 def _time_descriptor(times: Sequence[float], target: float) -> Tuple[int, int, float]:
@@ -314,6 +367,7 @@ def extract_motec_points(
     selected_lap = None
     selection_source = "all"
     ldx_interval = None
+    session_time_origin_s = 0.0
     if lap_selection != "all":
         intervals = _load_ldx_lap_intervals(
             ld_path,
@@ -395,8 +449,25 @@ def extract_motec_points(
             (end_left, end_right, end_fraction, end_time - start_time)
         )
     else:
+        all_times = None
+        if lap_selection == "all" and running_time is not None:
+            if len(running_time) < sample_count:
+                raise ValueError("Running-time channel is shorter than position channels")
+            candidate_times = np.asarray(running_time[:sample_count], dtype=float)
+            if np.all(np.isfinite(candidate_times)) and np.all(
+                np.diff(candidate_times) >= 0.0
+            ):
+                session_time_origin_s = float(candidate_times[0])
+                all_times = candidate_times - candidate_times[0]
         descriptors = [
-            (source_index, source_index, 0.0, output_index * time_step)
+            (
+                source_index,
+                source_index,
+                0.0,
+                float(all_times[source_index])
+                if all_times is not None
+                else output_index * time_step,
+            )
             for output_index, source_index in enumerate(indices)
         ]
     if len(descriptors) < 2:
@@ -470,6 +541,13 @@ def extract_motec_points(
             "pitchRad": float(_sample_series(pitch, descriptor, 0.0)),
             "rollRad": float(_sample_series(roll, descriptor, 0.0)),
         }
+        if selected_lap is not None:
+            point["lapNumber"] = int(selected_lap)
+        elif lap_values is not None:
+            sampled_lap = _sample_series(lap_values, descriptor, 1.0)
+            point["lapNumber"] = max(1, int(round(float(sampled_lap))))
+        else:
+            point["lapNumber"] = 1
         if heading is not None:
             heading_value = float(_sample_series(heading, descriptor, 0.0))
             point["headingRad"] = (
@@ -478,6 +556,18 @@ def extract_motec_points(
                 else heading_value
             )
         points.append(point)
+    session_segments = []
+    if lap_selection == "all":
+        session_segments = session_segment_diagnostics(
+            float(points[-1]["timeS"]),
+            _load_ldx_lap_intervals(
+                ld_path,
+                ldx_path,
+                use_companion_ldx,
+                ldx_time_scale,
+            ),
+            time_origin_s=session_time_origin_s,
+        )
     return {
         "points": points,
         "selectedLap": selected_lap,
@@ -486,6 +576,7 @@ def extract_motec_points(
         "frequencyHz": frequency,
         "origin": coordinate_origin,
         "coordinateSystem": "geodetic" if uses_geodetic else "cartesian",
+        "sessionSegments": session_segments,
         "metadata": {
             "driverName": _metadata_value(ld.head, "driver"),
             "carName": _metadata_value(ld.head, "vehicleid", "vehicle"),

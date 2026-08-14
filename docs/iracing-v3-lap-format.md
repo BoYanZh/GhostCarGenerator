@@ -1,8 +1,8 @@
 # iRacing v3 BLAP/OLAP format notes
 
-These observations are based on 19 BLAP/OLAP files from five layouts, two cars,
-two drivers, and 31,797 samples. Constant fields are structural observations,
-not proof of their private iRacing names.
+These observations are based on a varied local set of BLAP/OLAP files spanning
+multiple layouts and cars. Constant fields are structural observations, not
+proof of their private iRacing names.
 
 ## Binary layout
 

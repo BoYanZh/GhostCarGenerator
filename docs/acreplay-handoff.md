@@ -51,9 +51,9 @@ python -m ghost_car replay convert `
   --wheel-steer-multiplier 2.0
 ~~~
 
-Copy the output into the AC replay folder and play it. Validated
-metrics include a 3.29 m RMSE to the track centerline, a one-lap yaw sweep,
-and CSP stream lengths consistent with the frame count. Native replays,
+Copy the output into the AC replay folder and play it. Validation checks the
+track-reference tolerance, one-lap yaw sweep, and CSP stream lengths against
+the frame count. Native replays,
 telemetry, track references, and generated outputs must remain private.
 
 ## Hard-won facts (do not re-derive)
@@ -94,53 +94,45 @@ wrapping, and controls. A track JSON is checked against the template's track
 and layout.
 
 The default `--height-mode track` preserves GPS X/Z while taking Y from the
-nearest AC reference-path segment. Validation diagnostics changed
-vertical RMSE from 1.16 m to 0.00 m relative to that reference. The
+nearest AC reference-path segment, removing GPS/AC vertical-datum mismatch
+relative to that reference. The
 `gps-offset` and `gps` modes remain available for comparison.
 
 Wheel world positions now use median same-car template offsets fixed in body
-space, avoiding time-compressed suspension movement. Their local-position
-error is at most 1.62 mm and their relative-height step is 1.22 mm at P95,
-3.61 mm maximum. GPS X/Z and yaw use a 0.75 s zero-phase quadratic filter; lap
+space, avoiding time-compressed suspension movement and keeping residual
+movement within replay quantization. GPS X/Z and yaw use a 0.75 s zero-phase quadratic filter; lap
 start and finish are fitted independently and are never treated as a closed
-loop. On the validation lap, the P95 horizontal adjustment was 0.32 m, maximum
-0.47 m, and the lateral acceleration-noise proxy fell by about 90%.
+loop. Local validation confirmed that the filter reduces lateral jitter
+without forcing the lap endpoints together.
 
-The current LD source has zero pitch and roll, so pitch is derived from the
-smoothed aligned-track tangent. It spans approximately -3.31 to +3.42 degrees
-between P05 and P95, correlates 0.9978 with path grade, and has 0.138-degree
-RMSE. Roll remains zero for this source.
+When the LD pitch signal is unusable, pitch is derived from the smoothed
+aligned-track tangent and follows the reconstructed grade. Roll remains the LD
+value.
 
 The replay `gas` byte is mapped from driver accelerator input, not electronic
 throttle-plate position. Default aliases intentionally exclude `Throttle Pos`.
 The converter detects a stable low pedal-sensor rest cluster, maps it through
 a 2% dead zone to zero, interpolates short missing runs, and normalizes gas and
-brake independently. On the private validation sample, zero-gas frames changed
-from 0.7% before calibration to 25.3%, close to 21.4% in the native reference;
-WOT frames remained 51.3% and there were no isolated one-frame zero glitches.
+brake independently. Local validation confirmed that released-pedal frames are
+restored without introducing isolated one-frame zero glitches.
 
 Both YXZ wheel-rotation blocks are now updated too. The writer infers each
 front wheel's road-wheel/steering-wheel yaw scale from the same-car template,
 then applies replacement body yaw, calibrated toe, and the LD steering angle.
-The physical scale is approximately 0.078 in the native example and 0.077 in
-the generated replay, so the calibration itself is correct. The optional
+Native and generated steering scales agree in local validation. The optional
 `--wheel-steer-multiplier` changes only rendered front-wheel yaw, not the
-stored LD steering field. A 2.0 multiplier maps the generated 6.9-degree peak
-to the native example's 13.4--13.9-degree on-track P99 range. The resulting
-front-wheel P95/maximum are 8.76/13.71 degrees; both rear wheels still differ
-from body yaw by 0 degrees. LD has no trustworthy per-wheel slip channels, so
+stored LD steering field. It can make low-amplitude steering visible while the
+rear wheels continue to track body yaw. LD has no trustworthy per-wheel slip channels, so
 slip angle, slip ratio, and nd-slip are explicitly zeroed; the old tested
 output contained unrelated template values large enough to trigger continuous
 smoke.
 
 Wheel rotations must not use the generic numeric interpolation path. Native
 rolling wheels repeatedly cross YXZ singularities; interpolating x/y/z
-separately made the dynamic axle differ from the static axle by 116--118
-degrees at P95. The resampler now selects each 12-value static/dynamic rotation
-block from one nearest native frame, then `morph` applies body/steering yaw to
-that complete pose. Validation P95 axle error is 0.153--0.158 degrees, matching
-the native template's approximately 0.145 degrees; P05 cosine similarity is
-0.999996.
+separately caused extreme dynamic/static axle disagreement. The resampler now
+selects each 12-value static/dynamic rotation block from one nearest native
+frame, then `morph` applies body/steering yaw to that complete pose. The
+remaining axle error is consistent with the native template.
 
 ## Validation status and future work
 
@@ -148,14 +140,12 @@ the native template's approximately 0.145 degrees; P05 cosine similarity is
 
 - In-game validation confirmed that fixed body-local wheel centres remove
   vertical bouncing and track-derived body pitch has the correct direction.
-- The 2.0x front-wheel steering scale is visible and has the correct sign. Its
-  P95 magnitude is 8.76--8.79 degrees and maximum is 13.69--13.71 degrees,
-  matching the large-but-normal tail of the native same-car example.
+- The optional front-wheel steering scale is visible and has the correct sign;
+  tune it against a native same-car example.
 - Rear wheels remain aligned with the body, false skid smoke is absent, and
   wheel-axis/camber flashing is eliminated.
-- Rolling rotation is still inherited from the native template; synthesize it
-  from speed and effective tire radius only if the next visual check shows an
-  obvious wheel-spin-rate mismatch.
+- Rolling rotation is synthesized from vehicle speed and a same-car effective
+  tire radius/direction calibration; confirm its rate in-game.
 - Derive roll from a trustworthy bank/attitude source only if a later visual
   pass shows that zero roll is inadequate.
 - Compare the generated frames against the same-lap ghost frame by
@@ -179,10 +169,9 @@ the native template's approximately 0.145 degrees; P05 cosine similarity is
 
 ## Constraints and cautions
 
-- Do not distribute native replays, track references, or template
-  files (personal data / possibly licensed content). The
-  `track_references/` publishing pattern in this repo shows the
-  sanitized form.
+- Do not distribute native replays or template files (personal data / possibly
+  licensed content). The privacy-reduced resources under
+  `src/ghost_car/resources/tracks/` show the publishable derived form.
 - The parser supports CSP version-16 files only; vanilla (non-CSP)
   replays were not sampled.
 - Anything generated must be validated in the actual game before it is

@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Python package build metadata
 *.egg-info/
@@ -17,8 +18,10 @@ dist/
 *.olapta
 *.ghost
 
-# Data directory
+# Private/local work directories
 data/
+tmp/
+.work/
 
 # One-off analysis and experiment scripts
 scratch/
@@ -29,9 +32,10 @@ analysis_report.md
 *.tmp
 *.log
 
-# Sanitized, vehicle-independent public track references
-!track_references/
-!track_references/*.json
+# Versioned public track resources included in the Python package
+!src/ghost_car/resources/
+!src/ghost_car/resources/**/*.json
+src/ghost_car/resources/**/*.gcsurface
 
 # OS generated files
 .DS_Store

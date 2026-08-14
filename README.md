@@ -17,12 +17,14 @@ notes and acceptance limits are in
 ## Requirements
 
 - Python 3.8 or newer
-- The bundled `ldparser` submodule for MoTeC LD input
+- NumPy 1.24 or newer
 
 ~~~powershell
-git submodule update --init
 python -m pip install -e .
 ~~~
+
+MoTeC LD support uses the GPLv3 `ldparser` snapshot vendored in the Python
+package; no Git submodule or separate parser installation is required.
 
 The installed `ghost-car` command and `python -m ghost_car` are equivalent.
 
@@ -106,6 +108,105 @@ ghost-car replay convert native-template.acreplay telemetry.ld `
   -o converted.acreplay
 ~~~
 
+`--gps-track` also accepts a versioned track-package directory or a bundled
+`builtin:` resource. `.gcsurface` geometry is not bundled; generate the
+manifest-listed files locally from your installed KN5 assets. With
+`--height-mode kn5`, those local surfaces are loaded automatically:
+
+~~~powershell
+ghost-car replay convert native-template.acreplay telemetry.ld `
+  --gps-track builtin:assetto_corsa/thunderhill_raceway_park/threemilebypass `
+  --height-mode kn5 --session `
+  -o full-session.acreplay
+~~~
+
+The repository includes a privacy-reduced Thunderhill `threemilebypass`
+package. Source telemetry, native replay/ghost files, driver/vehicle metadata,
+lap times, source hashes, and extracted geometry are not bundled. The package
+does retain the public track GPS origin and a derived AC reference path because
+both are required for absolute calibration and track-height matching.
+
+To keep the complete recording, including out-lap, every timed lap, and
+in-lap, use `--session`. The replay runs from the first LD sample to the last;
+lap numbers and current-lap timers follow the source log, and no lap end is
+artificially joined back to its start:
+
+~~~powershell
+ghost-car replay convert native-template.acreplay telemetry.ld `
+  --gps-track calibrated-track.json `
+  --session `
+  -o full-session.acreplay
+~~~
+
+To compare laps, `--compare-laps` creates one cloned car per selected lap in a
+single replay. The default `--compare-sync time` preserves each recorded lap
+time: all cars start together, separate according to their real pace, and a
+finished car remains at its final position until the slowest lap finishes.
+Use `--compare-sync progress` for a line-only view where cars are retimed by
+shared track progress and remain together; this deliberately removes lap-time
+differences. A calibrated `--gps-track` is required: fitting each lap
+independently onto the template would erase the differences being compared.
+Use `--compare-skins` with one installed skin ID per lap when visual color
+separation is useful; otherwise all cars retain the template skin.
+
+~~~powershell
+ghost-car replay convert native-template.acreplay telemetry.ld `
+  --gps-track calibrated-track.json `
+  --compare-laps 1 2 3 4 `
+  --compare-sync time `
+  --compare-skins skin_red skin_blue skin_green skin_white `
+  -o line-comparison.acreplay
+~~~
+
+Full-session replay size grows with duration, car count, template track-object
+count, and CSP streams. A long session can therefore be substantially larger
+than a single-lap replay.
+
+If every converted lap has the same small AC-world displacement, create a new
+calibration JSON with an explicit X/Z correction. The command changes only the
+translation in `enuToAc.matrix`; the simulator reference path and original
+JSON remain untouched. Apply small 0.25--0.5 m steps and use the corrected file
+with `--gps-track`:
+
+~~~powershell
+ghost-car replay offset-track calibrated-track.json `
+  --x-m 0.25 --z-m -0.50 `
+  -o calibrated-track-corrected.json
+~~~
+
+Offsets are AC world axes, not vehicle left/right. Re-running `offset-track`
+on a corrected JSON accumulates the recorded `calibration.manualOffsetAcM`.
+Do not use a separate correction per lap: that would erase real racing-line
+differences. If the apparent error changes direction around the circuit, it is
+more likely a rotation/scale, GPS receiver-to-body offset, or noisy source and
+requires recalibration rather than a global translation.
+
+Create or rebuild a calibration from a native full-lap replay or existing
+track package plus one or more complete LD laps:
+
+~~~powershell
+ghost-car replay calibrate-track native-full-lap.acreplay telemetry.ld `
+  --lap 2 --track-name example_track --layout example_layout `
+  -o calibrated-track.json
+~~~
+
+For a shared multi-lap fit, repeat an LD path when selecting several laps from
+one file, or provide multiple LD files. Repeat `--lap` once per input:
+
+~~~powershell
+ghost-car replay calibrate-track existing-track-package `
+  stint.ld stint.ld stint.ld `
+  --lap 2 --lap 3 --lap 4 `
+  -o calibrated-track-multilap.json
+~~~
+
+All logs are converted into one common ENU frame, arc-length resampled, and
+combined by their median trajectory before one shared transform is solved.
+Scale stays fixed at one unless `--allow-scale` is explicit. Per-source
+RMSE/P95/max diagnostics are written without filenames, hashes, selected lap
+numbers, or lap times.
+More laps reduce random GPS noise, but do not justify per-lap snapping.
+
 GPS altitude and Assetto Corsa world height do not share a reliable datum.
 The default `--height-mode track` keeps GPS X/Z but takes Y from the nearest
 segment of the calibrated AC reference path. This prevents a car from floating
@@ -115,26 +216,62 @@ offset; `gps` keeps the raw mapped height. Use `--height-offset-m` only for a
 small final body-height correction. Generated files still require an in-game
 acceptance check because CSP replay rules are partly reverse-engineered.
 
+For pit lanes and other paths far from the calibrated reference line, extract
+the layout's actual `1ROAD*` and `1PIT` KN5 triangles and use explicit KN5
+height matching. This does not read `fast_lane.ai` or `pit_lane.ai`:
+
+~~~powershell
+ghost-car replay export-kn5-surface "C:\path\to\track\track.kn5" `
+  --mesh-pattern "^(1ROAD|1PIT)" `
+  -o track.gcsurface
+
+ghost-car replay convert native-template.acreplay telemetry.ld `
+  --gps-track calibrated-track.json `
+  --height-mode kn5 `
+  --track-surface track.gcsurface `
+  --session `
+  -o full-session-kn5.acreplay
+~~~
+
+The KN5 reader is pure Python and skips texture/material payloads. It does not
+require Content Manager, AcTools, .NET, or 32-bit PowerShell.
+
+The converter ray-matches each replay X/Z against the road/pit triangles and
+adds a body clearance calibrated from the native AC reference path. Samples
+outside the extracted surface fall back to the reference-path height. Repeat
+`--track-surface` when the layout stores pit/paddock ground in a separate
+terrain KN5; the surfaces share AC world coordinates and are combined without
+using AI lane files.
+
 LD GPS X/Z and heading are filtered on their native sample grid before the
 15 ms replay resample. The default 0.75 s zero-phase quadratic window removes
 visible sample-to-sample lateral wander without joining the end of a lap back
 to its start; override it with `--position-smoothing-s` when needed. Both
 world-coordinate wheel-position blocks use the same-car template's median
 body-local wheel centres and follow the replacement body's full yaw, pitch,
-and roll. This intentionally fixes suspension travel instead of
+and roll. Wheel orientation likewise uses a robust fixed body-local template
+orientation, then adds target steering and native rolling phase. This avoids
+retaining unrelated template Euler pitch/roll and producing extreme camber.
+This intentionally fixes suspension travel instead of
 time-compressing an unrelated template drive into the generated lap. Body
 pitch follows the smoothed tangent of the height-aligned 3D path because some
 LD exports contain no useful pitch channel. Wheel yaw is rebuilt from the
 replacement body yaw and an automatically calibrated same-car template
 steering ratio. `--wheel-steer-multiplier` optionally scales only the rendered
 front-wheel yaw while leaving the recorded steering field unchanged; its
-default is 1.0. A 2.0 value maps the tested LD lap's 6.9-degree peak to the
-native GR86 example's approximately 13.4--13.9-degree on-track P99 range.
+default is 1.0. Tune it against a same-car native replay when the source
+steering range is visually too small.
 Unsupported per-wheel slip channels are cleared instead of replaying unrelated
 template skids and smoke. When the template frame count changes, each wheel
 rotation is selected as one complete native YXZ triplet; its three Euler
 components are never interpolated independently across wheel roll
 singularities.
+
+Wheel angular velocity and rolling phase are synthesized from the generated
+car speed using an effective radius and rotation direction robustly calibrated
+from the native same-car template. Template wheel speed is not replayed: wheels
+are stopped below 0.25 m/s and rotate continuously with vehicle speed above
+that threshold.
 
 The replay `gas` byte represents driver accelerator input. Automatic channel
 selection therefore accepts accelerator/pedal names but does not silently use
@@ -201,7 +338,7 @@ metadata unless an explicit header override is supplied.
 
 The repository may publish a sanitized track-reference artifact separately from
 a target profile. For example,
-`track_references/lagunaseca-2026.axis.json` contains only a local closed
+`src/ghost_car/resources/tracks/iracing/lagunaseca-2026/axis.json` contains only a local closed
 east/north axis, lap fraction, layout identifier, and track length. It contains
 no BLAP prefix, vehicle metadata, GPS origin, source-file hashes, or Formula Vee
 provenance, and is not itself an iRacing lapfile or target profile.
@@ -349,21 +486,17 @@ match the target vehicle.
 
 | Path | Responsibility |
 | --- | --- |
-| `ghost_car/cli.py` | CLI parsing, file I/O, and command dispatch |
-| `ghost_car/iracing.py` | Lossless iRacing BLAP/OLAP codec |
-| `ghost_car/acreplay.py` | Assetto Corsa .acreplay parser |
-| `ghost_car/replay_writer.py` | Template-preserving replay morph and resampling |
-| `ghost_car/ld_replay.py` | MoTeC-to-replay alignment, height correction, and conversion |
-| `ghost_car/conversion.py` | Resampling, smoothing, pose, and control conversion |
-| `ghost_car/ibt.py` | Native IBT GPS parsing and least-squares/ICP path alignment |
-| `ghost_car/corridor.py` | Corridor-constrained lateral-offset correction |
-| `ghost_car/motec.py` | MoTeC loading, channel mapping, GPS cleanup, and lap selection |
-| `ghost_car/__main__.py` | `python -m ghost_car` entry point |
-| `ldparser/` | MoTeC parser Git submodule |
+| `src/ghost_car/` | Installable Python package and CLI implementation |
+| `src/ghost_car/_vendor/` | GPLv3 ldparser snapshot and upstream license |
+| `src/ghost_car/resources/tracks/` | Bundled simulator-specific public track resources |
+| `tests/` | Deterministic unit and integration tests |
 | `docs/` | Reverse-engineering notes and support boundaries |
 | `pyproject.toml` | Package metadata and console entry point |
 
 ## Legal and usage notice
+
+Copyright (C) 2026 BoYanZh. GhostCarGenerator is free software licensed under
+the GNU General Public License version 3; see `LICENSE`.
 
 GhostCarGenerator is an independent interoperability and research project. It
 is not affiliated with, authorized by, or endorsed by iRacing.com Motorsport
@@ -376,8 +509,9 @@ relevant software. You are responsible for your use of the tool and for
 compliance with those agreements.
 
 This repository does not distribute iRacing BLAP/OLAP files, target profiles,
-opaque binary prefixes, vehicle or track assets, or other proprietary game
-data. Do not publish or redistribute those materials. A target profile can
+opaque binary prefixes, original vehicle/track assets, or other proprietary
+game data. It includes only privacy-reduced derived calibration/reference JSON.
+Do not publish or redistribute the source materials. A target profile can
 contain an opaque prefix copied from the source lap file and should be treated
 as private local data.
 
