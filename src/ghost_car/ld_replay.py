@@ -41,6 +41,7 @@ from .replay_writer import morph, replicate_car, resample
 from .track_surface import TrackSurface
 
 RECORDING_INTERVAL_MS = 15.0
+TRACK_LATERAL_SMOOTHING_S = 0.15
 
 
 def offset_track_calibration(track_ref, x_m=0.0, z_m=0.0):
@@ -151,11 +152,64 @@ def _accelerator_fraction(values):
     return np.clip((fraction - threshold) / (1.0 - threshold), 0.0, 1.0)
 
 
-def smooth_replay_positions(positions, frequency_hz, window_s=0.75):
-    """Remove GPS-scale X/Z jitter while preserving the vertical profile."""
+def _track_lateral_filter(positions, reference_xyz, frequency_hz, window_s):
+    """Filter only the signed lateral offset from a shared AC reference path."""
+    reference = np.asarray(reference_xyz, dtype=np.float64)
+    if reference.ndim != 2 or reference.shape[1] != 3 or len(reference) < 2:
+        raise ValueError("Track lateral filtering needs an Nx3 reference path")
+    path = reference[:, [0, 2]]
+    segment_gap = float(np.linalg.norm(path[-1] - path[0]))
+    median_segment = float(np.median(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+    if segment_gap > 1e-6 and segment_gap <= max(1e-6, 2.5 * median_segment):
+        path = np.vstack((path, path[0]))
+    distance = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    if not np.any(distance > 1e-12):
+        raise ValueError("Track lateral filtering needs a non-degenerate reference path")
+    station = np.r_[0.0, np.cumsum(distance)]
+    dense_station = np.arange(0.0, station[-1], 0.5)
+    dense_path = np.column_stack(
+        (
+            np.interp(dense_station, station, path[:, 0]),
+            np.interp(dense_station, station, path[:, 1]),
+        )
+    )
+    tangent = np.gradient(dense_path, axis=0)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
+    normals = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    query = np.asarray(positions[:, [0, 2]], dtype=np.float64)
+    lateral = np.empty(len(query), dtype=np.float64)
+    query_normals = np.empty((len(query), 2), dtype=np.float64)
+    for index, point in enumerate(query):
+        sample = int(np.argmin(np.einsum("ij,ij->i", dense_path - point, dense_path - point)))
+        normal = normals[sample]
+        lateral[index] = float(np.dot(point - dense_path[sample], normal))
+        query_normals[index] = normal
+    window = _smoothing_window(frequency_hz, window_s, len(lateral))
+    filtered = _savgol_series(lateral, window) if window >= 3 else lateral.copy()
+    result = positions.copy()
+    result[:, [0, 2]] += query_normals * (filtered - lateral)[:, None]
+    correction = np.abs(filtered - lateral)
+    return result, {
+        "positionSmoothingMode": "track-lateral",
+        "trackLateralSmoothingS": float(window_s),
+        "trackLateralSmoothingSamples": int(window),
+        "trackLateralCorrectionRmsM": float(np.sqrt(np.mean(correction ** 2))),
+        "trackLateralCorrectionP95M": float(np.percentile(correction, 95)),
+        "trackLateralCorrectionMaxM": float(np.max(correction)),
+    }
+
+
+def smooth_replay_positions(
+    positions, frequency_hz, window_s=0.75, reference_xyz=None
+):
+    """Remove GPS X/Z jitter, optionally filtering only track-relative lateral offset."""
     positions = np.asarray(positions, dtype=np.float64)
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError("Replay positions must be an Nx3 array")
+    if reference_xyz is not None:
+        return _track_lateral_filter(
+            positions, reference_xyz, frequency_hz, window_s
+        )
     window = _smoothing_window(frequency_hz, window_s, len(positions))
     smoothed = positions.copy()
     if window >= 3:
@@ -166,6 +220,7 @@ def smooth_replay_positions(positions, frequency_hz, window_s=0.75):
     )
     diagnostics = {
         "positionSmoothingS": float(window_s),
+        "positionSmoothingMode": "world-xz",
         "positionSmoothingSamples": int(window),
         "positionSmoothingRmsM": float(np.sqrt(np.mean(shifts ** 2))),
         "positionSmoothingP95M": float(np.percentile(shifts, 95)),
@@ -767,6 +822,14 @@ def convert_ld_to_acreplay(
             frequency_hz=points["frequencyHz"],
             window_s=position_smoothing_s,
         )
+        if track_ref is not None:
+            transformed, lateral_diagnostics = smooth_replay_positions(
+                transformed,
+                frequency_hz=points["frequencyHz"],
+                window_s=min(position_smoothing_s, TRACK_LATERAL_SMOOTHING_S),
+                reference_xyz=reference,
+            )
+            smoothing_diagnostics.update(lateral_diagnostics)
         transformed, height_diagnostics = align_replay_heights(
             transformed,
             reference,

@@ -416,6 +416,22 @@ class ReplayPositionSmoothingTest(unittest.TestCase):
         self.assertAlmostEqual(smoothed[0, 0], 0.0, places=9)
         self.assertGreater(smoothed[-1, 0], 500.0)
 
+    def test_track_lateral_filter_preserves_longitudinal_and_height(self):
+        reference = np.column_stack(
+            (np.zeros(41), np.zeros(41), np.arange(41, dtype=float))
+        )
+        positions = reference.copy()
+        positions[:, 0] = 0.2 * ((-1.0) ** np.arange(41))
+        positions[:, 1] = np.linspace(3.0, 4.0, 41)
+        smoothed, diagnostics = smooth_replay_positions(
+            positions, frequency_hz=20.0, window_s=0.45, reference_xyz=reference
+        )
+        np.testing.assert_allclose(smoothed[:, 2], positions[:, 2])
+        np.testing.assert_allclose(smoothed[:, 1], positions[:, 1])
+        self.assertLess(np.std(smoothed[:, 0]), np.std(positions[:, 0]) * 0.5)
+        self.assertEqual(diagnostics["positionSmoothingMode"], "track-lateral")
+        self.assertEqual(diagnostics["trackLateralSmoothingSamples"], 9)
+
 
 class ReplayTrackValidationTest(unittest.TestCase):
     @staticmethod
