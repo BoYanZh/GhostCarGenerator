@@ -23,6 +23,7 @@ from ghost_car.acreplay import (
 from ghost_car.replay_writer import (
     _ac_rotation_angles,
     _ac_rotation_matrix,
+    _estimate_wheel_position_offsets,
     _estimate_wheel_yaw_calibration,
     _synthesize_wheel_rolling,
     locate,
@@ -45,6 +46,14 @@ def build_frame(offset, x, y, z, rpm=0.0, gear=0, gas=0, brake=0, lap_ms=0):
     values = [0.0] * 106
     values[0:3] = (x, y, z)
     values[3:6] = (0.0, 0.5, 0.0)
+    wheel_positions = [
+        x - 0.75, y - 0.35, z + 1.25,
+        x + 0.75, y - 0.35, z + 1.25,
+        x - 0.75, y - 0.35, z - 1.25,
+        x + 0.75, y - 0.35, z - 1.25,
+    ]
+    values[6:18] = wheel_positions
+    values[30:42] = wheel_positions
     values[54:57] = (1.0, 0.0, 0.0)
     values[57] = rpm
     values[78] = 0.0
@@ -262,6 +271,20 @@ class AcreplayFooterTest(unittest.TestCase):
 
 
 class AcreplayWriterTest(unittest.TestCase):
+    def test_wheel_position_calibration_rejects_remote_wheel_centres(self):
+        frame = bytearray(build_frame(0, 0.0, 0.0, 0.0))
+        remote_wheels = [
+            150.0, 0.0, 80.0,
+            151.0, 0.0, 80.0,
+            150.0, 0.0, 78.0,
+            151.0, 0.0, 78.0,
+        ]
+        struct.pack_into("<12f", frame, 20, *remote_wheels)
+        struct.pack_into("<12f", frame, 92, *remote_wheels)
+
+        with self.assertRaisesRegex(ValueError, "implausible wheel centres"):
+            _estimate_wheel_position_offsets([bytes(frame)])
+
     def test_replicate_car_rebuilds_multicar_metadata_and_csp_streams(self):
         raw = build_replay(num_frames=3)
         with tempfile.TemporaryDirectory() as tmp:

@@ -52,6 +52,8 @@ GLOBAL_FRAME_BASE_BYTES = 4
 TRACK_OBJECT_BYTES = 12
 CSP_TRAILING_ENTRY_BYTES = 8
 DEFAULT_WHEEL_STEER_PER_STEERING_RAD = 0.08
+MIN_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M = 0.1
+MAX_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M = 10.0
 STATUS_HORN = 1 << 3
 STATUS_LAP_BOUNDARY = 1 << 11
 
@@ -200,13 +202,37 @@ def _estimate_wheel_position_offsets(frame_bytes):
                     np.asarray(position, dtype=np.float64) - body_position
                 )
                 samples[field][wheel].append(local)
-    return {
+    offsets = {
         field: [
             np.median(np.asarray(wheel_samples), axis=0)
             for wheel_samples in field_samples
         ]
         for field, field_samples in samples.items()
     }
+    distances = np.asarray([
+        np.linalg.norm(offset)
+        for field_offsets in offsets.values()
+        for offset in field_offsets
+    ])
+    plausible = (
+        np.all(np.isfinite(distances))
+        and np.all(distances >= MIN_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M)
+        and np.all(distances <= MAX_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M)
+    )
+    if not plausible:
+        rendered = ", ".join(
+            "{:.3f}".format(float(distance)) for distance in distances
+        )
+        raise ValueError(
+            "Template has implausible wheel centres: body-local distances "
+            "[{}] m; expected {:.1f}-{:.1f} m. Use a native or known-good "
+            "same-car replay template.".format(
+                rendered,
+                MIN_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M,
+                MAX_PLAUSIBLE_WHEEL_CENTER_DISTANCE_M,
+            )
+        )
+    return offsets
 
 
 def _estimate_wheel_yaw_calibration(frame_bytes):
