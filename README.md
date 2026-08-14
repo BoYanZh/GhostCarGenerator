@@ -250,8 +250,9 @@ to its start; override it with `--position-smoothing-s` when needed. Body yaw
 uses a separate 1.0 s default window (`--yaw-smoothing-s`) so multi-car replay
 body orientation is stable without over-smoothing genuine lap-line differences. Both
 when a calibrated track reference is supplied, a conservative 0.15 s
-track-normal lateral pass removes only high-frequency cross-track noise while
-retaining the longitudinal timing and each lap's distinct line.
+track-normal lateral pass uses the local lateral second difference to apply
+stronger filtering only to rough samples, retaining the longitudinal timing
+and each lap's distinct line.
 world-coordinate wheel-position blocks use the same-car template's median
 body-local wheel centres and follow the replacement body's full yaw, pitch,
 and roll. Wheel orientation likewise uses a robust fixed body-local template

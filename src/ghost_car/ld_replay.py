@@ -185,7 +185,19 @@ def _track_lateral_filter(positions, reference_xyz, frequency_hz, window_s):
         lateral[index] = float(np.dot(point - dense_path[sample], normal))
         query_normals[index] = normal
     window = _smoothing_window(frequency_hz, window_s, len(lateral))
-    filtered = _savgol_series(lateral, window) if window >= 3 else lateral.copy()
+    candidate = _savgol_series(lateral, window) if window >= 3 else lateral.copy()
+    previous = np.r_[lateral[0], lateral[:-1]]
+    following = np.r_[lateral[1:], lateral[-1]]
+    roughness = np.abs(previous - 2.0 * lateral + following)
+    low = float(np.percentile(roughness, 40))
+    high = float(np.percentile(roughness, 80))
+    if high - low <= 1e-12:
+        adaptive_weight = np.ones(len(lateral), dtype=np.float64)
+    else:
+        adaptive_weight = np.clip(
+            (roughness - low) / (high - low), 0.0, 1.0
+        )
+    filtered = lateral + adaptive_weight * (candidate - lateral)
     result = positions.copy()
     result[:, [0, 2]] += query_normals * (filtered - lateral)[:, None]
     correction = np.abs(filtered - lateral)
@@ -196,6 +208,8 @@ def _track_lateral_filter(positions, reference_xyz, frequency_hz, window_s):
         "trackLateralCorrectionRmsM": float(np.sqrt(np.mean(correction ** 2))),
         "trackLateralCorrectionP95M": float(np.percentile(correction, 95)),
         "trackLateralCorrectionMaxM": float(np.max(correction)),
+        "trackLateralAdaptiveWeightMean": float(np.mean(adaptive_weight)),
+        "trackLateralAdaptiveWeightP95": float(np.percentile(adaptive_weight, 95)),
     }
 
 

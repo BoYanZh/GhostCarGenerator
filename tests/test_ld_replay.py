@@ -431,6 +431,7 @@ class ReplayPositionSmoothingTest(unittest.TestCase):
         self.assertLess(np.std(smoothed[:, 0]), np.std(positions[:, 0]) * 0.5)
         self.assertEqual(diagnostics["positionSmoothingMode"], "track-lateral")
         self.assertEqual(diagnostics["trackLateralSmoothingSamples"], 9)
+        self.assertGreater(diagnostics["trackLateralAdaptiveWeightMean"], 0.0)
 
 
 class ReplayTrackValidationTest(unittest.TestCase):
