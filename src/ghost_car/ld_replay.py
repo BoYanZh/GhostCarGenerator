@@ -239,14 +239,43 @@ def gps_track_to_ac(points, track_ref):
         ac.append((matrix @ enu)[:3])
     ac = np.asarray(ac)
     reference = np.array(track_ref["referencePathAc"], dtype=np.float64)
-    nearest = np.array([
-        np.min(np.linalg.norm(reference[:, [0, 2]] - row[[0, 2]], axis=1))
-        for row in ac
-    ])
+    delta = ac[:, None, [0, 2]] - reference[None, :, [0, 2]]
+    nearest = np.sqrt(np.min(np.einsum("qri,qri->qr", delta, delta), axis=1))
     rms = float(np.sqrt((nearest ** 2).mean()))
     # The 4x4 matrix maps (e, n, u) to (x, y, z); the horizontal
     # rotation is rows 0 and 2, columns 0 and 1.
     return ac, rms, matrix[[0, 2], :2]
+
+
+def _project_reference_segments(reference_xyz, query_xyz):
+    """Project X/Z queries onto all reference segments in one vectorized pass."""
+    reference = np.asarray(reference_xyz, dtype=np.float64)
+    query = np.asarray(query_xyz, dtype=np.float64)
+    if reference.ndim != 2 or reference.shape[1] != 3 or len(reference) < 2:
+        raise ValueError("Reference needs at least two XYZ points")
+    if query.ndim != 2 or query.shape[1] != 3:
+        raise ValueError("Queries need an Nx3 array")
+    if not np.allclose(reference[0], reference[-1]):
+        reference = np.vstack((reference, reference[0]))
+    start = reference[:-1]
+    delta = reference[1:] - start
+    horizontal = delta[:, [0, 2]]
+    length_sq = np.einsum("ij,ij->i", horizontal, horizontal)
+    valid = length_sq > 1e-12
+    relative = query[:, None, [0, 2]] - start[None, :, [0, 2]]
+    along = np.zeros((len(query), len(start)), dtype=np.float64)
+    along[:, valid] = np.einsum(
+        "qsi,si->qs", relative[:, valid], horizontal[valid]
+    ) / length_sq[valid]
+    along = np.clip(along, 0.0, 1.0)
+    projected = start[None, :, [0, 2]] + along[:, :, None] * horizontal[None, :, :]
+    distance_sq = np.einsum(
+        "qsi,qsi->qs", query[:, None, [0, 2]] - projected,
+        query[:, None, [0, 2]] - projected,
+    )
+    segment = np.argmin(distance_sq, axis=1)
+    rows = np.arange(len(query))
+    return segment, along[rows, segment], np.sqrt(distance_sq[rows, segment])
 
 
 def _reference_heights(reference_xyz, query_xyz):
@@ -257,28 +286,13 @@ def _reference_heights(reference_xyz, query_xyz):
         raise ValueError("Height reference needs at least two XYZ points")
     if not np.allclose(reference[0], reference[-1]):
         reference = np.vstack((reference, reference[0]))
-    start = reference[:-1]
-    delta = reference[1:] - start
-    horizontal = delta[:, [0, 2]]
-    length_sq = np.einsum("ij,ij->i", horizontal, horizontal)
-    result = np.empty(len(query), dtype=np.float64)
-    horizontal_distance = np.empty(len(query), dtype=np.float64)
-    for index, point in enumerate(query):
-        relative = point[[0, 2]] - start[:, [0, 2]]
-        along = np.zeros(len(start), dtype=np.float64)
-        valid = length_sq > 1e-12
-        along[valid] = (
-            np.einsum("ij,ij->i", relative[valid], horizontal[valid])
-            / length_sq[valid]
-        )
-        along = np.clip(along, 0.0, 1.0)
-        projected = start[:, [0, 2]] + horizontal * along[:, None]
-        distance_sq = np.einsum(
-            "ij,ij->i", point[[0, 2]] - projected, point[[0, 2]] - projected
-        )
-        segment = int(np.argmin(distance_sq))
-        result[index] = start[segment, 1] + along[segment] * delta[segment, 1]
-        horizontal_distance[index] = math.sqrt(float(distance_sq[segment]))
+    segment, along, horizontal_distance = _project_reference_segments(
+        reference, query
+    )
+    result = reference[segment, 1] + along * (
+        np.asarray(reference)[np.minimum(segment + 1, len(reference) - 1), 1]
+        - reference[segment, 1]
+    )
     return result, horizontal_distance
 
 
@@ -366,27 +380,12 @@ def _reference_track_progress(reference_xyz, query_xyz):
     start = reference[:-1]
     horizontal = reference[1:, [0, 2]] - start[:, [0, 2]]
     lengths = np.linalg.norm(horizontal, axis=1)
-    length_sq = lengths ** 2
     cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
     total_length = float(cumulative[-1])
     if total_length <= 1e-6:
         raise ValueError("Track-progress reference has no horizontal length")
-    wrapped = np.empty(len(query), dtype=np.float64)
-    for index, point in enumerate(query):
-        relative = point[[0, 2]] - start[:, [0, 2]]
-        along = np.zeros(len(start), dtype=np.float64)
-        valid = length_sq > 1e-12
-        along[valid] = (
-            np.einsum("ij,ij->i", relative[valid], horizontal[valid])
-            / length_sq[valid]
-        )
-        along = np.clip(along, 0.0, 1.0)
-        projected = start[:, [0, 2]] + horizontal * along[:, None]
-        distance_sq = np.einsum(
-            "ij,ij->i", point[[0, 2]] - projected, point[[0, 2]] - projected
-        )
-        segment = int(np.argmin(distance_sq))
-        wrapped[index] = cumulative[segment] + along[segment] * lengths[segment]
+    segment, along, _ = _project_reference_segments(reference, query)
+    wrapped = cumulative[segment] + along * lengths[segment]
     unwrapped = np.unwrap(wrapped * 2.0 * math.pi / total_length)
     unwrapped *= total_length / (2.0 * math.pi)
     differences = np.diff(unwrapped)
@@ -647,7 +646,7 @@ def convert_ld_to_acreplay(
 ):
     """Convert one lap, a full session, or synchronized comparison laps."""
     compared_laps = None if compare_laps is None else [int(item) for item in compare_laps]
-    if compare_sync not in ("time", "progress"):
+    if compare_sync not in ("time", "progress", "driven-distance"):
         raise ValueError("Unknown comparison timing: {}".format(compare_sync))
     selected_modes = int(bool(session)) + int(compared_laps is not None) + int(lap is not None)
     if selected_modes > 1:
@@ -662,7 +661,10 @@ def convert_ld_to_acreplay(
         if len(set(compared_laps)) != len(compared_laps):
             raise ValueError("Comparison lap numbers must be distinct")
         if not gps_track_path:
-            raise ValueError("--compare-laps requires --gps-track to preserve line differences")
+            raise ValueError(
+                "--compare-laps requires --gps-track for GPS-to-AC mapping; "
+                "driven-distance only avoids the shared reference station"
+            )
     if compare_skins is not None and compared_laps is None:
         raise ValueError("--compare-skins can only be used with --compare-laps")
     if compare_skins is not None and len(compare_skins) != len(compared_laps):
@@ -791,20 +793,22 @@ def convert_ld_to_acreplay(
 
     if compared_laps is not None:
         durations = [item["source"]["lapTimeS"] for item in aligned_sets]
-        replay_duration = min(durations) if compare_sync == "progress" else max(durations)
+        replay_duration = min(durations) if compare_sync in ("progress", "driven-distance") else max(durations)
         poses_by_car = {}
         per_car = []
         built_poses = []
         built_counts = []
         progress_by_car = []
         for item in aligned_sets:
-            if compare_sync == "progress":
+            if compare_sync in ("progress", "driven-distance"):
                 source_points, source_xyz, progress_diagnostics = (
                     _synchronize_lap_progress(
                         item["source"]["points"],
                         item["xyz"],
                         replay_duration,
-                        reference_xyz=reference,
+                        reference_xyz=(
+                            reference if compare_sync == "progress" else None
+                        ),
                     )
                 )
             else:

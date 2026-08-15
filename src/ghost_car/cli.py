@@ -21,9 +21,15 @@ from .ibt import (
     fit_ibt_distance_map,
     load_ibt_reference,
 )
-from .ld_replay import convert_ld_to_acreplay, offset_track_calibration
+from .ld_replay import (
+    convert_ld_to_acreplay,
+    gps_track_to_ac,
+    offset_track_calibration,
+    validate_track_reference,
+)
 from .kn5 import export_kn5_surface
 from .motec import extract_motec_points, parse_channel_overrides
+from .replay_writer import _estimate_wheel_position_offsets
 
 
 def _csv_values(text: str, converter: Callable[[str], Any]) -> List[Any]:
@@ -951,6 +957,116 @@ def _handle_replay_inspect(args: argparse.Namespace) -> None:
         print(text)
 
 
+def _handle_replay_doctor(args: argparse.Namespace) -> None:
+    """Validate replay-conversion inputs before starting a long conversion."""
+    errors = []
+    warnings = []
+    template_path = Path(args.template).expanduser()
+    ld_path = Path(args.input).expanduser()
+    if not template_path.is_file():
+        errors.append("template does not exist: {}".format(template_path))
+    if not ld_path.is_file():
+        errors.append("LD input does not exist: {}".format(ld_path))
+    decoded = None
+    if template_path.is_file():
+        try:
+            decoded = parse_acreplay(
+                template_path, max_frames=0, include_raw_frames=True
+            )
+            if not decoded["cars"]:
+                errors.append("template contains no cars")
+            else:
+                car = decoded["cars"][min(args.car, len(decoded["cars"]) - 1)]
+                raw_frames = [
+                    bytes.fromhex(frame["rawHex"]) for frame in car["frames"]
+                ]
+                _estimate_wheel_position_offsets(raw_frames)
+        except Exception as error:
+            errors.append("template validation failed: {}".format(error))
+
+    points = None
+    if ld_path.is_file():
+        try:
+            if args.compare_laps:
+                point_sets = [
+                    extract_motec_points(ld_path, target_lap=lap)
+                    for lap in args.compare_laps
+                ]
+                points = point_sets[0]
+            else:
+                # Diagnose the fastest timed lap; a full session can include
+                # pits/out-laps that are intentionally outside the circuit.
+                point_sets = [extract_motec_points(ld_path)]
+                points = point_sets[0]
+            if len(points["points"]) < 2 or points["lapTimeS"] <= 0.0:
+                errors.append("LD contains no usable timed trajectory")
+            if points["frequencyHz"] <= 0.0:
+                errors.append("LD has no positive sample frequency")
+        except Exception as error:
+            errors.append("LD validation failed: {}".format(error))
+
+    track_ref = None
+    surfaces = []
+    if args.gps_track:
+        try:
+            from .ac_track import load_track_package
+
+            track_ref, _, surfaces, _ = load_track_package(args.gps_track)
+            if decoded is not None:
+                validate_track_reference(decoded, track_ref)
+            if points is not None:
+                alignment_values = [
+                    gps_track_to_ac(item, track_ref)[1] for item in point_sets
+                ]
+                worst = max(alignment_values)
+                if worst > args.max_alignment_rmse_m:
+                    errors.append(
+                        "GPS-to-AC alignment RMSE {:.2f}m exceeds {:.2f}m".format(
+                            worst, args.max_alignment_rmse_m
+                        )
+                    )
+                else:
+                    print("PASS alignment RMSE: {:.3f}m".format(worst))
+        except Exception as error:
+            errors.append("track validation failed: {}".format(error))
+    elif args.height_mode in ("track", "kn5"):
+        errors.append("--gps-track is required for --height-mode {}".format(args.height_mode))
+
+    if args.height_mode == "kn5":
+        requested = args.track_surface or surfaces
+        missing = [Path(item) for item in requested if not Path(item).is_file()]
+        if missing:
+            errors.append("missing KN5 surface: {}".format(missing[0]))
+        elif not requested:
+            errors.append("KN5 mode has no packaged or explicit surface")
+    if args.compare_laps and not args.gps_track:
+        errors.append(
+            "comparison requires --gps-track for GPS-to-AC mapping "
+            "(including driven-distance mode)"
+        )
+    if args.compare_laps and args.compare_sync == "driven-distance":
+        warnings.append(
+            "driven-distance uses each LD lap's cumulative distance; it still "
+            "needs --gps-track for GPS-to-AC mapping"
+        )
+
+    if decoded is not None:
+        print("PASS template: {} car(s), {} frame(s)".format(
+            decoded["header"]["numCars"], decoded["header"]["numFrames"]
+        ))
+    if points is not None:
+        print("PASS LD: {:.2f}s, {:.2f}Hz, {} samples".format(
+            points["lapTimeS"], points["frequencyHz"], len(points["points"])
+        ))
+    for warning in warnings:
+        print("WARN {}".format(warning))
+    if errors:
+        for error in errors:
+            print("FAIL {}".format(error))
+        raise SystemExit(2)
+    print("PASS replay inputs are ready")
+
+
 def _handle_replay_export_kn5_surface(args: argparse.Namespace) -> None:
     result = export_kn5_surface(
         Path(args.input).expanduser(),
@@ -1197,6 +1313,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     replay_inspect.set_defaults(handler=_handle_replay_inspect)
 
+    replay_doctor = replay_commands.add_parser(
+        "doctor",
+        help="Validate replay template, LD, calibration, and KN5 inputs",
+    )
+    replay_doctor.add_argument("template", help="Native same-layout .acreplay template")
+    replay_doctor.add_argument("input", help="Input MoTeC .ld path")
+    replay_doctor.add_argument("--car", type=int, default=0, help="Template car index")
+    replay_doctor.add_argument("--gps-track", help="Calibrated track package or track.json")
+    replay_doctor.add_argument(
+        "--height-mode", choices=("track", "kn5", "gps-offset", "gps"), default="track"
+    )
+    replay_doctor.add_argument("--track-surface", action="append")
+    replay_doctor.add_argument("--compare-laps", type=int, nargs="+")
+    replay_doctor.add_argument(
+        "--compare-sync", choices=("time", "progress", "driven-distance"), default="time"
+    )
+    replay_doctor.add_argument(
+        "--max-alignment-rmse-m", type=float, default=8.0,
+        help="Fail when GPS-to-AC nearest-path RMSE exceeds this value",
+    )
+    replay_doctor.set_defaults(handler=_handle_replay_doctor)
+
     replay_export_surface = replay_commands.add_parser(
         "export-kn5-surface",
         help="Extract road-height geometry from KN5 using pure Python",
@@ -1330,11 +1468,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     replay_convert.add_argument(
         "--compare-sync",
-        choices=("time", "progress"),
+        choices=("time", "progress", "driven-distance"),
         default="time",
         help=(
-            "Comparison timing: actual lap times (default), or equal track "
-            "progress for line-only comparison"
+            "Comparison timing: actual lap times (default), equal shared-track "
+            "progress, or equal per-lap driven distance"
         ),
     )
     replay_convert.add_argument(

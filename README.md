@@ -144,10 +144,24 @@ time: all cars start together, separate according to their real pace, and a
 finished car remains at its final position until the slowest lap finishes.
 Use `--compare-sync progress` for a line-only view where cars are retimed by
 shared track progress and remain together; this deliberately removes lap-time
-differences. A calibrated `--gps-track` is required: fitting each lap
+differences. Use `--compare-sync driven-distance` to synchronize by each LD
+lap's own cumulative distance without using a shared track station; this is
+not equivalent to shared-track progress. A calibrated `--gps-track` is still
+required for GPS-to-AC mapping: fitting each lap
 independently onto the template would erase the differences being compared.
 Use `--compare-skins` with one installed skin ID per lap when visual color
 separation is useful; otherwise all cars retain the template skin.
+
+Validate a conversion before writing a replay with `replay doctor`:
+
+~~~powershell
+ghost-car replay doctor native-template.acreplay telemetry.ld `
+  --gps-track calibrated-track.json `
+  --height-mode kn5
+~~~
+
+The doctor checks the native template wheel geometry, LD timing/sample rate,
+track/layout compatibility, GPS-to-AC alignment, and required KN5 surfaces.
 
 ~~~powershell
 ghost-car replay convert native-template.acreplay telemetry.ld `
