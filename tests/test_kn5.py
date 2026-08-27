@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ghost_car.kn5 import export_kn5_surface, read_kn5_surface
-from ghost_car.track_surface import TrackSurface
+from ghost_car_generator.kn5 import export_kn5_surface, read_kn5_surface
+from ghost_car_generator.track_surface import TrackSurface
 
 
 def _text(value):

@@ -21,7 +21,8 @@ dev = [
 ]
 
 [project.scripts]
-ghost-car = "ghost_car.cli:main"
+ghost-car = "ghost_car_generator.cli:main"
+ghost-car-generator = "ghost_car_generator.cli:main"
 
 [project.urls]
 Repository = "https://github.com/BoYanZh/GhostCarGenerator"
@@ -32,14 +33,14 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["ghost_car*"]
+include = ["ghost_car_generator*"]
 
 [tool.setuptools.dynamic]
-version = { attr = "ghost_car.__version__" }
+version = { attr = "ghost_car_generator.__version__" }
 
 [tool.setuptools.package-data]
-"ghost_car" = ["resources/tracks/**/*.json"]
-"ghost_car._vendor" = ["LDParser.LICENSE", "README.md"]
+"ghost_car_generator" = ["resources/tracks/**/*.json"]
+"ghost_car_generator._vendor" = ["LDParser.LICENSE", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,7 +49,7 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py38"
 exclude = [
-  "src/ghost_car/_vendor",
+  "src/ghost_car_generator/_vendor",
   "build",
   "dist",
   "data",

@@ -36,7 +36,8 @@ jobs:
       - name: Verify installed CLI
         run: |
           ghost-car --help
-          python -m ghost_car --help
+          ghost-car-generator --help
+          python -m ghost_car_generator --help
       - name: Run tests
         run: python -m pytest -q
       - name: Build wheel

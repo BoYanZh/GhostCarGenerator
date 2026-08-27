@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ghost_car.ac_track import calibrate_track, load_track_package
+from ghost_car_generator.ac_track import calibrate_track, load_track_package
 
 
 class TrackPackageTest(unittest.TestCase):
@@ -103,9 +103,9 @@ class TrackCalibrationTest(unittest.TestCase):
                 "closureGapM": 0.0,
             }
             with patch(
-                "ghost_car.ac_track.extract_motec_points", side_effect=point_sets
+                "ghost_car_generator.ac_track.extract_motec_points", side_effect=point_sets
             ), patch(
-                "ghost_car.ac_track.load_track_reference_path",
+                "ghost_car_generator.ac_track.load_track_reference_path",
                 return_value=loaded_reference,
             ):
                 result = calibrate_track(

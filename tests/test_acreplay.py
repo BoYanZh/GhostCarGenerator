@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ghost_car.acreplay import (
+from ghost_car_generator.acreplay import (
     CAR_FRAME,
     CAR_FRAME_SIZE,
     EXT_CAR_BYTES_PER_FRAME,
@@ -21,7 +21,7 @@ from ghost_car.acreplay import (
     parse_car_frame,
     parse_header,
 )
-from ghost_car.replay_writer import (
+from ghost_car_generator.replay_writer import (
     _ac_rotation_angles,
     _ac_rotation_matrix,
     _estimate_wheel_position_offsets,

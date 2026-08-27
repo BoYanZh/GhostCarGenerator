@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ghost_car.ld_replay import (
+from ghost_car_generator.ld_replay import (
     _pad_comparison_poses,
     _synchronize_lap_progress,
     align_replay_heights,
@@ -19,13 +19,13 @@ from ghost_car.ld_replay import (
     smooth_replay_positions,
     validate_track_reference,
 )
-from ghost_car.motec import CHANNEL_ALIASES, load_ld_data, session_segment_diagnostics
-from ghost_car.track_surface import TrackSurface
+from ghost_car_generator.motec import CHANNEL_ALIASES, load_ld_data, session_segment_diagnostics
+from ghost_car_generator.track_surface import TrackSurface
 
 
 class BundledDependencyTest(unittest.TestCase):
     def test_default_motec_parser_is_vendored(self):
-        self.assertEqual(load_ld_data().__module__, "ghost_car._vendor.ldparser")
+        self.assertEqual(load_ld_data().__module__, "ghost_car_generator._vendor.ldparser")
 
 
 class SessionSegmentDiagnosticsTest(unittest.TestCase):
@@ -433,16 +433,16 @@ class ReplayTrackValidationTest(unittest.TestCase):
     def test_track_mode_does_not_require_unbundled_surface(self):
         replay, track_ref = self._surface_resolution_fixture()
         with patch(
-            "ghost_car.ld_replay.extract_motec_points", return_value={}
+            "ghost_car_generator.ld_replay.extract_motec_points", return_value={}
         ), patch(
-            "ghost_car.ld_replay.parse_acreplay", return_value=replay
+            "ghost_car_generator.ld_replay.parse_acreplay", return_value=replay
         ), patch(
-            "ghost_car.ld_replay.load_track_package",
+            "ghost_car_generator.ld_replay.load_track_package",
             return_value=(track_ref, Path("track.json"), [Path("missing.gcsurface")], {}),
         ), patch(
-            "ghost_car.ld_replay.TrackSurface.from_files"
+            "ghost_car_generator.ld_replay.TrackSurface.from_files"
         ) as load_surface, patch(
-            "ghost_car.ld_replay.gps_track_to_ac",
+            "ghost_car_generator.ld_replay.gps_track_to_ac",
             side_effect=RuntimeError("mapping reached"),
         ):
             with self.assertRaisesRegex(RuntimeError, "mapping reached"):
@@ -458,11 +458,11 @@ class ReplayTrackValidationTest(unittest.TestCase):
     def test_kn5_mode_explains_how_to_generate_unbundled_surface(self):
         replay, track_ref = self._surface_resolution_fixture()
         with patch(
-            "ghost_car.ld_replay.extract_motec_points", return_value={}
+            "ghost_car_generator.ld_replay.extract_motec_points", return_value={}
         ), patch(
-            "ghost_car.ld_replay.parse_acreplay", return_value=replay
+            "ghost_car_generator.ld_replay.parse_acreplay", return_value=replay
         ), patch(
-            "ghost_car.ld_replay.load_track_package",
+            "ghost_car_generator.ld_replay.load_track_package",
             return_value=(track_ref, Path("track.json"), [Path("missing.gcsurface")], {}),
         ):
             with self.assertRaisesRegex(ValueError, "export-kn5-surface"):

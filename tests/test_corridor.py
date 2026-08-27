@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ghost_car.corridor import constrain_blap
-from ghost_car.iracing import parse_blap
+from ghost_car_generator.corridor import constrain_blap
+from ghost_car_generator.iracing import parse_blap
 
 TABLE_HEADER = 0x5B0
 TABLE_RECORDS = 0x5C0

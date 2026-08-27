@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ghost_car.track_surface import TrackSurface
+from ghost_car_generator.track_surface import TrackSurface
 
 
 class TrackSurfaceTest(unittest.TestCase):

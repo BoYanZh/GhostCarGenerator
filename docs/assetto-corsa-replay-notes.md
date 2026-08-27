@@ -3,7 +3,7 @@
 Status: the version-16 core layout and the CSP extension container are
 documented below and verified against locally recorded CSP replays. This
 document is research documentation. Parsing and template-based LD conversion
-are supported by `ghost_car.acreplay` and `ghost_car.replay_writer`.
+are supported by `ghost_car_generator.acreplay` and `ghost_car_generator.replay_writer`.
 
 ## Verified sample set
 
@@ -221,7 +221,7 @@ core frames, and how extension records vary across CSP versions.
 
 ## Template-based writer
 
-`ghost_car/replay_writer.py` implements a template-based writer in two
+`ghost_car_generator/replay_writer.py` implements a template-based writer in two
 modes:
 
 - `morph` patches the pose fields (position, rotation, velocity, rpm,
@@ -245,7 +245,7 @@ modes:
   session table, creates `[CAR_N]` INI sections, updates `[RACE] CARS`, and
   emits one indexed EXT_PERCAR plus one incrementing-ID EXTRASTREAM per car.
 
-`ghost_car/ld_replay.py` provides the formal LD conversion pipeline and the
+`ghost_car_generator/ld_replay.py` provides the formal LD conversion pipeline and the
 `ghost-car replay convert` command. GPS elevation is not assumed to share the
 AC world-height datum. The default track-height mode projects each converted
 X/Z sample onto the nearest segment of the AC reference path and uses that
@@ -317,7 +317,7 @@ replay:
 
 ### LD to replay pipeline
 
-`ghost_car/ld_replay.py` converts a MoTeC LD lap into a morphed
+`ghost_car_generator/ld_replay.py` converts a MoTeC LD lap into a morphed
 replay: `extract_motec_points` supplies per-sample position, speed, rpm,
 gear, accelerator pedal, brake, steering, pitch and roll; the LD east/north path
 is rigidly fitted onto the template replay's driven x/z path (or, with

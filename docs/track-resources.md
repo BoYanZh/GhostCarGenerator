@@ -1,6 +1,6 @@
 # Bundled track resources
 
-Resources live under `src/ghost_car/resources/tracks/<simulator>/` so they are
+Resources live under `src/ghost_car_generator/resources/tracks/<simulator>/` so they are
 included in source distributions and wheels without mixing simulator schemas.
 
 ## Assetto Corsa calibration packages

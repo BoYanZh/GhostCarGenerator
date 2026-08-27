@@ -1,7 +1,7 @@
 """Convert a MoTeC LD lap into an Assetto Corsa .acreplay.
 
 Pipeline:
-1. Extract the selected LD lap via ghost_car.motec (position, speed,
+1. Extract the selected LD lap via ghost_car_generator.motec (position, speed,
    rpm, gear, accelerator pedal, brake, steering, pitch, roll).
 2. Map the lap into AC world coordinates either by rigid 2D fitting
    onto the template replay's driven path (--gps-track absent), or

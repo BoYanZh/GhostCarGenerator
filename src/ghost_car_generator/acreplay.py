@@ -3,7 +3,7 @@
 This module decodes the version-16 replay layout and the Custom Shaders
 Patch extension container. It is verified against locally recorded CSP
 replays; see docs/assetto-corsa-replay-notes.md for the field map.
-Template-based writing lives in ghost_car.replay_writer.
+Template-based writing lives in ghost_car_generator.replay_writer.
 """
 from __future__ import annotations
 

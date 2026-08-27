@@ -26,7 +26,7 @@ python -m pip install -e .
 MoTeC LD support uses the GPLv3 `ldparser` snapshot vendored in the Python
 package; no Git submodule or separate parser installation is required.
 
-The installed `ghost-car` command and `python -m ghost_car` are equivalent.
+The installed `ghost-car` command and `python -m ghost_car_generator` are equivalent.
 
 ## CLI
 
@@ -354,7 +354,7 @@ metadata unless an explicit header override is supplied.
 
 The repository may publish a sanitized track-reference artifact separately from
 a target profile. For example,
-`src/ghost_car/resources/tracks/iracing/lagunaseca-2026/axis.json` contains only a local closed
+`src/ghost_car_generator/resources/tracks/iracing/lagunaseca-2026/axis.json` contains only a local closed
 east/north axis, lap fraction, layout identifier, and track length. It contains
 no BLAP prefix, vehicle metadata, GPS origin, source-file hashes, or Formula Vee
 provenance, and is not itself an iRacing lapfile or target profile.
@@ -502,9 +502,9 @@ match the target vehicle.
 
 | Path | Responsibility |
 | --- | --- |
-| `src/ghost_car/` | Installable Python package and CLI implementation |
-| `src/ghost_car/_vendor/` | GPLv3 ldparser snapshot and upstream license |
-| `src/ghost_car/resources/tracks/` | Bundled simulator-specific public track resources |
+| `src/ghost_car_generator/` | Installable Python package and CLI implementation |
+| `src/ghost_car_generator/_vendor/` | GPLv3 ldparser snapshot and upstream license |
+| `src/ghost_car_generator/resources/tracks/` | Bundled simulator-specific public track resources |
 | `tests/` | Deterministic unit and integration tests |
 | `docs/` | Reverse-engineering notes and support boundaries |
 | `pyproject.toml` | Package metadata and console entry point |

@@ -14,19 +14,19 @@ post-mortems, and `README.md` for the package overview.
 
 ## Current state (what works)
 
-- `ghost_car/acreplay.py` - read-only parser: header, global frame
+- `ghost_car_generator/acreplay.py` - read-only parser: header, global frame
   data, per-car 256-byte physics frames, CSP extension records
   (decompression, per-frame sizes, EXTRASTREAM chunk ids).
 - `ghost-car replay inspect <file>` - CLI JSON dump of the above.
-- `ghost_car/motec.py` - `extract_motec_points` now also returns rpm
+- `ghost_car_generator/motec.py` - `extract_motec_points` now also returns rpm
   and `steerRad` (aliases `rpm` / `steering`).
-- `ghost_car/replay_writer.py` - template-based writer:
+- `ghost_car_generator/replay_writer.py` - template-based writer:
   - `morph` patches one car's pose fields in place (byte-for-byte
     faithful elsewhere);
   - `resample` rebuilds the file at a new frame count (car frames,
     global sun data, per-frame CSP streams, EXTRASTREAM length,
     session data table, footer offset).
-- `ghost_car/ld_replay.py` - LD → replay:
+- `ghost_car_generator/ld_replay.py` - LD → replay:
   `extract_motec_points` → GPS transform (rigid fit, or
   `--gps-track track.json` ENU→AC matrix) → 15 ms resample → yaw from
   GPS heading/path → `morph`.
@@ -43,7 +43,7 @@ post-mortems, and `README.md` for the package overview.
 - Reference conversion command:
 
 ~~~powershell
-python -m ghost_car replay convert `
+python -m ghost_car_generator replay convert `
   native-template.acreplay `
   telemetry.ld `
   -o scratch\converted.acreplay `
@@ -87,7 +87,7 @@ telemetry, track references, and generated outputs must remain private.
 
 ### A. Formalize: CLI command + tests
 
-Completed in `ghost_car/replay_writer.py`, `ghost_car/ld_replay.py`, and
+Completed in `ghost_car_generator/replay_writer.py`, `ghost_car_generator/ld_replay.py`, and
 `ghost-car replay convert`. Synthetic tests cover morph/resample, opaque
 trailing-data preservation, mixed CSP record resizing, height modes, yaw
 wrapping, and controls. A track JSON is checked against the template's track
@@ -171,7 +171,7 @@ remaining axle error is consistent with the native template.
 
 - Do not distribute native replays or template files (personal data / possibly
   licensed content). The privacy-reduced resources under
-  `src/ghost_car/resources/tracks/` show the publishable derived form.
+  `src/ghost_car_generator/resources/tracks/` show the publishable derived form.
 - The parser supports CSP version-16 files only; vanilla (non-CSP)
   replays were not sampled.
 - Anything generated must be validated in the actual game before it is
