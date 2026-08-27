@@ -3,6 +3,7 @@
 Only data needed for road-height matching is retained. Textures and materials
 are skipped; mesh positions, indices, and node transforms are decoded.
 """
+from __future__ import annotations
 
 __all__ = ["export_kn5_surface", "read_kn5_surface"]
 
@@ -13,7 +14,6 @@ from pathlib import Path
 import numpy as np
 
 from .track_surface import TrackSurface
-
 
 KN5_MAGIC = b"sc6969"
 MAX_COUNT = 100_000_000

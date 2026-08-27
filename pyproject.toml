@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghost-car"
-version = "0.1.0"
+dynamic = ["version"]
 description = "CLI and codecs for iRacing laps and Assetto Corsa replays"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,6 +13,12 @@ authors = [
   { name = "BoYanZh" },
 ]
 dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+]
 
 [project.scripts]
 ghost-car = "ghost_car.cli:main"
@@ -28,9 +34,28 @@ package-dir = { "" = "src" }
 where = ["src"]
 include = ["ghost_car*"]
 
+[tool.setuptools.dynamic]
+version = { attr = "ghost_car.__version__" }
+
 [tool.setuptools.package-data]
 "ghost_car" = ["resources/tracks/**/*.json"]
 "ghost_car._vendor" = ["LDParser.LICENSE", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+exclude = [
+  "src/ghost_car/_vendor",
+  "build",
+  "dist",
+  "data",
+  "scratch",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+

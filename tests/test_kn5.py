@@ -1,4 +1,5 @@
 """Tests for dependency-free KN5 geometry extraction."""
+from __future__ import annotations
 
 import struct
 import tempfile

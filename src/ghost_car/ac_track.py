@@ -1,4 +1,5 @@
 """Assetto Corsa track packages and GPS-to-world calibration."""
+from __future__ import annotations
 
 __all__ = [
     "calibrate_track",
@@ -8,14 +9,12 @@ __all__ = [
 
 import json
 import math
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
 from .acreplay import parse_acreplay
 from .motec import extract_motec_points
-
 
 EARTH_RADIUS_M = 6371008.8
 BUILTIN_TRACK_ROOT = Path(__file__).resolve().parent / "resources" / "tracks"

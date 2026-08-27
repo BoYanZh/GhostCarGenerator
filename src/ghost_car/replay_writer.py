@@ -18,6 +18,7 @@ The writer deliberately requires a native replay template. Assetto Corsa
 replay metadata and CSP extension records are not safely synthesizable from
 telemetry alone, so all non-telemetry data is retained from that template.
 """
+from __future__ import annotations
 
 __all__ = [
     "locate",

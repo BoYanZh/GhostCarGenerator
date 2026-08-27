@@ -1,6 +1,6 @@
 """Tests for the corridor-constrained lateral-offset correction."""
+from __future__ import annotations
 
-import math
 import struct
 import tempfile
 import unittest

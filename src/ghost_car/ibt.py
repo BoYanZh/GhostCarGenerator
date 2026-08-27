@@ -1,4 +1,5 @@
 """Native iRacing IBT reference parsing and GPS-based path alignment."""
+from __future__ import annotations
 
 __all__ = [
     "load_ibt_reference",
@@ -11,11 +12,11 @@ __all__ = [
 
 import math
 import mmap
-import numpy as np
 import struct
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
+import numpy as np
 
 _IBT_TYPES = {
     0: "i1",

@@ -15,6 +15,7 @@ The horizontal line comes from telemetry. By default, vertical positions
 are projected onto an Assetto Corsa reference path because GPS altitude and
 the simulator's world-height datum are independent.
 """
+from __future__ import annotations
 
 __all__ = [
     "align_replay_heights",

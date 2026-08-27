@@ -5,12 +5,25 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install ruff
+      - name: Lint with ruff
+        run: ruff check src tests
+
   test:
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-latest, ubuntu-latest]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -18,14 +31,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install package
-        run: python -m pip install -e .
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
       - name: Verify installed CLI
         run: |
           ghost-car --help
           python -m ghost_car --help
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -q
       - name: Build wheel
         run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Compile Python sources

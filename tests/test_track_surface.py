@@ -1,4 +1,5 @@
 """Tests for KN5-derived road-surface height matching."""
+from __future__ import annotations
 
 import tempfile
 import unittest

@@ -5,6 +5,7 @@ Patch extension container. It is verified against locally recorded CSP
 replays; see docs/assetto-corsa-replay-notes.md for the field map.
 Template-based writing lives in ghost_car.replay_writer.
 """
+from __future__ import annotations
 
 __all__ = [
     "VERSION",

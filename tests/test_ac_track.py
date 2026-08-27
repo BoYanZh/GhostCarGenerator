@@ -1,4 +1,5 @@
 """Tests for AC track packages and multi-lap GPS calibration."""
+from __future__ import annotations
 
 import json
 import tempfile

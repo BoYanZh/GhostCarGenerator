@@ -1,4 +1,5 @@
 """Track-agnostic resampling and pose conversion for the ghost_car package."""
+from __future__ import annotations
 
 __all__ = ["build_canonical_blap"]
 

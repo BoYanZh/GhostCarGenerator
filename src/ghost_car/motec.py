@@ -1,4 +1,5 @@
 """MoTeC LD loading isolated from the optional ldparser dependency."""
+from __future__ import annotations
 
 __all__ = [
     "parse_channel_overrides",
@@ -15,7 +16,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-
 
 CHANNEL_ALIASES = {
     "latitude": ("GPS Latitude", "GPS_Lat", "Latitude", "Pos_Lat"),

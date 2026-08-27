@@ -1,4 +1,5 @@
 """Road-surface height lookup from geometry extracted from an AC KN5 file."""
+from __future__ import annotations
 
 __all__ = ["TrackSurface"]
 
@@ -7,7 +8,6 @@ import struct
 from pathlib import Path
 
 import numpy as np
-
 
 SURFACE_MAGIC = b"GCSURF1\0"
 

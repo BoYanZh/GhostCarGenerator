@@ -1,4 +1,5 @@
 """Codec for iRacing BLAP and OLAP files."""
+from __future__ import annotations
 
 __all__ = ["parse_int", "parse_blap", "pack_blap"]
 
@@ -8,7 +9,6 @@ import os
 import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 
 TABLE_HEADER = 0x5B0
 TABLE_RECORDS = 0x5C0

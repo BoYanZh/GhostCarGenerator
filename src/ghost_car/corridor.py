@@ -1,4 +1,5 @@
 """Corridor-constrained lateral-offset correction for iRacing BLAP/OLAP files."""
+from __future__ import annotations
 
 __all__ = ["constrain_blap"]
 
@@ -7,7 +8,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .iracing import parse_blap, pack_blap
+from .iracing import pack_blap, parse_blap
 
 _DEFAULT_TOLERANCE_M = 1.0
 _DEFAULT_SMOOTH_BINS = 6
