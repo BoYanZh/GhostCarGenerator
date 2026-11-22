@@ -16,11 +16,14 @@ Scene recipe: `ac.findNodes('carsRoot:yes')` → `createBoundingSphereNode` →
 `setVirtualCarFlag(true)` → `loadKN5` of the hard-coded Initial G GR86 Premium →
 per-frame `setPosition` / `setOrientation`.
 
-**Status: v0.3.** The data path and the *opaque* render path are proven in-game
-(v0.2 proof below). v0.3 adds the two remaining features: a semi-transparent
-ghost body (`GHOST_ALPHA`, default `0.5`) and a single-instance writer lease so
-a duplicate app instance cannot interleave log rows. Both shipped without a game
-launch; "v0.3 protocol" below states exactly what to look for in-game.
+**Status: v0.4.** The data path and the *opaque* render path are proven in-game
+(v0.2 proof below); v0.3's transparency and single-writer lease are proven
+in-game (v0.3 proof below). v0.4 adds **lap synchronisation**: the ghost timeline
+restarts at every player start/finish crossing so both cars cross each lap
+together, with a settings toggle (default ON) and a documented alignment
+tunable. v0.4's sync is **driver-verified only** (it cannot be proven without
+driving a lap); see "v0.4 protocol" for the exact gates. No game launch was made
+for v0.4 and the installed AC tree was not modified.
 
 ## Install
 
@@ -65,16 +68,16 @@ Appended to
 
 (`ac.FolderID.Logs`, with a `%USERPROFILE%\Documents\...` fallback path).
 
-Line shapes (v0.3; v0.2 lines are unchanged unless a new token is appended):
+Line shapes (v0.4; v0.3 lines are unchanged unless a new token is appended):
 
 ```
-INIT ok app=0.3 schema=ghost-runtime-v1 frames=9131 durationS=136.950 carId=... trackId=... log=... alpha=0.500
-INIT missing-runtime fallback=5m-follow player app=0.3 log=... alpha=0.500
+INIT ok app=0.4 schema=ghost-runtime-v1 frames=9131 durationS=136.950 carId=... trackId=... log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
+INIT missing-runtime fallback=5m-follow player app=0.4 log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
 INSTANCE writer id=<instanceId> gen=<n> backend=shared|file attempts=<n>
 INSTANCE standby, another writer active id=<instanceId> gen=<n> ageS=<n> backend=shared|file
 INSTANCE takeover id=<instanceId|free> genOld=<n> ageS=<n> gen=<n>
 INSTANCE unavailable <store-write-failed|store-unverified>; running unguarded
-NODE ok app=0.3 rootActive=1 rootChildren=1 modelEmpty=0 modelName=... modelActive=1 modelChildren=89 meshes=317 meshVisible=1 aabbSize=4.20x1.30x1.80 aabbMeshes=317 wheels=4 model=E:/.../toyota_gr86_premium.kn5
+NODE ok app=0.4 rootActive=1 rootChildren=1 modelEmpty=0 modelName=... modelActive=1 modelChildren=89 meshes=317 meshVisible=1 aabbSize=4.20x1.30x1.80 aabbMeshes=317 wheels=4 model=E:/.../toyota_gr86_premium.kn5
 GHOST alpha=0.500 mode=alpha meshes=317 transparent=ok blend=ok shadows=ok tint=ok unique=ok
 GHOST alpha=1.000 mode=opaque meshes=0
 GHOST failed <reason>
@@ -82,25 +85,53 @@ RENDERHOOK ok event=main.track.transparent frames=1
 RENDERHOOK unavailable render.on | RENDERHOOK failed <reason>
 CLOCK sim | CLOCK app
 ACTIVE mode=runtime frames=9131 hook=none|ok alpha=0.500 log=...
-SESSION token=0
+SESSION token=0 syncLaps=1
+LAPSYNC baseline playerLap=<n> wallS=<gameTime>
+LAPSYNC playerLap=<n> ghostRestarted t=0 wallS=<gameTime> cursorS=<s> offsetS=<s> jumps=<n>
+LAPSYNC rebase playerLap=<n> wallS=<gameTime> reason=lapcount-decrease
+LAPSYNC unavailable lapCount=nil free-run
+LAPSYNC toggle syncLaps=1|0 wallS=<gameTime> cursorS=<s>
 <time>,<ghostX>,<ghostY>,<ghostZ>,<playerX>,<playerY>,<playerZ>,<dist>,<ghostNdcX>,<ghostNdcY>,<inFrustum01>,<camDistM>,<ghostT>
 WARN init <message>
 ERROR <stage> <message>
 SHUTDOWN role=writer|standby [release=ok]
 ```
 
-v0.3 protocol deltas:
+v0.4 protocol deltas:
+
+* `INIT` (both variants) now ends with `syncLaps=1|0` and `syncOffsetS=<s>`.
+  `syncLaps` is the persisted toggle state (`1` = ON, the shipped default);
+  `syncOffsetS` is `GHOST_START_OFFSET_S`.
+* `SESSION` now also carries `syncLaps=1|0`. It is still written once per
+  session-token change and still zeroes the playback cursor.
+* `LAPSYNC` lines are new and are the only proof of lap sync:
+  * `baseline` — first observation of `ac.getCar(0).lapCount`, or the first
+    observation after a session reset / re-enable. **Never** a restart.
+  * `playerLap=<n> ghostRestarted t=0` — one line per real start/finish
+    crossing. `t=0` is the lap-start token (the ghost playback cursor is put
+    back to the start of the lap); `cursorS=` is the actual timeline second now
+    playing — `(duration − syncOffsetS) mod duration` — and `jumps=` is
+    `newLapCount − previousLapCount` (normally `1`).
+  * `rebase ... reason=lapcount-decrease` — the counter went **down**
+    (session/car change, or a counter reset). Baseline is re-armed, no restart.
+  * `unavailable lapCount=nil free-run` — the car object did not expose
+    `lapCount`; sync is off for the session and the ghost free-runs.
+  * `toggle syncLaps=1|0` — written by the settings-window checkbox the moment
+    it is clicked.
+* `LAPSYNC` restarts are **not** written for teleports/respawns, pit entry, or
+  invalidated laps (policy below). Their absence at the right moments is part
+  of the protocol.
+
+v0.3 deltas (still current):
 
 * `INIT` is written by the **elected writer** after the instance lease settles
-  (≤ 1 s after load), not at script load. `alpha=` is the clamped
-  `GHOST_ALPHA`. Everything before `alpha=` keeps the v0.2 grammar.
+  (≤ 1 s after load), not at script load. `alpha=` is the clamped `GHOST_ALPHA`.
+  Everything before `alpha=` keeps the v0.2 grammar.
 * A standby instance writes one `INSTANCE standby, another writer active ...`
-  line and **no** `INIT`, `NODE`, `ACTIVE`, `SESSION` or data rows. That is the
-  fix for the v0.2 "second `INIT ok`, two interleaved writers" bug.
-* `GHOST` reports the transparency actually applied. `mode=alpha` with
+  line and **no** `INIT`, `NODE`, `ACTIVE`, `SESSION` or data rows.
+* `GHOST` reports the transparency actually applied: `mode=alpha` with
   `transparent=ok blend=ok tint=ok` is the expected line; `GHOST failed ...`
   means the app fell back to the opaque look and says why.
-* `ACTIVE` now also carries `alpha=`, and `SHUTDOWN` carries `role=`.
 * Data rows are still exactly 13 comma-separated fields, so every v0.2 parser
   keeps working on the row prefix.
 
@@ -125,9 +156,224 @@ from `ac.getSim().gameTime` deltas when available (`CLOCK sim`), which removes
 the ~0.7 % drift v0.1 had from accumulating app frame `dt` (v0.1 lost about 1 s
 of ghost time per 137 s lap).
 
+## Lap synchronisation (v0.4)
+
+The ghost is a *lap* reference, not a wall-clock recording: its timeline restarts
+whenever the **player** starts a new lap, so both cars cross the start/finish
+line together on every lap instead of the ghost free-running its 136.95 s loop
+from session `gameTime`.
+
+### What "player lap boundary" means (API citations)
+
+The boundary is detected from the player car's completed-lap counter:
+
+```lua
+local player = ac.getCar(0)
+if player.lapCount > baseline then  -- one real start/finish crossing
+  -- restart ghost playback
+  baseline = player.lapCount
+end
+```
+
+This mirrors the installed `ac-tracer` app, which is the reference
+implementation on this machine:
+
+* `apps/lua/ac-tracer/lib/core/state.lua:1263` —
+  `if car.lapCount > state.lapNumber then` treats the increment as "lap
+  completed", finalises the lap with `car.previousLapTimeMs` (line 1272) and
+  validity with `car.isLastLapValid` (line 1271), then re-baselines
+  `state.lapNumber = car.lapCount` (line 1322).
+* `apps/lua/ac-tracer/lib/windows/delta_bar.lua:79` — the UI keys off the same
+  counter (`if car.lapCount ~= prevLapCount then`).
+* The other fields ac-tracer reads on the same `ac.StateCar` object, and why
+  this app does **not** need them: `car.lapTimeMs` / `car.previousLapTimeMs`
+  (lap timing), `car.splinePosition` (used there for teleport heuristics),
+  `car.isInPitlane` / `car.isInPit`, `car.resetCounter`, and
+  `ac.onCarJumped(0, fn)` (`state.lua:1225`). Only `lapCount` is a lap boundary;
+  the rest describe teleports, which must not restart the ghost (below).
+
+`script.update` is the only clock that matters: the counter is read once per
+frame, before the playback clock advances, so a restart is already visible in
+the pose written that frame.
+
+### Restart semantics
+
+* Restart == the existing loop-wrap path: `runtimeTime` is set to a time inside
+  `[0, duration)` and the frame cursor is re-armed to frame 1. Nothing else in
+  the playback math changes, so `ghostT` (field 13) stays exact: the next row is
+  `cursorS + elapsed`, never a stale index scan.
+* The cursor is `(duration − GHOST_START_OFFSET_S) mod duration`. With the
+  default `0.0` that is frame 0, i.e. the documented `t=0` restart.
+* One line per crossing:
+  `LAPSYNC playerLap=<n> ghostRestarted t=0 wallS=<gameTime> cursorS=<s>
+  offsetS=<s> jumps=<n>`.
+* A single frame that sees the counter jump by more than one (e.g. a teleport
+  across the line while the counter catches up) is **one** restart with
+  `jumps=<n>`; the intermediate crossings cannot be separated, and firing the
+  restart twice in the same frame would be a visible double jump.
+
+### Toggle
+
+`Sync ghost to my laps` in the settings window, **default ON, persisted**
+through `ac.storage({ syncLaps = true }, 'ghostcar_hotlap/')` — the SDK's
+auto-saving script store used by the installed ac-tracer
+(`apps/lua/ac-tracer/lib/core/settings.lua:50`, pattern at lines 267-268 for the
+checkbox flip). CSP writes it under
+`Documents/Assetto Corsa/cfg/extension/state/lua/` next to the other app state
+files; deleting that store entry restores the ON default. If `ac.storage` is
+missing, the toggle still works for the running session but is not persisted.
+
+* ON (default): restart on every `lapCount` increment; log `syncLaps=1`.
+* OFF: **exactly v0.3 free-run** — no restart, no baseline tracking,
+  `LAPSYNC` stays silent, and the timeline keeps advancing from session start.
+  Log `syncLaps=0` at INIT, and `LAPSYNC toggle syncLaps=0|1` on each click.
+  Re-enabling rebases the counter (`LAPSYNC baseline ...`) so a crossing that
+  happened while OFF does not retro-fire.
+
+### Policy for the awkward cases (and why)
+
+| event | restart? | reason |
+| --- | --- | --- |
+| start/finish crossing (`lapCount` +1) | **yes, once** | the only real lap boundary; both cars then cross together |
+| teleport: respawn, ESC → pits, back to pits (`ac.onCarJumped`, `resetCounter`, big `splinePosition` jump) | **no** | a teleport does not change `lapCount` and does not put the player at t=0 of a lap. Re-zeroing the ghost there would make it lead/lag by the distance already driven this lap, and pit exits would silently shift the anchor off the timing line. The ghost is anchored to the line, not to the player's position. |
+| invalidated lap (track limits, cut, contact) | **yes, once** | the ghost is a visual reference line, not a referee. A cut lap still crosses the line; the next lap must start with both cars together, so validity (`car.isLastLapValid`) is deliberately ignored |
+| session restart (session token change: `sim.currentSessionIndex`) | cursor already zeroed by `resetForSession()`; **no** `LAPSYNC` restart at that moment | the existing reset path re-creates the node and zeroes the cursor. v0.4 additionally clears the lap baseline and restart counter there, so the first crossing of the new session re-syncs once instead of comparing against a stale lap number (which would either double-fire or miss the first crossing) |
+| counter goes **backwards** without a session change | no restart, one `LAPSYNC rebase ... reason=lapcount-decrease` | defensive: AC can reset the counter on car/session swaps that do not bump the session index; the next forward increment is then the real crossing |
+| `lapCount` missing on the car object | no restart, one `LAPSYNC unavailable ... free-run` | degrade to v0.3 rather than erroring; logged once, not per frame |
+
+### Aligning frame 0 to the start line
+
+The restart is only as good as the timeline's phase: if frame 0 does not sit on
+the start/finish line, both cars still restart together but the ghost will
+constantly lead or lag the player by that fixed distance. This was checked
+offline rather than assumed:
+
+* AC counts laps on the AI spline: `splinePosition` 0 (and `lapCount`
+  increments) at the **first point of `content/tracks/<track>/<layout>/ai/fast_lane.ai`**.
+* `threemilebypass` `fast_lane.ai` (installed): 2922 points, 4544.6 m closed
+  loop, first point `(x,z) = (68.52, 164.60)`. The repo's own calibration
+  package (`src/ghost_car_generator/resources/tracks/assetto_corsa/
+  thunderhill_raceway_park/threemilebypass/calibration.json`) records
+  `startLineAc = (69.57, 166.18)` — 1.9 m from that point, an independent
+  corroboration within the track's own fit error.
+* The bundled `ghost-runtime-v1.json` (9131 frames, 136.95 s, 15 ms) was
+  projected onto that spline: **frame 0 sits 66.3 m past the line** (~1.41 s at
+  the 53.0 m/s speed at frame 0), and the timeline reaches the line at
+  `t ≈ 135.54 s` before wrapping to frame 0 again.
+
+So frame 0 is **not** on the line for the bundled timeline, by a constant that
+comes from how the source lap was cut. The tunable exists for exactly that:
+
+```lua
+-- ghostcar_hotlap.lua
+local GHOST_START_OFFSET_S = 0.0
+```
+
+`GHOST_START_OFFSET_S` is *how far the timeline runs ahead of the player's lap,
+in seconds*: playback starts at `(duration − offset)` at a crossing. `0.0` is the
+only safe default because the app must work with any `ghost-runtime-v1.json`
+(each file has its own phase). For the bundled file the offline value is
+**`1.41`** (`cursorS` becomes `135.54`); it is documented rather than baked in so
+the app stays correct for a timeline cut crossing-to-crossing.
+
+**In-game calibration (3 steps, driver-verified):**
+
+1. Leave `GHOST_START_OFFSET_S = 0.0`, sync ON, and drive two laps. At the
+   second crossing note whether the ghost is ahead or behind and by roughly how
+   many metres `D` (pit wall / braking board are good references).
+2. Convert to seconds: `offset ≈ D / (speed_at_line_kmh / 3.6)`. If the ghost is
+   **ahead**, increase `GHOST_START_OFFSET_S` by that amount; if it is
+   **behind**, decrease it. Reload the app (edit `syncOffsetS` in the new
+   `INIT` line to confirm the value took effect, and `cursorS` on the next
+   `LAPSYNC` line to confirm the arithmetic).
+3. Repeat once with a ±0.05 s nudge. A correct value shows the ghost's nose
+   arriving at the line with the player's on successive laps, and the
+   `LAPSYNC ... cursorS=` second barely changing between laps (it is a constant
+   of the file, not of your driving).
+
+A different timeline file needs its own value; re-measure with the same steps.
+If the source lap was cut crossing-to-crossing from the same `fast_lane.ai`
+start point, the correct value is `0.0` and nothing needs changing.
+
+### Offline harness
+
+v0.4 ships with no in-repo test for the Lua app (like v0.3), but the sync logic
+was exercised by an offline harness in temp files only: it stubs the CSP API
+(car, sim, scene nodes, `ac.storage`, `ui.checkbox`, JSON decoder), writes a
+synthetic 20 s timeline, drives `script.update(dt)` and asserts on the app's own
+log. 54 assertions cover: INIT/`syncLaps` state, baseline line, one restart per
+crossing, no double fire while the counter is unchanged, `jumps=` on a skipped
+count, no restart on teleport, restart on invalidated lap, session-reset rebase
+with exactly one later restart, toggle OFF staying free-run and re-enable
+rebasing, non-zero `GHOST_START_OFFSET_S` cursor arithmetic
+(`cursorS = duration − offset`), and fallback mode staying silent. `luac -p` is
+clean on the shipped script.
+
 ## Verification
 
-### v0.3 protocol (use this one)
+### v0.4 protocol (use this one; driver-verified)
+
+Sync cannot be validated without **driving a lap**, so this section is the
+driver's procedure, not a screenshot gate. It assumes the v0.3 gates below
+already pass (one writer, `GHOST ... mode=alpha`, `ACTIVE mode=runtime`).
+
+**Step 0 — pre-flight (no driving needed).**
+
+```powershell
+$log = "$env:USERPROFILE\Documents\Assetto Corsa\logs\ghostcar_hotlap_verify.log"
+Select-String -Path $log -Pattern '^INIT ok|^SESSION |^LAPSYNC ' | Select-Object -Last 8
+```
+
+* `INIT ok app=0.4 ... syncLaps=1 syncOffsetS=0.000` — sync enabled at the
+  shipped defaults. `syncLaps=0` means the toggle was persisted OFF; turn it on
+  in the settings window and check for `LAPSYNC toggle syncLaps=1`.
+* exactly one `LAPSYNC baseline playerLap=<n> ...` appears shortly after
+  `ACTIVE`, with no `ghostRestarted` yet.
+* no `ERROR`, and (if you want the bundled file aligned immediately) set
+  `GHOST_START_OFFSET_S = 1.41` before this run, per "Aligning frame 0".
+
+**Step 1 — drive one lap, then cross the line (the actual sync test).**
+
+Drive a full lap from the pits and cross the start/finish line. Immediately
+after the crossing the log must gain **exactly one** line for that crossing:
+
+```
+LAPSYNC playerLap=<n+1> ghostRestarted t=0 wallS=<gameTime> cursorS=<s> offsetS=<s> jumps=1
+```
+
+What to look at on track *at* the crossing: the ghost is at the same point of
+its lap as the player — i.e. it is crossing the line with you (within
+`GHOST_START_OFFSET_S` if you have not calibrated), not 60–70 m down the road.
+Then drive the next lap: at the *next* crossing there must be exactly one new
+`LAPSYNC` line with `playerLap` incremented by exactly 1, and the ghost must
+again be with you at the line. That is the proof: two consecutive crossings,
+one line each, ghost together both times.
+
+**Step 2 — negative controls (same session).**
+
+| action | expected log | expected on track |
+| --- | --- | --- |
+| ESC → back to pits (respawn, no lap counted) | **no** new `LAPSYNC` line at all | ghost keeps playing its current lap (it does not jump back to t=0) |
+| invalidated lap (cut the chicane), then cross | exactly one `LAPSYNC ... ghostRestarted` | both cars still start the next lap together |
+| checkbox "Sync ghost to my laps" off, drive and cross | `LAPSYNC toggle syncLaps=0`, then no restarts; `ghostT` keeps rising across the crossing | v0.3 free-run: the ghost drifts by roughly the lap-time difference per lap |
+| re-enable the toggle | `LAPSYNC toggle syncLaps=1` + `LAPSYNC baseline playerLap=<n>` (no restart) | next crossing re-syncs once |
+| restart the session (ESC → restart) | `SESSION token=<new> syncLaps=1` then `LAPSYNC baseline ...`; no restart at the reset itself | first crossing of the new session re-syncs once, not twice |
+
+**Alignment check for the record:** with the calibrated offset, at the crossing
+compare the ghost's nose with the line (or with your car) — the residual should
+be well under one car length. If it is a constant several car lengths, the file
+phase differs from your `fast_lane.ai` cut: re-run the 3-step calibration above.
+
+**Expected summary line count after a clean 3-lap run with one pit teleport:**
+three `LAPSYNC ... ghostRestarted` lines (one per crossing), zero lines for the
+teleport, and one `LAPSYNC baseline` at the start.
+
+### v0.3 protocol (historical; still the transparency/single-writer gate)
+
+> The sample lines below say `app=0.3`. v0.4 writes `app=0.4` and appends
+> `syncLaps=`/`syncOffsetS=` to `INIT` and `syncLaps=` to `SESSION`; every gate
+> in this section is otherwise unchanged and still required.
+
 
 Same session/car/track as v0.2 (`thunderhill_raceway_park / threemilebypass`,
 `ig_toyota_gr86_premium`, player stationary in the pit box). Steps 2–4 of the
@@ -290,8 +536,6 @@ Render path **proven end-to-end** (car visible + cross visible):
   centered NDC, `dist` 20-65 m, ghost height within ~1 m of player
   height — not buried).
 
-![ghost in chase view](../../../docs/assets/ghostcar_hotlap_proof_wide.jpg)
-![ghost close-up with debug cross](../../../docs/assets/ghostcar_hotlap_proof_close.png)
 
 Caveats carried forward: a duplicate app instance was observed writing
 interleaved rows (second `INIT ok` after a session restart while the first
@@ -521,6 +765,20 @@ decides it without relying on human eyes.
   `io.fileExists` / `io.load` / `io.open` / `io.createFileDir`
   (`apps/lua/ac-tracer/lib/core/files.lua`, `paths.lua`), `json.decode`
   (`csp-traffic-tool/tool.lua`), with `JSON.parse` as fallback.
+* Lap sync (v0.4) uses only `ac.getCar(0).lapCount` as the boundary, which is
+  the counter the installed ac-tracer keys off
+  (`apps/lua/ac-tracer/lib/core/state.lua:1263`, `windows/delta_bar.lua:79`).
+  Teleports (`ac.onCarJumped`, `resetCounter`, `splinePosition` jumps) and lap
+  validity (`isLastLapValid`) are deliberately not used to restart playback; see
+  the policy table above for the reasoning.
+* The sync toggle is persisted with `ac.storage` (the auto-saving store used by
+  ac-tracer's `lib/core/settings.lua:50` and by map_display), flipped with
+  `ui.checkbox` in the same click-to-invert pattern as
+  `settings.lua:267-268`. Assignment persists; there is no save call.
+* `GHOST_START_OFFSET_S` is a per-timeline phase constant, not a per-lap
+  correction: the bundled threemilebypass file is measured ~1.41 s ahead of the
+  line, but the shipped default stays `0.0` so the app is correct for a
+  timeline cut crossing-to-crossing (see "Aligning frame 0").
 * Transparency is one constant, `GHOST_ALPHA = 0.5`, at the top of
   `ghostcar_hotlap.lua`. `GHOST_TINT` is the flat texel color; the livery is
   intentionally not preserved because the SDK has no alpha-only material
@@ -558,4 +816,3 @@ actual shader, not by assumption; (b) `findMeshes('*')` matches nothing,
 use `key:value` filters; (c) only 55/317 meshes are covered — full-car
 coverage would need the remaining interior/trim shader names.
 
-![translucent ghost with debug cross](../../../docs/assets/ghostcar_hotlap_proof_translucent.jpg)

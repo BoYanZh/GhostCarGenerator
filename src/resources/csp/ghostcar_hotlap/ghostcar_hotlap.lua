@@ -21,6 +21,22 @@
 --   * KN5 path resolved through `ac.findFile()` (documented portable form)
 --     instead of a raw concatenation of an absolute folder path.
 --
+-- v0.4 additions (see README "v0.4 protocol"):
+--   * Lap synchronisation: when the player's completed-lap counter increments
+--     (`ac.getCar(0).lapCount`, the same signal `ac-tracer` keys off at
+--     apps/lua/ac-tracer/lib/core/state.lua:1263 and lib/windows/delta_bar.lua:79)
+--     the playback cursor jumps back to the start of the timeline, so the ghost
+--     and the player cross the start/finish line together on every lap.
+--     Teleports, pit stops and invalidated laps are deliberately NOT lap
+--     boundaries for this purpose (see README "Policy for the awkward cases").
+--   * Toggle in the settings window, default ON, persisted through
+--     `ac.storage` (apps/lua/ac-tracer/lib/core/settings.lua:50). Its state is
+--     logged as `syncLaps=1/0` on the INIT line, and every restart writes one
+--     `LAPSYNC ...` line. With the toggle OFF the app is byte-for-byte v0.3
+--     free-run behaviour.
+--   * `GHOST_START_OFFSET_S` tunable for the constant (if any) between
+--     timeline frame 0 and the track's start/finish line.
+--
 -- v0.3 additions (see README "v0.3 protocol"):
 --   * Transparency: the loaded ghost KN5 is drawn with `setTransparent(true)` +
 --     `setBlendMode(render.BlendMode.AlphaBlend)` and a flat translucent
@@ -61,13 +77,53 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.3'
+local APP_VERSION = '0.4'
 -- Single tunable alpha for the ghost body, 0..1 (1 = opaque v0.2 look).
 -- Clamped at load; logged in the INIT line and every GHOST line.
 local GHOST_ALPHA = 0.5
+-- Timeline steerAngleDeg is steering-WHEEL degrees straight from the LD
+-- channel (about +/-90 on track). Wheel nodes need ROAD angle, hence the
+-- steering ratio (2nd-gen GR86: 13.5:1). Visual only; tune freely.
+local GHOST_STEER_RATIO = 13.5
 -- Flat tint written into txDiffuse; the ghost keeps its shape/normals but not
 -- its livery. A neutral cool grey reads as a ghost against dark tarmac.
 local GHOST_TINT = { 0.72, 0.78, 0.85 }
+-- v0.4 lap sync. `GHOST_START_OFFSET_S` is how far the timeline runs AHEAD of
+-- the player's lap at the start/finish crossing, in seconds: playback starts at
+-- (duration - offset) when the player's lap counter increments. 0.0 shows the
+-- raw file phase (frame 0) and is the only safe default for an arbitrary
+-- `ghost-runtime-v1.json`.
+--
+-- Offline measurement for the bundled threemilebypass timeline
+-- (`ghost-runtime-v1.json`, 9131 frames / 136.95 s) says frame 0 sits 66.3 m
+-- PAST the AI-spline start point, i.e. ~1.41 s ahead of the line at racing
+-- speed, so 1.41 is the value that puts that file's frame on the line. It is
+-- not the default because the app historically ships with data it does not
+-- own; see README "Aligning frame 0 to the start line" for the derivation and
+-- for the in-game calibration procedure.
+local GHOST_START_OFFSET_S = 0.0
+-- v0.4 lap-sync toggle persistence. `ac.storage` is the SDK's auto-saving
+-- script store used by the installed ac-tracer app
+-- (apps/lua/ac-tracer/lib/core/settings.lua:50: `ac.storage({...}, "ac_tracer/")`)
+-- and by PureConfig; assignment persists, no explicit save call.
+local SETTINGS_PREFIX = 'ghostcar_hotlap/'
+local settings
+do
+  settings = { syncLaps = true }
+  if type(ac.storage) == 'function' then
+    local ok, store = pcall(ac.storage, { syncLaps = true }, SETTINGS_PREFIX)
+    if ok and type(store) == 'table' then
+      settings = store
+    end
+  end
+  -- An older/partial settings file must not turn the feature off by accident.
+  if settings.syncLaps == nil then settings.syncLaps = true end
+end
+
+local function syncLapsEnabled()
+  return settings.syncLaps ~= false
+end
+
 local GHOST_MODEL_RELATIVE = 'content/cars/ig_toyota_gr86_premium/toyota_gr86_premium.kn5'
 local RUNTIME_FILENAME = __dirname .. '/ghost-runtime-v1.json'
 local LOG_RELATIVE_DIR = 'Documents/Assetto Corsa/logs'
@@ -196,6 +252,12 @@ local state = {
   materialMode = nil,
   materialMeshes = 0,
   materialError = nil,
+  -- v0.4 lap sync. `lapBaseline` is the last player `lapCount` seen; nil means
+  -- "not tracking yet" (first tick, toggle re-enabled, or session reset), so
+  -- the next crossing is a real crossing instead of a double-fire.
+  lapBaseline = nil,
+  lapRestarts = 0,
+  lapSyncUnavailable = false,
 }
 
 -- Render-context oracle cache; filled by the `render.on()` callback above and
@@ -281,14 +343,15 @@ local function announceInit()
   initLogged = true
   if runtime then
     appendLog(string.format(
-      'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s alpha=%.3f',
+      'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f',
       APP_VERSION, tostring(runtime.schema), #runtime.frames, runtimeDurationS,
       tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH),
-      EFFECTIVE_ALPHA))
+      EFFECTIVE_ALPHA, syncLapsEnabled() and 1 or 0, GHOST_START_OFFSET_S))
   else
     appendLog(string.format(
-      'INIT %s app=%s fallback=5m-follow player log=%s alpha=%.3f',
-      tostring(runtimeError), APP_VERSION, tostring(LOG_PATH), EFFECTIVE_ALPHA))
+      'INIT %s app=%s fallback=5m-follow player log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f',
+      tostring(runtimeError), APP_VERSION, tostring(LOG_PATH), EFFECTIVE_ALPHA,
+      syncLapsEnabled() and 1 or 0, GHOST_START_OFFSET_S))
     ac.warn('GhostCarGenerator Hotlap: '..tostring(runtimeError)..'; using 5 m fallback')
   end
 end
@@ -908,7 +971,15 @@ local function resetForSession(token)
   state.materialMode = nil
   state.materialMeshes = 0
   state.materialError = nil
-  appendLog('SESSION token='..tostring(token))
+  -- v0.4: the session token change means a new session, so any lap baseline
+  -- belongs to the old one. Clearing it guarantees the first crossing after the
+  -- restart re-syncs once (instead of comparing against a stale lap number and
+  -- either double-firing or missing the crossing).
+  state.lapBaseline = nil
+  state.lapRestarts = 0
+  state.lapSyncUnavailable = false
+  appendLog(string.format('SESSION token=%s syncLaps=%d',
+    tostring(token), syncLapsEnabled() and 1 or 0))
 end
 
 -- ---------------------------------------------------------------------------
@@ -1011,6 +1082,101 @@ local function advanceClock(fallback)
   return fallback
 end
 
+-- ---------------------------------------------------------------------------
+-- Lap synchronisation (v0.4)
+-- ---------------------------------------------------------------------------
+-- The player's lap boundary is `ac.getCar(0).lapCount`, an integer that AC
+-- increments on the start/finish crossing. This is exactly the signal the
+-- installed ac-tracer app uses:
+--   * apps/lua/ac-tracer/lib/core/state.lua:1263
+--       `if car.lapCount > state.lapNumber then` -> lap completed, then
+--       `state.lapNumber = car.lapCount` (line 1322);
+--   * apps/lua/ac-tracer/lib/windows/delta_bar.lua:79
+--       `if car.lapCount ~= prevLapCount then` -> same counter, UI-side.
+-- The surrounding fields ac-tracer reads live on the same `ac.StateCar` object:
+-- `car.lapTimeMs`, `car.previousLapTimeMs`, `car.isLastLapValid`,
+-- `car.splinePosition`, `car.isInPitlane`/`car.isInPit`, `car.resetCounter`,
+-- and `ac.onCarJumped(0, fn)` for teleports (state.lua:1225). Only `lapCount`
+-- is used for the restart trigger here, on purpose (policy below).
+--
+-- Policy:
+--   * Increment -> restart playback. Forward-only: `count > baseline`.
+--   * Teleport / respawn / back to pits -> NO restart. Those do not change
+--     `lapCount` and do not put the player at t=0 of a lap, so re-zeroing the
+--     ghost there would make it lead or lag by the distance already driven on
+--     the current lap. The ghost is anchored to the timing line, nothing else.
+--   * Invalidated lap (track limits, cut, contact) -> still restart. The ghost
+--     is a visual reference line, not a lap validator; a cut lap still crosses
+--     the line and the next lap must start with both cars together.
+--   * `lapCount` going backwards (session restart, car/session change) -> rebase
+--     the baseline without restarting, and let the next increment fire once.
+--     `resetForSession()` clears the baseline for the same reason.
+--   * A jump of more than one (teleport across the line inside one frame) is
+--     still one restart; the skipped count is logged as `jumps=` because the
+--     intermediate crossings cannot be separated.
+local function lapStartCursorS()
+  local offset = GHOST_START_OFFSET_S % runtimeDurationS
+  -- offset > 0 pulls playback back by that many seconds: the frame shown at the
+  -- crossing is the one that sits ON the line, not frame 0.
+  return (runtimeDurationS - offset) % runtimeDurationS
+end
+
+-- Same code path as the loop wrap: `runtimeTime` stays a time inside
+-- `[0, duration)`, and the frame cursor is re-armed (`= 1`) rather than left
+-- pointing at a later frame, so `ghostT` in the next data row is honest.
+local function restartPlaybackForLap(playerLap, nowS, jumps)
+  local cursor = lapStartCursorS()
+  state.runtimeTime = cursor
+  state.runtimeCursor = 1
+  state.lapRestarts = state.lapRestarts + 1
+  appendLog(string.format(
+    'LAPSYNC playerLap=%s ghostRestarted t=0 wallS=%s cursorS=%.3f offsetS=%.3f jumps=%d',
+    tostring(playerLap), fmtNumber(nowS), cursor, GHOST_START_OFFSET_S, jumps))
+end
+
+local function lapSyncTick(player, nowS)
+  if not runtime then return end
+  if not syncLapsEnabled() then
+    -- Toggled off: forget the baseline so re-enabling rebases instead of
+    -- firing a restart for a crossing that happened while free-running.
+    state.lapBaseline = nil
+    return
+  end
+
+  local count = player and player.lapCount
+  if type(count) ~= 'number' or count ~= count then
+    if not state.lapSyncUnavailable then
+      state.lapSyncUnavailable = true
+      appendLog('LAPSYNC unavailable lapCount=nil free-run')
+      ac.warn('GhostCarGenerator Hotlap: ac.getCar(0).lapCount unavailable; '
+        ..'lap sync disabled for this session')
+    end
+    return
+  end
+  state.lapSyncUnavailable = false
+
+  if state.lapBaseline == nil then
+    state.lapBaseline = count
+    appendLog(string.format('LAPSYNC baseline playerLap=%s wallS=%s',
+      tostring(count), fmtNumber(nowS)))
+    return
+  end
+
+  if count > state.lapBaseline then
+    local jumps = count - state.lapBaseline
+    state.lapBaseline = count
+    restartPlaybackForLap(count, nowS, jumps)
+    return
+  end
+
+  if count < state.lapBaseline then
+    state.lapBaseline = count
+    appendLog(string.format(
+      'LAPSYNC rebase playerLap=%s wallS=%s reason=lapcount-decrease',
+      tostring(count), fmtNumber(nowS)))
+  end
+end
+
 local function writeSample()
   local sim = ac.getSim()
   local time = (sim and sim.gameTime) or 0
@@ -1052,9 +1218,17 @@ local function updateGhost(dt)
   step = advanceClock(step)
 
   if runtime then
+    -- Lap boundary first, then advance: a restart this frame is visible in the
+    -- pose written this frame (cursor is re-armed, then +step is applied).
+    local simNow = ac.getSim()
+    lapSyncTick(player, (simNow and simNow.gameTime) or state.clock)
     state.runtimeTime = (state.runtimeTime + step) % runtimeDurationS
     local frame = sampleRuntimeFrame(state.runtimeTime)
-    local steer = math.rad(frame and frame.steerAngleDeg or 0)
+    -- Timeline steer+ is a right turn, but the wheel node +x axis is the
+    -- car's left, so the raw value renders mirrored (seen in-game: right
+    -- turn, wheels pointing left). Negate, and convert steering-wheel
+    -- degrees to road angle via GHOST_STEER_RATIO.
+    local steer = -math.rad(frame and frame.steerAngleDeg or 0) / GHOST_STEER_RATIO
     steerWheels(steer, step * 5)
   else
     -- Fallback: keep a second car visible 5 m to the side of the player so the
@@ -1123,8 +1297,9 @@ function script.windowMain(dt)
       dist3(state.ghostX, state.ghostY, state.ghostZ,
         state.playerX, state.playerY, state.playerZ),
       state.runtimeTime))
-    ui.text(string.format('alpha %.2f mode %s  meshes %d',
-      EFFECTIVE_ALPHA, tostring(state.materialMode or 'pending'), state.materialMeshes))
+    ui.text(string.format('alpha %.2f mode %s  meshes %d  sync %s',
+      EFFECTIVE_ALPHA, tostring(state.materialMode or 'pending'), state.materialMeshes,
+      syncLapsEnabled() and 'on' or 'off'))
     ui.text(string.format('oracle ndc %s %s  hook %s',
       fmtNumber(oracle.ndcX), fmtNumber(oracle.ndcY),
       oracle.hookAnnounced and ('ok/'..oracle.hookFrames) or 'never'))
@@ -1167,6 +1342,21 @@ function script.windowSettings(dt)
   ui.text('runtime: '..(runtime and (tostring(#runtime.frames)..' frames') or tostring(runtimeError)))
   ui.text('model: '..tostring(state.modelPath or GHOST_MODEL_RELATIVE))
   ui.text('clock: '..tostring(state.clockSource or '-'))
+  -- v0.4: toggle. `ui.checkbox` returns true on the click that flips it, which
+  -- is the pattern the installed ac-tracer settings window uses
+  -- (apps/lua/ac-tracer/lib/core/settings.lua:267-268).
+  local sync = syncLapsEnabled()
+  if ui.checkbox('Sync ghost to my laps', sync) then
+    settings.syncLaps = not sync
+    state.lapBaseline = nil
+    local sim = ac.getSim()
+    local nowS = (sim and sim.gameTime) or state.clock
+    appendLog(string.format('LAPSYNC toggle syncLaps=%d wallS=%s cursorS=%.3f',
+      syncLapsEnabled() and 1 or 0, fmtNumber(nowS), state.runtimeTime))
+  end
+  ui.text(string.format('lap sync: %s  playerLap=%s  restarts=%d  offset %.2fs',
+    syncLapsEnabled() and 'on' or 'off', tostring(state.lapBaseline),
+    state.lapRestarts, GHOST_START_OFFSET_S))
   ui.text('oracle: '..(oracle.hookAnnounced and ('hook ok, ndc '..fmtNumber(oracle.ndcX)
     ..' '..fmtNumber(oracle.ndcY)) or 'hook not fired'))
   ui.text('log: '..tostring(LOG_PATH))
