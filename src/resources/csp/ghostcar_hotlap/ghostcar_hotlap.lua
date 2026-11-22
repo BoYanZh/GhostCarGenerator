@@ -21,6 +21,19 @@
 --   * KN5 path resolved through `ac.findFile()` (documented portable form)
 --     instead of a raw concatenation of an absolute folder path.
 --
+-- v0.3 additions (see README "v0.3 protocol"):
+--   * Transparency: the loaded ghost KN5 is drawn with `setTransparent(true)` +
+--     `setBlendMode(render.BlendMode.AlphaBlend)` and a flat translucent
+--     `txDiffuse` color carrying GHOST_ALPHA. The SDK has no per-material
+--     opacity call, so alpha is carried by the diffuse texture slot, which is
+--     the channel AC's blend path already uses for windscreens. Materials are
+--     made unique first (`ensureUniqueMaterials()`), which is what keeps the
+--     edit off the player car even when both use the same pooled KN5.
+--   * Single-instance guard: a session-shared lease in `ac.store()`/`ac.load()`
+--     elects exactly one writer. A duplicate app instance logs one
+--     `INSTANCE standby, another writer active ...` line and never creates a
+--     node or appends a data row.
+--
 -- Determinism notes (verified conclusions, see docs/assetto-corsa-replay-notes.md):
 --   * `rotationRad` is {pitch, yaw, roll}; yaw is element 2 and is wrapped into
 --     [-pi, pi] before use.
@@ -38,13 +51,23 @@
 --     `nan` means "not available" (oracle hook never ran, or the point projects
 --     to infinity because it is behind the camera).
 --   * On load a single `INIT ok ...` or `INIT missing-runtime ...` line is
---     written, followed by `NODE ok ...` once the scene node exists.
---     Failures also produce an `ERROR ...` line and an `ac.warn`.
+--     written by the elected writer, followed by `NODE ok ...` once the scene
+--     node exists and `GHOST ...` with the transparency actually applied.
+--     The INIT line ends with `alpha=<value>`; everything before it keeps the
+--     v0.2 shape. Failures also produce an `ERROR ...` line and an `ac.warn`.
+--   * Standby instances write only `INSTANCE standby, another writer active ...`
+--     (plus `SHUTDOWN role=standby`), so a duplicate app cannot interleave rows.
 --   * The window text starts with `GhostCarGenerator Hotlap: ACTIVE` or
---     `GhostCarGenerator Hotlap: ERROR: ...` so screenshots can be asserted
---     on without OCR of the numbers.
+--     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
+--     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.2'
+local APP_VERSION = '0.3'
+-- Single tunable alpha for the ghost body, 0..1 (1 = opaque v0.2 look).
+-- Clamped at load; logged in the INIT line and every GHOST line.
+local GHOST_ALPHA = 0.5
+-- Flat tint written into txDiffuse; the ghost keeps its shape/normals but not
+-- its livery. A neutral cool grey reads as a ghost against dark tarmac.
+local GHOST_TINT = { 0.72, 0.78, 0.85 }
 local GHOST_MODEL_RELATIVE = 'content/cars/ig_toyota_gr86_premium/toyota_gr86_premium.kn5'
 local RUNTIME_FILENAME = __dirname .. '/ghost-runtime-v1.json'
 local LOG_RELATIVE_DIR = 'Documents/Assetto Corsa/logs'
@@ -61,6 +84,24 @@ local RENDER_EVENT = 'main.track.transparent'
 -- Draws a cross at the computed ghost pose during verification. Remove/disable
 -- for production use; it only draws inside the render hook.
 local ORACLE_DEBUG_CROSS = true
+-- Single-instance lease. `ac.store`/`ac.load` are the SDK's session-shared
+-- script storage (ac_apps/lib.lua:3953-3966); the value is
+--   <gen>|<instanceId>|<wallClockSeconds>|<sessionToken>
+-- An empty value means "free". A writer is replaced only after LEASE_S of
+-- silence, so a crashed/hidden instance cannot keep the ghost off forever.
+local INSTANCE_KEY = 'ghostcar_hotlap.writer'
+local INSTANCE_LEASE_S = 8
+local INSTANCE_SETTLE_S = 0.6
+local INSTANCE_HEARTBEAT_S = 1
+
+local function clamp01(value)
+  if type(value) ~= 'number' or value ~= value then return 0.5 end
+  if value < 0 then return 0 end
+  if value > 1 then return 1 end
+  return value
+end
+
+local EFFECTIVE_ALPHA = clamp01(GHOST_ALPHA)
 
 -- ---------------------------------------------------------------------------
 -- Logging
@@ -152,6 +193,9 @@ local state = {
   nextInitAttemptAt = 0,
   initFailures = 0,
   poseApplied = false,
+  materialMode = nil,
+  materialMeshes = 0,
+  materialError = nil,
 }
 
 -- Render-context oracle cache; filled by the `render.on()` callback above and
@@ -224,18 +268,29 @@ end
 
 local runtimeError = nil
 runtime, runtimeError = loadRuntime()
-
 if runtime then
   runtimeDurationS = runtime.frames[#runtime.frames].timeS
-  appendLog(string.format(
-    'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s',
-    APP_VERSION, tostring(runtime.schema), #runtime.frames, runtimeDurationS,
-    tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH)))
-else
-  appendLog(string.format(
-    'INIT %s app=%s fallback=5m-follow player log=%s',
-    tostring(runtimeError), APP_VERSION, tostring(LOG_PATH)))
-  ac.warn('GhostCarGenerator Hotlap: '..tostring(runtimeError)..'; using 5 m fallback')
+end
+
+-- The INIT line is emitted only once the single-instance guard has made this
+-- instance the writer, so a duplicate app instance cannot add a second
+-- `INIT ok` to the log. Everything before ` alpha=` keeps the v0.2 grammar.
+local initLogged = false
+local function announceInit()
+  if initLogged then return end
+  initLogged = true
+  if runtime then
+    appendLog(string.format(
+      'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s alpha=%.3f',
+      APP_VERSION, tostring(runtime.schema), #runtime.frames, runtimeDurationS,
+      tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH),
+      EFFECTIVE_ALPHA))
+  else
+    appendLog(string.format(
+      'INIT %s app=%s fallback=5m-follow player log=%s alpha=%.3f',
+      tostring(runtimeError), APP_VERSION, tostring(LOG_PATH), EFFECTIVE_ALPHA))
+    ac.warn('GhostCarGenerator Hotlap: '..tostring(runtimeError)..'; using 5 m fallback')
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -318,6 +373,236 @@ local function disposeGhost()
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- Single-instance guard
+-- ---------------------------------------------------------------------------
+-- Two copies of this app in one session each keep their own playback clock and
+-- append to the same CSV, which is the v0.2 interleaved-row bug. The SDK's
+-- session-shared storage is documented for exactly this ("a way for different
+-- scripts to exchange data", ac_apps/lib.lua:3953-3966), so the writer role is
+-- leased there. Election is claim -> settle -> re-read:
+--
+--   1. write `<gen>|<id>|<wallSeconds>|<sessionToken>`;
+--   2. wait INSTANCE_SETTLE_S;
+--   3. re-read. If our id survived we are the writer; if a fresher foreign
+--      lease survived we stand by BEFORE creating a node or logging a row.
+--
+-- The writer refreshes the lease every second, re-asserts it when the storage
+-- was cleared by a session restart, and stands down if a duplicate holds a
+-- fresher lease. A dead writer is replaced after INSTANCE_LEASE_S of silence.
+--
+-- Why `ac.store` and not a real lock: the SDK exposes no mutex/atomic CAS.
+-- This is a lease protocol, so the residual race window is INSTANCE_SETTLE_S
+-- at a simultaneous cold start, and the shared store is per-session, not
+-- per-machine. The file backend (same record format, next to the log) is used
+-- only when `ac.store` is missing; it extends coverage to a separate process
+-- but has the same settle-window caveat. Backend switch: force this expression
+-- to 'file' to arbitrate across processes.
+local INSTANCE_BACKEND = (type(ac.store) == 'function' and type(ac.load) == 'function')
+  and 'shared' or 'file'
+local INSTANCE_FILE = nil
+if LOG_PATH then
+  INSTANCE_FILE = LOG_PATH:gsub('%.log$', '')..'.owner'
+end
+
+local function wallNow()
+  local ok, value = pcall(os.time)
+  if ok and type(value) == 'number' then return value end
+  -- Fallbacks keep the lease monotonic when os.time is unavailable.
+  local sim = nil
+  pcall(function() sim = ac.getSim() end)
+  local system = sim and sim.systemTime
+  if type(system) == 'number' then return system end
+  return math.floor(state.clock)
+end
+
+local function makeInstanceId()
+  -- Wall second + sub-second CPU stamp + Lua state address. Two instances in
+  -- the same process have distinct heaps, so the address disambiguates even a
+  -- same-second load.
+  local address = tostring({}):match('(%x+)$') or '0'
+  local cpu = 0
+  pcall(function() cpu = os.clock() end)
+  local micro = math.floor((cpu % 1) * 1000000)
+  return string.format('%d-%06d-%s', wallNow(), micro, address)
+end
+
+local instance = {
+  id = makeInstanceId(),
+  gen = 0,
+  role = 'claiming',
+  sessionToken = nil,
+  claimedAt = 0,
+  claimAttempts = 0,
+  lastBeatSecond = nil,
+  lastPollSecond = nil,
+  available = INSTANCE_BACKEND == 'shared' or INSTANCE_FILE ~= nil,
+}
+
+local function readOwnerRecord()
+  if INSTANCE_BACKEND == 'shared' then
+    local ok, value = pcall(ac.load, INSTANCE_KEY)
+    if ok then return value end
+    return nil
+  end
+  if not INSTANCE_FILE then return nil end
+  local ok, value = pcall(io.load, INSTANCE_FILE, '')
+  if ok and type(value) == 'string' then
+    return (value:gsub('%s+$', ''))
+  end
+  return nil
+end
+
+local function writeOwnerRecord(record)
+  if INSTANCE_BACKEND == 'shared' then
+    return (pcall(ac.store, INSTANCE_KEY, record))
+  end
+  if not INSTANCE_FILE then return false end
+  local file = io.open(INSTANCE_FILE, 'w')
+  if not file then return false end
+  file:write(record..'\n')
+  file:close()
+  return true
+end
+
+local function parseOwnerRecord(record)
+  if type(record) ~= 'string' or record == '' then return nil end
+  local gen, id, stamp, token = record:match('^(%d+)|([^|]+)|(%d+)|(.*)$')
+  if not gen then return nil end
+  return {
+    gen = tonumber(gen) or 0,
+    id = id,
+    stamp = tonumber(stamp) or 0,
+    token = token,
+  }
+end
+
+local function logStandby(record, extra)
+  appendLog(string.format(
+    'INSTANCE standby, another writer active id=%s gen=%d ageS=%d backend=%s%s',
+    tostring(record and record.id or '?'), record and record.gen or 0,
+    record and math.max(0, wallNow() - record.stamp) or -1,
+    INSTANCE_BACKEND, extra and (' '..extra) or ''))
+end
+
+local function beginClaim(reason, previous)
+  local record = previous or parseOwnerRecord(readOwnerRecord())
+  instance.gen = (record and record.gen or 0) + 1
+  instance.claimedAt = state.clock + INSTANCE_SETTLE_S
+  instance.claimAttempts = instance.claimAttempts + 1
+  instance.role = 'claiming'
+  local wrote = writeOwnerRecord(string.format('%d|%s|%d|%s',
+    instance.gen, instance.id, wallNow(), tostring(instance.sessionToken or '0')))
+  if not wrote then
+    instance.available = false
+    instance.role = 'writer'
+    appendLog('INSTANCE unavailable store-write-failed; running unguarded')
+    announceInit()
+    return
+  end
+  if reason == 'takeover' then
+    appendLog(string.format(
+      'INSTANCE takeover id=%s genOld=%d ageS=%d gen=%d',
+      tostring(record and record.id or 'free'), record and record.gen or 0,
+      record and math.max(0, wallNow() - record.stamp) or -1, instance.gen))
+  end
+end
+
+-- Returns the current role: 'claiming' | 'writer' | 'standby'. Only 'writer'
+-- may create/pose the node or append data rows.
+local function guardTick()
+  if not instance.available then
+    instance.role = 'writer'
+    announceInit()
+    return 'writer'
+  end
+
+  local sim = ac.getSim()
+  instance.sessionToken = tostring(sim and sim.currentSessionIndex or 0)
+  local wall = wallNow()
+
+  if instance.role == 'claiming' then
+    if instance.gen == 0 then
+      -- First tick: never disturb a writer that already holds a fresh lease
+      -- (this is the "session restart loaded a second app" case), otherwise
+      -- write our claim and let the settle window arbitrate a cold start.
+      local existing = parseOwnerRecord(readOwnerRecord())
+      if existing and existing.id ~= instance.id
+        and (wall - existing.stamp) <= INSTANCE_LEASE_S then
+        instance.role = 'standby'
+        logStandby(existing)
+        return 'standby'
+      end
+      beginClaim('initial', existing)
+      return instance.role
+    end
+    if state.clock < instance.claimedAt then return 'claiming' end
+    local record = parseOwnerRecord(readOwnerRecord())
+    if record and record.id == instance.id then
+      instance.role = 'writer'
+      instance.lastBeatSecond = wall
+      appendLog(string.format('INSTANCE writer id=%s gen=%d backend=%s attempts=%d',
+        instance.id, instance.gen, INSTANCE_BACKEND, instance.claimAttempts))
+      announceInit()
+      return 'writer'
+    end
+    if record and (wall - record.stamp) <= INSTANCE_LEASE_S then
+      instance.role = 'standby'
+      logStandby(record)
+      return 'standby'
+    end
+    if instance.claimAttempts >= 3 then
+      -- The store keeps losing our write (e.g. it is per-instance, not
+      -- shared). Prefer a working ghost over a silent app, and say so.
+      instance.available = false
+      instance.role = 'writer'
+      appendLog('INSTANCE unavailable store-unverified; running unguarded')
+      announceInit()
+      return 'writer'
+    end
+    beginClaim('takeover', record)
+    return instance.role
+  end
+
+  if instance.role == 'writer' then
+    if not instance.lastBeatSecond
+      or wall - instance.lastBeatSecond >= INSTANCE_HEARTBEAT_S then
+      instance.lastBeatSecond = wall
+      local record = parseOwnerRecord(readOwnerRecord())
+      if record and record.id ~= instance.id
+        and (wall - record.stamp) <= INSTANCE_LEASE_S then
+        -- A duplicate won a newer claim: retire this writer immediately.
+        disposeGhost()
+        state.status = 'INIT'
+        state.mode = nil
+        state.materialMode = nil
+        instance.role = 'standby'
+        logStandby(record)
+        return 'standby'
+      end
+      -- Re-assert even when the record is missing: a session restart may have
+      -- cleared the shared store while this instance kept running.
+      writeOwnerRecord(string.format('%d|%s|%d|%s',
+        instance.gen, instance.id, wall, instance.sessionToken))
+    end
+    return 'writer'
+  end
+
+  -- standby: poll for a dead/free lease and take over.
+  if not instance.lastPollSecond
+    or wall - instance.lastPollSecond >= INSTANCE_HEARTBEAT_S then
+    instance.lastPollSecond = wall
+    local record = parseOwnerRecord(readOwnerRecord())
+    if not record or (wall - record.stamp) > INSTANCE_LEASE_S then
+      instance.claimAttempts = 0
+      beginClaim('takeover', record)
+      return instance.role
+    end
+  end
+  return 'standby'
+end
+
+
 -- `ac.findFile()` (SDK ac_apps/lib.lua:3160) searches the script folder, then
 -- the CSP folder, then the AC root, and returns an absolute path; a path
 -- relative to the AC root is the documented form for `loadKN5()`.
@@ -367,6 +652,7 @@ local function logNodeIntrospection(node, model)
     local okSize, size = pcall(function() return found:size() end)
     if okSize and type(size) == 'number' and size > 0 then
       meshes = found
+      meshCount = size
       parts[#parts + 1] = 'meshes='..sanitizeToken(size)
     end
   end
@@ -389,6 +675,126 @@ local function logNodeIntrospection(node, model)
   parts[#parts + 1] = 'wheels='..sanitizeToken(#state.wheels)
   parts[#parts + 1] = 'model='..sanitizeToken(state.modelPath)
   appendLog(table.concat(parts, ' '))
+end
+
+-- Ghost look. The SDK has no per-material opacity (`ac.SceneReference` exposes
+-- setMaterialProperty/setMaterialTexture but nothing like setOpacity; see
+-- ac_apps/lib.lua:9610-9681), so alpha has to come from the diffuse texture
+-- slot: that is the channel AC's transparent materials (windscreens) use, and
+-- the SDK's own solid-color example is lib.lua:9641-9650.
+-- We write one flat translucent texel into txDiffuse, mark the meshes as
+-- transparent so they are drawn in the transparent pass (lib.lua:10064), and
+-- switch the blend mode (lib.lua:9874). setShadows(false) keeps the ghost from
+-- casting a solid shadow through its own transparency (lib.lua:9858).
+--
+-- Scope: ensureUniqueMaterials() (lib.lua:9677) is the guarantee that this
+-- never touches the player car or another car. loadKN5 pulls from a shared
+-- pool (lib.lua:9797-9800), so editing a pooled material without it could leak.
+-- Mesh filters. findMeshes() takes `key:value` filters ('*' alone matches
+-- nothing); there is no documented match-all, so cover the car by the shader
+-- slots cars actually use. The traffic tool proves
+-- 'shader:ksPerPixelMultiMap_damage_dirt' for paint; the plain variants cover
+-- converted/modded models like this GR86. Per-filter counts are logged, so
+-- coverage vs aabbMeshes is auditable in a single run.
+local GHOST_MESH_FILTERS = {
+  'shader:ksPerPixelMultiMap_damage_dirt',
+  'shader:ksPerPixelMultiMap',
+  'shader:ksPerPixel',
+  'shader:ksWindscreen',
+  'shader:ksGlass',
+  'shader:ksTyre',
+  'shader:ksWheel',
+}
+
+local function applyGhostMaterials(model)
+  if EFFECTIVE_ALPHA >= 0.999 then
+    return { count = 0, mode = 'opaque' }, nil
+  end
+  if type(render) ~= 'table' or not render.BlendMode then
+    return nil, 'render.BlendMode-missing'
+  end
+  local total, merged, detail = 0, {}, {}
+  for _, filter in ipairs(GHOST_MESH_FILTERS) do
+    local okFind, found = pcall(function() return model:findMeshes(filter) end)
+    local n = 0
+    if okFind and found then
+      local okSize, count = pcall(function() return found:size() end)
+      if okSize and type(count) == 'number' then n = count end
+    end
+    detail[#detail + 1] = filter..'='..n
+    if n > 0 then
+      local steps = {}
+      local function step(name, fn)
+        local okStep, err = pcall(fn)
+        steps[name] = okStep and 'ok' or ('failed:'..tostring(err))
+      end
+      step('unique', function() found:ensureUniqueMaterials() end)
+      step('transparent', function() found:setTransparent(true) end)
+      step('blend', function() found:setBlendMode(render.BlendMode.AlphaBlend) end)
+      step('shadows', function() found:setShadows(false) end)
+      step('tint', function()
+        found:setMaterialTexture('txDiffuse', rgbm(
+          GHOST_TINT[1], GHOST_TINT[2], GHOST_TINT[3], EFFECTIVE_ALPHA))
+      end)
+      for k, v in pairs(steps) do
+        if merged[k] == nil then merged[k] = v
+        elseif v ~= 'ok' then merged[k] = v end
+      end
+      total = total + n
+    end
+  end
+  -- Root pass: reference-level ops may propagate to all child meshes
+  -- (covers shaders the filter list misses). Logged separately.
+  local rsteps = {}
+  local function rstep(name, fn)
+    local okStep, err = pcall(fn)
+    rsteps[name] = okStep and 'ok' or ('failed:'..tostring(err))
+  end
+  rstep('unique', function() model:ensureUniqueMaterials() end)
+  rstep('transparent', function() model:setTransparent(true) end)
+  rstep('blend', function() model:setBlendMode(render.BlendMode.AlphaBlend) end)
+  rstep('shadows', function() model:setShadows(false) end)
+  rstep('tint', function()
+    model:setMaterialTexture('txDiffuse', rgbm(
+      GHOST_TINT[1], GHOST_TINT[2], GHOST_TINT[3], EFFECTIVE_ALPHA))
+  end)
+  appendLog(string.format(
+    'GHOSTROOT unique=%s transparent=%s blend=%s shadows=%s tint=%s',
+    sanitizeToken(rsteps.unique or '?'), sanitizeToken(rsteps.transparent or '?'),
+    sanitizeToken(rsteps.blend or '?'), sanitizeToken(rsteps.shadows or '?'),
+    sanitizeToken(rsteps.tint or '?')))
+  if total <= 0 then return nil, 'no-meshes' end
+  return { count = total, mode = 'alpha', steps = merged,
+    filters = table.concat(detail, ',') }, nil
+end
+
+local function logGhostMaterials(info, err)
+  if not info then
+    state.materialMode = nil
+    state.materialMeshes = 0
+    state.materialError = tostring(err)
+    appendLog('GHOST failed '..sanitizeToken(err))
+    ac.warn('GhostCarGenerator Hotlap: transparency not applied ('..tostring(err)..')')
+    return
+  end
+  state.materialMode = info.mode
+  state.materialMeshes = info.count
+  state.materialError = nil
+  if info.mode == 'opaque' then
+    appendLog(string.format('GHOST alpha=%.3f mode=opaque meshes=%d',
+      EFFECTIVE_ALPHA, info.count))
+    return
+  end
+  local steps = info.steps or {}
+  appendLog(string.format(
+    'GHOST alpha=%.3f mode=alpha meshes=%d transparent=%s blend=%s shadows=%s tint=%s unique=%s filters=%s',
+    EFFECTIVE_ALPHA, info.count,
+    sanitizeToken(steps.transparent or '?'), sanitizeToken(steps.blend or '?'),
+    sanitizeToken(steps.shadows or '?'), sanitizeToken(steps.tint or '?'),
+    sanitizeToken(steps.unique or '?'), sanitizeToken(info.filters or '?')))
+  if steps.blend ~= 'ok' or steps.transparent ~= 'ok' then
+    ac.warn('GhostCarGenerator Hotlap: alpha blend not fully applied (see GHOST line)')
+  end
 end
 
 local function createGhostNode()
@@ -478,9 +884,11 @@ local function initialize()
   state.simGameTime = nil
   state.logAccum = LOG_INTERVAL_S -- log the first sample immediately
   logNodeIntrospection(node, model)
-  appendLog(string.format('ACTIVE mode=%s frames=%d hook=%s log=%s',
+  local materialInfo, materialError = applyGhostMaterials(model)
+  logGhostMaterials(materialInfo, materialError)
+  appendLog(string.format('ACTIVE mode=%s frames=%d hook=%s alpha=%.3f log=%s',
     tostring(state.mode), runtime and #runtime.frames or 0,
-    oracle.hookAnnounced and 'ok' or 'none', tostring(LOG_PATH)))
+    oracle.hookAnnounced and 'ok' or 'none', EFFECTIVE_ALPHA, tostring(LOG_PATH)))
   return true
 end
 
@@ -497,6 +905,9 @@ local function resetForSession(token)
   state.runtimeCursor = 1
   state.simGameTime = nil
   state.logAccum = 0
+  state.materialMode = nil
+  state.materialMeshes = 0
+  state.materialError = nil
   appendLog('SESSION token='..tostring(token))
 end
 
@@ -676,6 +1087,12 @@ function script.update(dt)
     if step < 0 then step = 0 end
     state.clock = state.clock + step
 
+    -- Only the elected writer may create/pose the node or append rows. The
+    -- guard itself runs for standby instances too, so they can take over when
+    -- the writer dies or the session restarts.
+    local role = guardTick()
+    if role ~= 'writer' then return end
+
     local token = tostring(sim and sim.currentSessionIndex or 0)
     if token ~= state.sessionToken then
       resetForSession(token)
@@ -690,6 +1107,15 @@ function script.update(dt)
 end
 
 function script.windowMain(dt)
+  if instance.role == 'standby' then
+    ui.text('GhostCarGenerator Hotlap: STANDBY (another writer active)')
+    ui.text('instance '..tostring(instance.id)..' - no node, no rows')
+    return
+  end
+  if instance.role == 'claiming' then
+    ui.text('GhostCarGenerator Hotlap: INIT claiming writer lease')
+    return
+  end
   if state.status == 'ACTIVE' then
     ui.text('GhostCarGenerator Hotlap: ACTIVE ['..tostring(state.mode)..']')
     ui.text(string.format('ghost %.1f %.1f %.1f  dist %.1f m  t %.1f s',
@@ -697,6 +1123,8 @@ function script.windowMain(dt)
       dist3(state.ghostX, state.ghostY, state.ghostZ,
         state.playerX, state.playerY, state.playerZ),
       state.runtimeTime))
+    ui.text(string.format('alpha %.2f mode %s  meshes %d',
+      EFFECTIVE_ALPHA, tostring(state.materialMode or 'pending'), state.materialMeshes))
     ui.text(string.format('oracle ndc %s %s  hook %s',
       fmtNumber(oracle.ndcX), fmtNumber(oracle.ndcY),
       oracle.hookAnnounced and ('ok/'..oracle.hookFrames) or 'never'))
@@ -713,12 +1141,29 @@ function script.shutdown()
     pcall(function() renderSubscription:dispose() end)
     renderSubscription = nil
   end
-  appendLog('SHUTDOWN')
+  local released = false
+  if instance.role == 'writer' and instance.available then
+    local record = parseOwnerRecord(readOwnerRecord())
+    if record and record.id == instance.id then
+      writeOwnerRecord('')
+      released = true
+    end
+  end
+  appendLog(string.format('SHUTDOWN role=%s%s', tostring(instance.role),
+    released and ' release=ok' or ''))
 end
 
 function script.windowSettings(dt)
   ui.text('GhostCarGenerator Hotlap '..APP_VERSION)
   ui.text('status: '..tostring(state.status)..' / '..tostring(state.mode or '-'))
+  ui.text('role: '..tostring(instance.role)..' gen='..tostring(instance.gen)
+    ..' id='..tostring(instance.id))
+  ui.text('alpha: '..string.format('%.3f', EFFECTIVE_ALPHA)..' / '
+    ..tostring(state.materialMode or 'pending')
+    ..' meshes='..tostring(state.materialMeshes))
+  if state.materialError then
+    ui.text('alpha error: '..tostring(state.materialError))
+  end
   ui.text('runtime: '..(runtime and (tostring(#runtime.frames)..' frames') or tostring(runtimeError)))
   ui.text('model: '..tostring(state.modelPath or GHOST_MODEL_RELATIVE))
   ui.text('clock: '..tostring(state.clockSource or '-'))
