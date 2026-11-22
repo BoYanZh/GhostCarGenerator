@@ -7,7 +7,7 @@ name = "ghost-car"
 dynamic = ["version"]
 description = "CLI and codecs for iRacing laps and Assetto Corsa replays"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
   { name = "BoYanZh" },
@@ -47,7 +47,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py38"
+target-version = "py310"
 exclude = [
   "src/ghost_car_generator/_vendor",
   "build",

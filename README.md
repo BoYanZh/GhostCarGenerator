@@ -16,7 +16,7 @@ notes and acceptance limits are in
 
 ## Requirements
 
-- Python 3.8 or newer
+- Python 3.10 or newer
 - NumPy 1.24 or newer
 
 ~~~powershell
