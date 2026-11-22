@@ -6,6 +6,21 @@
 -- back to a static 5 m offset that follows the player so a second car still
 -- renders in an otherwise empty install.
 --
+-- v0.2 additions (see README "Verification"):
+--   * Machine-readable render oracle: every data row now carries
+--       ghostNdcX,ghostNdcY,inFrustum01,camDistM,ghostT
+--     appended after the v0.1 eight-field prefix. NDC comes from
+--     `render.projectPoint()` sampled inside a `render.on()` callback
+--     (render context), the frustum bit from `ac.isVisibleInMainCamera()`
+--     (documented as callable from anywhere).
+--   * One-time NODE introspection line (valid handles, child counts, model
+--     AABB, wheels) so "loaded but empty" is distinguishable from
+--     "loaded and correctly sized".
+--   * Playback clock is locked to `ac.getSim().gameTime` when possible, so the
+--     re-verify timing rule is exact instead of drifting with app frame time.
+--   * KN5 path resolved through `ac.findFile()` (documented portable form)
+--     instead of a raw concatenation of an absolute folder path.
+--
 -- Determinism notes (verified conclusions, see docs/assetto-corsa-replay-notes.md):
 --   * `rotationRad` is {pitch, yaw, roll}; yaw is element 2 and is wrapped into
 --     [-pi, pi] before use.
@@ -16,23 +31,36 @@
 -- Observability:
 --   * Every second a CSV row is appended to
 --     `%USERPROFILE%\Documents\Assetto Corsa\logs\ghostcar_hotlap_verify.log`:
---       time,ghostX,ghostY,ghostZ,playerX,playerY,playerZ,dist
+--       time,ghostX,ghostY,ghostZ,playerX,playerY,playerZ,dist,\
+--       ghostNdcX,ghostNdcY,inFrustum01,camDistM,ghostT
 --     `time` is `ac.getSim().gameTime` in seconds; coordinates are metres; the
 --     ghost coordinates are the values handed to `setPosition`.
+--     `nan` means "not available" (oracle hook never ran, or the point projects
+--     to infinity because it is behind the camera).
 --   * On load a single `INIT ok ...` or `INIT missing-runtime ...` line is
---     written. Failures also produce an `ERROR ...` line and an `ac.warn`.
---   * The window text always starts with `GhostCarGenerator Hotlap: ACTIVE`
---     or `GhostCarGenerator Hotlap: ERROR: ...` so screenshots can be asserted
+--     written, followed by `NODE ok ...` once the scene node exists.
+--     Failures also produce an `ERROR ...` line and an `ac.warn`.
+--   * The window text starts with `GhostCarGenerator Hotlap: ACTIVE` or
+--     `GhostCarGenerator Hotlap: ERROR: ...` so screenshots can be asserted
 --     on without OCR of the numbers.
 
-local GHOST_MODEL = 'ig_toyota_gr86_premium/toyota_gr86_premium.kn5'
+local APP_VERSION = '0.2'
+local GHOST_MODEL_RELATIVE = 'content/cars/ig_toyota_gr86_premium/toyota_gr86_premium.kn5'
 local RUNTIME_FILENAME = __dirname .. '/ghost-runtime-v1.json'
 local LOG_RELATIVE_DIR = 'Documents/Assetto Corsa/logs'
 local LOG_FILENAME = 'ghostcar_hotlap_verify.log'
 local LOG_INTERVAL_S = 1.0
 local FALLBACK_OFFSET = vec3(5, 0, 0)
 local GHOST_NODE_NAME = 'GhostCarGenerator.Hotlap'
-local GHOST_NODE_RADIUS = 3
+-- Half-diagonal of a 4.2 x 1.8 m car is ~2.3 m; keep headroom so the bounding
+-- sphere never culls the model at screen edges (SDK ac_apps/lib.lua:9788).
+local GHOST_NODE_RADIUS = 4
+-- Render-context hook used to sample the projection oracle. Installed apps use
+-- the same event in an app script: apps/lua/ac-tracer/lib/reference_line.lua:301.
+local RENDER_EVENT = 'main.track.transparent'
+-- Draws a cross at the computed ghost pose during verification. Remove/disable
+-- for production use; it only draws inside the render hook.
+local ORACLE_DEBUG_CROSS = true
 
 -- ---------------------------------------------------------------------------
 -- Logging
@@ -83,6 +111,22 @@ local function appendLog(line)
   return false
 end
 
+-- `nan`/`inf` are emitted verbatim: they are valid Python float literals and
+-- keep "unknown" distinguishable from a real 0.
+local function fmtNumber(value)
+  if type(value) ~= 'number' then return 'nan' end
+  if value ~= value then return 'nan' end
+  if value == math.huge then return 'inf' end
+  if value == -math.huge then return '-inf' end
+  return string.format('%.4f', value)
+end
+
+-- Tokens land in a space-separated key=value line (not in the CSV row), so
+-- only whitespace has to be neutralised; paths and names stay readable.
+local function sanitizeToken(value)
+  return (tostring(value):gsub('%s+', '_'))
+end
+
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
@@ -95,6 +139,7 @@ local state = {
   sessionToken = nil,
   root = nil,
   model = nil,
+  modelPath = nil,
   wheels = {},
   runtimeTime = 0,
   runtimeCursor = 1,
@@ -102,8 +147,20 @@ local state = {
   ghostX = 0, ghostY = 0, ghostZ = 0,
   playerX = 0, playerY = 0, playerZ = 0,
   clock = 0,
+  simGameTime = nil,
+  clockSource = nil,
   nextInitAttemptAt = 0,
   initFailures = 0,
+  poseApplied = false,
+}
+
+-- Render-context oracle cache; filled by the `render.on()` callback above and
+-- read by writeSample().
+local oracle = {
+  ndcX = nil,
+  ndcY = nil,
+  hookFrames = 0,
+  hookAnnounced = false,
 }
 
 -- Retry scene setup once a second (the 3D scene can still be loading when the
@@ -112,6 +169,7 @@ local MAX_INIT_FAILURES = 15
 
 local runtime = nil
 local runtimeDurationS = 0
+local renderSubscription = nil
 
 -- ---------------------------------------------------------------------------
 -- JSON helpers (CSP exposes both `json` and `JSON`; accept either)
@@ -170,14 +228,53 @@ runtime, runtimeError = loadRuntime()
 if runtime then
   runtimeDurationS = runtime.frames[#runtime.frames].timeS
   appendLog(string.format(
-    'INIT ok schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s',
-    tostring(runtime.schema), #runtime.frames, runtimeDurationS,
+    'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s',
+    APP_VERSION, tostring(runtime.schema), #runtime.frames, runtimeDurationS,
     tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH)))
 else
   appendLog(string.format(
-    'INIT %s fallback=5m-follow player log=%s', tostring(runtimeError), tostring(LOG_PATH)))
+    'INIT %s app=%s fallback=5m-follow player log=%s',
+    tostring(runtimeError), APP_VERSION, tostring(LOG_PATH)))
   ac.warn('GhostCarGenerator Hotlap: '..tostring(runtimeError)..'; using 5 m fallback')
 end
+
+-- ---------------------------------------------------------------------------
+-- Render oracle
+-- ---------------------------------------------------------------------------
+
+-- `render.projectPoint()` is only reliable inside render context, so the
+-- projection is sampled from a render callback and cached for the 1 Hz log row.
+local function installRenderOracle()
+  if type(render) ~= 'table' or type(render.on) ~= 'function' then
+    appendLog('RENDERHOOK unavailable render.on')
+    return
+  end
+  local ok, subscription = pcall(render.on, RENDER_EVENT, function()
+    oracle.hookFrames = oracle.hookFrames + 1
+    if not state.root then return end
+    if not oracle.hookAnnounced then
+      oracle.hookAnnounced = true
+      appendLog(string.format('RENDERHOOK ok event=%s frames=%d',
+        RENDER_EVENT, oracle.hookFrames))
+    end
+    local position = vec3(state.ghostX, state.ghostY, state.ghostZ)
+    local point = nil
+    pcall(function() point = render.projectPoint(position) end)
+    if point then
+      oracle.ndcX, oracle.ndcY = point.x, point.y
+    end
+    if ORACLE_DEBUG_CROSS then
+      pcall(render.debugCross, position, GHOST_NODE_RADIUS * 0.5, rgbm(2, 0, 0, 1))
+    end
+  end)
+  if ok and subscription then
+    renderSubscription = subscription
+  else
+    appendLog('RENDERHOOK failed '..tostring(subscription))
+  end
+end
+
+installRenderOracle()
 
 -- ---------------------------------------------------------------------------
 -- Math
@@ -215,9 +312,83 @@ local function disposeGhost()
   state.root = nil
   state.model = nil
   state.wheels = {}
+  state.poseApplied = false
   if root then
     pcall(function() root:dispose() end)
   end
+end
+
+-- `ac.findFile()` (SDK ac_apps/lib.lua:3160) searches the script folder, then
+-- the CSP folder, then the AC root, and returns an absolute path; a path
+-- relative to the AC root is the documented form for `loadKN5()`.
+local function resolveModelFilename()
+  local resolved = nil
+  pcall(function() resolved = ac.findFile(GHOST_MODEL_RELATIVE) end)
+  if type(resolved) == 'string' and resolved ~= '' and io.fileExists(resolved) then
+    return resolved
+  end
+  local ok, carsFolder = pcall(function() return ac.getFolder(ac.FolderID.ContentCars) end)
+  if ok and type(carsFolder) == 'string' and carsFolder ~= '' then
+    local fallback = carsFolder:gsub('[/\\]+$', '')..'/'
+      ..GHOST_MODEL_RELATIVE:gsub('^content/cars/', '')
+    if io.fileExists(fallback) then
+      return fallback
+    end
+  end
+  return nil
+end
+
+-- One-shot introspection so "node exists but renders nothing" is visible in
+-- the log without a camera: valid handles (`isActive`), child counts, and the
+-- mesh AABB (proves geometry was attached, at the expected metre scale, and
+-- still flagged visible).
+local function logNodeIntrospection(node, model)
+  local parts = { 'NODE ok app='..APP_VERSION }
+  local function add(key, fn)
+    local ok, value = pcall(fn)
+    if not ok then
+      parts[#parts + 1] = key..'=err'
+      return
+    end
+    parts[#parts + 1] = key..'='..sanitizeToken(value)
+  end
+  add('rootActive', function() return node:isActive() and 1 or 0 end)
+  add('rootChildren', function() return node:getChildrenCount() end)
+  add('modelEmpty', function() return model:empty() and 1 or 0 end)
+  add('modelName', function() return model:name() end)
+  add('modelActive', function() return model:isActive() and 1 or 0 end)
+  add('modelChildren', function() return model:getChildrenCount() end)
+
+  -- AABB/visibility are mesh-only calls, so resolve the model's meshes first
+  -- (the same filter-style lookup the traffic tool uses on a loaded KN5).
+  local meshes = nil
+  local okMeshes, found = pcall(function() return model:findMeshes('*') end)
+  if okMeshes and found then
+    local okSize, size = pcall(function() return found:size() end)
+    if okSize and type(size) == 'number' and size > 0 then
+      meshes = found
+      parts[#parts + 1] = 'meshes='..sanitizeToken(size)
+    end
+  end
+  if meshes then
+    local okVisible, visible = pcall(function() return meshes:isVisible(1) end)
+    parts[#parts + 1] = 'meshVisible='..(okVisible and sanitizeToken(visible and 1 or 0) or 'err')
+  end
+
+  local target = meshes or model
+  local aabbOk, minPos, maxPos, meshCount = pcall(function()
+    return target:getLocalAABB()
+  end)
+  if aabbOk and minPos and maxPos then
+    parts[#parts + 1] = string.format('aabbSize=%.2fx%.2fx%.2f',
+      maxPos.x - minPos.x, maxPos.y - minPos.y, maxPos.z - minPos.z)
+    parts[#parts + 1] = 'aabbMeshes='..sanitizeToken(meshCount)
+  else
+    parts[#parts + 1] = 'aabb=unavailable'
+  end
+  parts[#parts + 1] = 'wheels='..sanitizeToken(#state.wheels)
+  parts[#parts + 1] = 'model='..sanitizeToken(state.modelPath)
+  appendLog(table.concat(parts, ' '))
 end
 
 local function createGhostNode()
@@ -230,13 +401,23 @@ local function createGhostNode()
     if not created then
       return nil, 'createBoundingSphereNode returned nil'
     end
+    -- Only marks the node as car-like for car-specific code (BLIND_SPOT input
+    -- and similar); it does not affect rendering (SDK ac_apps/lib.lua:10217).
     created:setVirtualCarFlag(true)
-    local modelFilename = ac.getFolder(ac.FolderID.ContentCars)..'/'..GHOST_MODEL
+    local modelFilename = resolveModelFilename()
+    if not modelFilename then
+      pcall(function() created:dispose() end)
+      return nil, 'model-not-found '..GHOST_MODEL_RELATIVE
+    end
     local loaded = created:loadKN5(modelFilename)
     if not loaded then
       pcall(function() created:dispose() end)
       return nil, 'could not load '..modelFilename
     end
+    -- Explicit visibility request; documented as a no-op when the object was
+    -- already visible, so it is a cheap guard for "loaded but never drawn".
+    pcall(function() loaded:setVisible(true, false) end)
+    state.modelPath = modelFilename
     return created, loaded
   end)
   if not ok then
@@ -294,9 +475,12 @@ local function initialize()
   state.initFailures = 0
   state.runtimeTime = 0
   state.runtimeCursor = 1
+  state.simGameTime = nil
   state.logAccum = LOG_INTERVAL_S -- log the first sample immediately
-  appendLog(string.format('ACTIVE mode=%s frames=%d log=%s',
-    tostring(state.mode), runtime and #runtime.frames or 0, tostring(LOG_PATH)))
+  logNodeIntrospection(node, model)
+  appendLog(string.format('ACTIVE mode=%s frames=%d hook=%s log=%s',
+    tostring(state.mode), runtime and #runtime.frames or 0,
+    oracle.hookAnnounced and 'ok' or 'none', tostring(LOG_PATH)))
   return true
 end
 
@@ -311,6 +495,7 @@ local function resetForSession(token)
   state.nextInitAttemptAt = 0
   state.runtimeTime = 0
   state.runtimeCursor = 1
+  state.simGameTime = nil
   state.logAccum = 0
   appendLog('SESSION token='..tostring(token))
 end
@@ -324,6 +509,13 @@ local function applyPose(x, y, z, yaw)
   state.root:setPosition(vec3(x, y, z))
   state.root:setOrientation(
     vec3(-math.sin(wrappedYaw), 0, math.cos(wrappedYaw)), vec3(0, 1, 0))
+  if not state.poseApplied then
+    state.poseApplied = true
+    -- The first pose teleports the node hundreds of metres away from the scene
+    -- origin; without this the interpolated motion state is garbage for a
+    -- frame (SDK ac_apps/lib.lua:9687).
+    pcall(function() state.root:clearMotion() end)
+  end
   state.ghostX, state.ghostY, state.ghostZ = x, y, z
 end
 
@@ -380,15 +572,58 @@ end
 -- Per-frame update
 -- ---------------------------------------------------------------------------
 
+-- Playback must track real session time, not app frame time: app `dt` drops
+-- frames and made the ghost clock lag game time by ~1 s per lap, which breaks
+-- any "screenshot when ghost-time == X" rule.
+local function advanceClock(fallback)
+  local sim = ac.getSim()
+  local now = sim and sim.gameTime
+  if type(now) == 'number' then
+    local previous = state.simGameTime
+    state.simGameTime = now
+    if previous and now >= previous then
+      local delta = now - previous
+      if delta <= 1.0 then
+        if state.clockSource ~= 'sim' then
+          state.clockSource = 'sim'
+          appendLog('CLOCK sim')
+        end
+        return delta
+      end
+    end
+  end
+  -- Skip the first couple of frames: there is no previous sample to diff yet.
+  if state.clockSource ~= 'app' and state.clock > 2 then
+    state.clockSource = 'app'
+    appendLog('CLOCK app')
+  end
+  return fallback
+end
+
 local function writeSample()
   local sim = ac.getSim()
   local time = (sim and sim.gameTime) or 0
-  appendLog(string.format('%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f',
+  local position = vec3(state.ghostX, state.ghostY, state.ghostZ)
+
+  local inFrustum = 0
+  local okFrustum, visible = pcall(ac.isVisibleInMainCamera, position,
+    GHOST_NODE_RADIUS, false, true)
+  if okFrustum and visible then inFrustum = 1 end
+
+  local camDist = nil
+  local okCamera, camPos = pcall(ac.getCameraPosition)
+  if okCamera and camPos then
+    camDist = dist3(state.ghostX, state.ghostY, state.ghostZ, camPos.x, camPos.y, camPos.z)
+  end
+
+  appendLog(string.format('%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%s,%d,%s,%.3f',
     time,
     state.ghostX, state.ghostY, state.ghostZ,
     state.playerX, state.playerY, state.playerZ,
     dist3(state.ghostX, state.ghostY, state.ghostZ,
-      state.playerX, state.playerY, state.playerZ)))
+      state.playerX, state.playerY, state.playerZ),
+    fmtNumber(oracle.ndcX), fmtNumber(oracle.ndcY), inFrustum, fmtNumber(camDist),
+    state.runtimeTime))
 end
 
 local function updateGhost(dt)
@@ -403,6 +638,7 @@ local function updateGhost(dt)
   local step = dt
   if type(step) ~= 'number' or step < 0 then step = 0 end
   if step > 1 then step = 1 end
+  step = advanceClock(step)
 
   if runtime then
     state.runtimeTime = (state.runtimeTime + step) % runtimeDurationS
@@ -456,10 +692,14 @@ end
 function script.windowMain(dt)
   if state.status == 'ACTIVE' then
     ui.text('GhostCarGenerator Hotlap: ACTIVE ['..tostring(state.mode)..']')
-    ui.text(string.format('ghost %.1f %.1f %.1f  dist %.1f m',
+    ui.text(string.format('ghost %.1f %.1f %.1f  dist %.1f m  t %.1f s',
       state.ghostX, state.ghostY, state.ghostZ,
       dist3(state.ghostX, state.ghostY, state.ghostZ,
-        state.playerX, state.playerY, state.playerZ)))
+        state.playerX, state.playerY, state.playerZ),
+      state.runtimeTime))
+    ui.text(string.format('oracle ndc %s %s  hook %s',
+      fmtNumber(oracle.ndcX), fmtNumber(oracle.ndcY),
+      oracle.hookAnnounced and ('ok/'..oracle.hookFrames) or 'never'))
   elseif state.status == 'ERROR' then
     ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
   else
@@ -469,14 +709,21 @@ end
 
 function script.shutdown()
   disposeGhost()
+  if renderSubscription then
+    pcall(function() renderSubscription:dispose() end)
+    renderSubscription = nil
+  end
   appendLog('SHUTDOWN')
 end
 
 function script.windowSettings(dt)
-  ui.text('GhostCarGenerator Hotlap')
+  ui.text('GhostCarGenerator Hotlap '..APP_VERSION)
   ui.text('status: '..tostring(state.status)..' / '..tostring(state.mode or '-'))
   ui.text('runtime: '..(runtime and (tostring(#runtime.frames)..' frames') or tostring(runtimeError)))
-  ui.text('model: '..GHOST_MODEL)
+  ui.text('model: '..tostring(state.modelPath or GHOST_MODEL_RELATIVE))
+  ui.text('clock: '..tostring(state.clockSource or '-'))
+  ui.text('oracle: '..(oracle.hookAnnounced and ('hook ok, ndc '..fmtNumber(oracle.ndcX)
+    ..' '..fmtNumber(oracle.ndcY)) or 'hook not fired'))
   ui.text('log: '..tostring(LOG_PATH))
   if ui.button('Copy log path') then
     ui.setClipboardText(LOG_PATH or '')
