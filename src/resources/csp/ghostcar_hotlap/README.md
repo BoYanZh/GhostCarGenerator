@@ -180,6 +180,31 @@ enable the app. Then:
    | missing | missing | pose/coordinates or camera framing is wrong; `inFrustum01` and `camDistM` in the same row say which |
    | visible | missing | the render hook never ran (`RENDERHOOK` absent) |
 
+### v0.2 in-game proof (2026-11-22, Thunderhill threemilebypass, GR86)
+
+Render path **proven end-to-end** (car visible + cross visible):
+
+* Gates, same session: `INIT ok app=0.2`, `NODE ok` (`modelEmpty=0`,
+  `modelActive=1`, `aabbMeshes=317`, `wheels=4`), `RENDERHOOK ok
+  event=main.track.transparent`, `CLOCK sim`, `ACTIVE mode=runtime`, zero
+  `ERROR`.
+* Two independent conditional screenshots (log-gated burst, chase cam,
+  player stationary) each show a second light-grey GR86 on the recorded
+  line with the red 2 m `ORACLE_DEBUG_CROSS` overlapping it exactly at the
+  logged ghost pose. The car sits at different track positions in the two
+  shots, following the timeline direction.
+* The oracle rows bracketing the shots agree (`inFrustum01=1`,
+  centered NDC, `dist` 20-65 m, ghost height within ~1 m of player
+  height — not buried).
+
+![ghost in chase view](../../../docs/assets/ghostcar_hotlap_proof_wide.jpg)
+![ghost close-up with debug cross](../../../docs/assets/ghostcar_hotlap_proof_close.png)
+
+Caveats carried forward: a duplicate app instance was observed writing
+interleaved rows (second `INIT ok` after a session restart while the first
+instance kept running); v0.3 should add a single-instance guard. The
+v0.2 build renders opaque; transparency is a separate v0.3 item.
+
 ### Falsification of the v0.1 render check (why the oracle exists)
 
 v0.1 was reported as "render path falsified" from four screenshots. The app's
