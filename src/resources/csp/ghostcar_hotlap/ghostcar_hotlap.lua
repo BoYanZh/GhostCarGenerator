@@ -100,10 +100,13 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.7'
+local APP_VERSION = '0.8'
+local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
-local GHOST_ALPHA = 0.5
+-- 0.25 with interior meshes hidden + specular/fresnel scaled by alpha gives a
+-- crisp, see-through GT/iRacing-style silhouette that never blocks sightlines.
+local GHOST_ALPHA = 0.25
 -- Default lead time in seconds so the ghost runs just ahead of the player
 -- (~11-25 m depending on speed), matching AC's built-in 0.5 s ghost advantage.
 local GHOST_DEFAULT_LEAD_S = 0.5
@@ -114,51 +117,6 @@ local NEAREST_MAX_DIST_M = 40.0
 -- channel (about +/-90 on track). Wheel nodes need ROAD angle, hence the
 -- steering ratio (2nd-gen GR86: 13.5:1). Visual only; tune freely.
 local GHOST_STEER_RATIO = 13.5
--- v0.5 smoothing. Everything below is about *when* the pose is applied, not
--- about the data: the timeline stays `ghost-runtime-v1` with its 15 ms frames.
---
--- The render callback (`render.on('main.track.transparent')`) already fires
--- once per drawn frame (the v0.2 oracle proves it: `RENDERHOOK ok ... frames`).
--- The pose now lives there, driven by `os.preciseClock()` (documented as
--- "time in seconds from script start (with high precision)",
--- ac_apps/lib.lua:4427), so per-frame motion does not depend on the granularity
--- of `ac.getSim().gameTime` (a millisecond snapshot of the game step, which is
--- why the separate `os.preciseGameTime()` accessor exists at lib.lua:4432).
---
--- PHASE_GAIN: fraction of the remaining phase error applied per render frame
--- when the display time is *behind* the authoritative phase. With the deadband
--- below, normal jitter is never corrected at all -- only real drift is.
--- LEAD_MAX_S: the display may never run further ahead of the authoritative
--- phase than this. That single clamp is also what makes a pause self-limiting:
--- `runtimeTime` freezes, the display walks into the clamp and stops, and when
--- playback resumes it waits out the remaining milliseconds instead of drifting
--- and snapping back.
--- PHASE_DEADBAND_S: phase lag smaller than this is left alone, so a coarse
--- `sim.gameTime` (game-step chunks) cannot modulate the on-screen speed.
--- PHASE_SNAP_S: larger error = deliberate re-anchor (first frame, session
--- reset, lap restart), counted in `resets=` instead of being smoothed.
-local PHASE_GAIN = 0.05
-local PHASE_SPEED_CAP = 0.08
-local PHASE_DEADBAND_S = 0.05
-local LEAD_MAX_S = 0.03
-local PHASE_SNAP_S = 0.5
--- One long frame (window drag, load hitch) must not lurch the ghost; the phase
--- lock pulls it back over the following frames instead.
-local MAX_RENDER_WALL_S = 0.05
--- Playback seconds per wall second as measured at the app tick: 1 at normal
--- speed, ~0 while paused, following replay slow motion. Measured over a whole
--- window, not per tick, so a quantised `sim.gameTime` cannot make the estimated
--- rate noisy (which would show up as speed modulation).
-local PLAYBACK_RATE_GAIN = 0.25
-local PLAYBACK_RATE_WINDOW_S = 0.5
-local MAX_PLAYBACK_RATE = 3
--- If `render.on` returns a subscription but the callback never fires, the ghost
--- would freeze at its first pose; after this many app ticks the app falls back
--- to app-tick posing (logged once as `SMOOTHPATH pose=tick reason=...`).
-local RENDER_HOOK_GRACE_TICKS = 120
--- ...and if the callback stops arriving for this long, the app tick takes the
--- pose back (and hands it over again when the hook resumes).
-local RENDER_HOOK_STALE_S = 0.25
 -- GR86 road-wheel radius, metres. Only turns timeline speed into wheel roll; a
 -- silhouette detail, not a physics claim.
 local GHOST_WHEEL_RADIUS_M = 0.32
@@ -168,9 +126,9 @@ local SMOOTH_LOG_WINDOW_S = 5.0
 -- its livery. Splitting body vs dark-trim/tyre/glass tints avoids bright milky
 -- tyres or distracting underbody bleed-through, giving a clean GT/iRacing-style
 -- translucent ghost silhouette.
-local GHOST_TINT_BODY = { 0.52, 0.68, 0.86 }
-local GHOST_TINT_DARK = { 0.16, 0.20, 0.26 }
-local GHOST_TINT_GLASS = { 0.12, 0.18, 0.26 }
+local GHOST_TINT_BODY = { 0.58, 0.78, 0.98 }
+local GHOST_TINT_DARK = { 0.22, 0.30, 0.40 }
+local GHOST_TINT_GLASS = { 0.18, 0.28, 0.42 }
 -- v0.4 lap sync. `GHOST_START_OFFSET_S` is how far the timeline runs AHEAD of
 -- the player's lap at the start/finish crossing, in seconds: playback starts at
 -- (duration - offset) when the player's lap counter increments. 0.0 shows the
@@ -193,6 +151,7 @@ local SETTINGS_PREFIX = 'ghostcar_hotlap/'
 local settings
 do
   local defaults = {
+    settingsVersion = 0,
     syncLaps = true,
     visible = true,
     alpha = GHOST_ALPHA,
@@ -207,6 +166,14 @@ do
     if ok and type(store) == 'table' then
       settings = store
     end
+  end
+  -- One-time upgrade from earlier versions where default alpha was 0.50.
+  local savedVer = type(settings.settingsVersion) == 'number' and settings.settingsVersion or 0
+  if savedVer < SETTINGS_VERSION then
+    if type(settings.alpha) ~= 'number' or math.abs(settings.alpha - 0.5) < 0.02 then
+      settings.alpha = GHOST_ALPHA
+    end
+    settings.settingsVersion = SETTINGS_VERSION
   end
   -- An older/partial settings file must not leave nil fields.
   if settings.syncLaps == nil then settings.syncLaps = true end
@@ -273,10 +240,9 @@ local GHOST_NODE_NAME = 'GhostCarGenerator.Hotlap'
 -- Half-diagonal of a 4.2 x 1.8 m car is ~2.3 m; keep headroom so the bounding
 -- sphere never culls the model at screen edges (SDK ac_apps/lib.lua:9788).
 local GHOST_NODE_RADIUS = 4
--- Render-context hooks: pose runs in `main.root.opaque` (before both opaque and
--- transparent geometry passes), while the projection oracle and optional debug
--- cross run in `main.track.transparent`.
-local POSE_RENDER_EVENT = 'main.root.opaque'
+-- Render-context hook for the projection oracle and optional debug cross.
+-- Pose updates run inside `script.update(dt)` (once per rendered frame, before
+-- AC builds render passes / TAA motion vectors, locked to `sim.dt`).
 local RENDER_EVENT = 'main.track.transparent'
 -- Single-instance lease. `ac.store`/`ac.load` are the SDK's session-shared
 -- script storage (ac_apps/lib.lua:3953-3966); the value is
@@ -380,8 +346,10 @@ local state = {
   poseApplied = false,
   materialMode = nil,
   materialMeshes = 0,
+  interiorMeshes = 0,
   materialError = nil,
   ghostMeshSets = {},
+  interiorMeshSets = {},
   appliedAlpha = nil,
   appliedVisible = nil,
   -- v0.4/v0.7 lap sync. `lapBaseline` is the last player `lapCount` seen; nil
@@ -395,25 +363,16 @@ local state = {
   lastLapSyncWallS = -1e9,
   playerLaunched = false,
   holdingForLaunch = false,
-  -- v0.5 motion smoothing. `runtimeTime` stays the authoritative timeline phase
-  -- (advanced by `sim.gameTime` deltas at the app tick, lap-synced); the render
-  -- callback turns it into `displayTime`, which is what gets sampled and posed.
-  displayTime = 0,
-  playRate = 1,
-  rateStepAcc = 0,
-  rateWallAcc = 0,
-  lastTickPrecise = nil,
-  renderLastPrecise = nil,
-  renderPoseActive = false,
-  renderPoseFrames = 0,
-  lastRenderPoseWall = nil,
-  renderFallbackLogged = false,
+  isPaused = false,
+  -- v0.8 unified frame-locked simulation clock (`sim.dt` inside `script.update`).
+  -- Eliminates dual-clock sawtooth, pauses instantly on Escape/Menu, and keeps
+  -- the ghost 100% phase-locked to AC's player car and chase camera.
+  simDtAccS = 0,
+  simGameTimeAccS = 0,
   activeTicks = 0,
-  poseErrorLogged = false,
-  reanchor = true,
   prevPose = nil,
   steerRad = 0,
-  steerApplied = nil,
+  wheelRollRad = 0,
   speedMps = 0,
   smooth = {
     windowS = 0,
@@ -442,12 +401,8 @@ local MAX_INIT_FAILURES = 15
 
 local runtime = nil
 local runtimeDurationS = 0
+local runtimeSmoothedTag = 'none'
 local renderSubscription = nil
-local poseSubscription = nil
-local poseRenderEvent = POSE_RENDER_EVENT
--- Forward declaration: `installRenderOracle()` (below) installs the render
--- callback before the pose code is defined, and the callback has to call it.
-local updatePoseInRender
 
 -- ---------------------------------------------------------------------------
 -- JSON helpers (CSP exposes both `json` and `JSON`; accept either)
@@ -500,10 +455,99 @@ local function loadRuntime()
   return decoded, nil
 end
 
+-- Zero-phase circular smoothing guard for legacy unsmoothed GPS timelines:
+-- if the p95 inter-frame speed step exceeds 1.5 m/s per 15 ms frame (10 Hz
+-- GPS stair-stepping), run two circular triangular passes (zero phase shift,
+-- preserves exact lapTimeS) and recompute tangent yaw/pitch.
+local function smoothTimelineIfNeeded(decoded)
+  local frames = decoded and decoded.frames
+  if type(frames) ~= 'table' or #frames < 20 then return 'short' end
+  local n = #frames
+  local dt = (type(decoded.frameIntervalS) == 'number' and decoded.frameIntervalS > 0)
+    and decoded.frameIntervalS or 0.015
+  local dvs = {}
+  local stride = math.max(1, math.floor((n - 2) / 600))
+  for i = 1, n - 2, stride do
+    local a = frames[i].positionM
+    local b = frames[i + 1].positionM
+    local c = frames[i + 2].positionM
+    local span1 = frames[i + 1].timeS - frames[i].timeS
+    local span2 = frames[i + 2].timeS - frames[i + 1].timeS
+    if span1 > 1e-6 and span2 > 1e-6 then
+      local dx1, dy1, dz1 = b[1] - a[1], b[2] - a[2], b[3] - a[3]
+      local dx2, dy2, dz2 = c[1] - b[1], c[2] - b[2], c[3] - b[3]
+      local spd1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1) / span1
+      local spd2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2) / span2
+      dvs[#dvs + 1] = math.abs(spd2 - spd1)
+    end
+  end
+  if #dvs < 10 then return 'clean' end
+  table.sort(dvs)
+  local p95 = dvs[math.max(1, math.floor(#dvs * 0.95))]
+  if p95 <= 1.5 then
+    return string.format('clean(p95=%.2f)', p95)
+  end
+
+  local xs, ys, zs = {}, {}, {}
+  for i = 1, n do
+    local p = frames[i].positionM
+    xs[i], ys[i], zs[i] = p[1], p[2], p[3]
+  end
+  local function circularBoxPass(arr, radius)
+    local out = {}
+    local w = 2 * radius + 1
+    local sum = 0
+    for k = -radius, radius do
+      local idx = ((k) % n) + 1
+      sum = sum + arr[idx]
+    end
+    for i = 1, n do
+      out[i] = sum / w
+      local removeIdx = ((i - 1 - radius) % n) + 1
+      local addIdx = ((i + radius) % n) + 1
+      sum = sum - arr[removeIdx] + arr[addIdx]
+    end
+    return out
+  end
+  -- Three circular box passes approximate a zero-phase Gaussian filter
+  -- (radius=8 -> sigma ≈ 8 frames ≈ 0.12 s, 0 ms phase shift).
+  for _ = 1, 3 do
+    xs = circularBoxPass(xs, 8)
+    ys = circularBoxPass(ys, 8)
+    zs = circularBoxPass(zs, 8)
+  end
+  for i = 1, n do
+    local prevI = (i == 1) and n or (i - 1)
+    local nextI = (i == n) and 1 or (i + 1)
+    local vx = (xs[nextI] - xs[prevI]) / (2 * dt)
+    local vy = (ys[nextI] - ys[prevI]) / (2 * dt)
+    local vz = (zs[nextI] - zs[prevI]) / (2 * dt)
+    local horiz = math.sqrt(vx * vx + vz * vz)
+    local yaw = math.atan2(-vx, vz)
+    local pitch = math.atan2(vy, math.max(horiz, 1e-6))
+    local roll = (frames[i].rotationRad and frames[i].rotationRad[3]) or 0
+    frames[i].positionM = { xs[i], ys[i], zs[i] }
+    frames[i].rotationRad = { pitch, yaw, roll }
+  end
+  return string.format('auto(p95=%.2f)', p95)
+end
+
 local runtimeError = nil
 runtime, runtimeError = loadRuntime()
 if runtime then
-  runtimeDurationS = runtime.frames[#runtime.frames].timeS
+  runtimeSmoothedTag = smoothTimelineIfNeeded(runtime)
+  local count = #runtime.frames
+  local lastTime = runtime.frames[count].timeS
+  local dtNom = (type(runtime.frameIntervalS) == 'number' and runtime.frameIntervalS > 0)
+    and runtime.frameIntervalS or 0.015
+  if type(runtime.lapTimeS) == 'number' and runtime.lapTimeS > lastTime then
+    runtimeDurationS = runtime.lapTimeS
+  elseif count >= 2 then
+    -- Preserve exact loop period including the wrap segment frames[count]->frames[1].
+    runtimeDurationS = lastTime + dtNom
+  else
+    runtimeDurationS = lastTime
+  end
 end
 
 -- The INIT line is emitted only once the single-instance guard has made this
@@ -515,10 +559,11 @@ local function announceInit()
   initLogged = true
   if runtime then
     appendLog(string.format(
-      'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f',
+      'INIT ok app=%s schema=%s frames=%d durationS=%.3f carId=%s trackId=%s log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f timeline=%s',
       APP_VERSION, tostring(runtime.schema), #runtime.frames, runtimeDurationS,
       tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH),
-      currentAlpha(), syncLapsEnabled() and 1 or 0, currentStartOffsetS()))
+      currentAlpha(), syncLapsEnabled() and 1 or 0, currentStartOffsetS(),
+      tostring(runtimeSmoothedTag)))
   else
     appendLog(string.format(
       'INIT %s app=%s fallback=5m-follow player log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f',
@@ -534,30 +579,10 @@ end
 
 -- `render.projectPoint()` is only reliable inside render context, so the
 -- projection is sampled from a render callback and cached for the 1 Hz log row.
--- The pose update runs in `main.root.opaque` (before both opaque and
--- transparent geometry passes) when available, falling back to `RENDER_EVENT`.
 local function installRenderOracle()
   if type(render) ~= 'table' or type(render.on) ~= 'function' then
     appendLog('RENDERHOOK unavailable render.on')
     return
-  end
-  local function runRenderPose()
-    if not state.root or not state.renderPoseActive then return end
-    local okPose = pcall(updatePoseInRender)
-    if not okPose and not state.poseErrorLogged then
-      state.poseErrorLogged = true
-      appendLog('SMOOTH pose-error render-context')
-    end
-  end
-
-  local okPoseHook, pSub = pcall(render.on, POSE_RENDER_EVENT, function()
-    runRenderPose()
-  end)
-  if okPoseHook and pSub then
-    poseSubscription = pSub
-    poseRenderEvent = POSE_RENDER_EVENT
-  else
-    poseRenderEvent = RENDER_EVENT
   end
 
   local ok, subscription = pcall(render.on, RENDER_EVENT, function()
@@ -567,9 +592,6 @@ local function installRenderOracle()
       oracle.hookAnnounced = true
       appendLog(string.format('RENDERHOOK ok event=%s frames=%d',
         RENDER_EVENT, oracle.hookFrames))
-    end
-    if not poseSubscription then
-      runRenderPose()
     end
     local position = vec3(state.ghostX, state.ghostY, state.ghostZ)
     local point = nil
@@ -640,26 +662,16 @@ local function disposeGhost()
   state.model = nil
   state.wheels = {}
   state.ghostMeshSets = {}
+  state.interiorMeshSets = {}
+  state.interiorMeshes = 0
   state.appliedAlpha = nil
   state.appliedVisible = nil
   state.poseApplied = false
-  -- v0.5: the render path must stop posing a node that no longer exists, and the
-  -- next node starts from a clean clock (its first pose is a re-anchor, not a
-  -- 1 km step).
-  state.renderPoseActive = false
-  state.renderPoseFrames = 0
-  state.lastRenderPoseWall = nil
-  state.renderFallbackLogged = false
   state.activeTicks = 0
   state.prevPose = nil
-  state.renderLastPrecise = nil
-  state.displayTime = 0
-  state.reanchor = true
-  state.playRate = 1
-  state.rateStepAcc = 0
-  state.rateWallAcc = 0
-  state.lastTickPrecise = nil
-  state.steerApplied = nil
+  state.wheelRollRad = 0
+  state.simDtAccS = 0
+  state.simGameTimeAccS = 0
   if root then
     pcall(function() root:dispose() end)
   end
@@ -988,22 +1000,34 @@ end
 -- 'shader:ksPerPixelMultiMap_damage_dirt' for paint; the plain variants cover
 -- converted/modded models like this GR86. Per-filter counts are logged, so
 -- coverage vs aabbMeshes is auditable in a single run.
+-- Interior/clutter materials hidden when translucent so alpha does not stack
+-- 4-6 layers deep through seats, dashboard, carpet, and cabin trim.
+local GHOST_INTERIOR_FILTERS = {
+  'material:int_*',
+  'material:EXT_OBJECTS_IN_MIRROR',
+  'material:ext_window_dots*',
+  'material:ext_rear_window_heater',
+}
+
+local GHOST_SHADER_REPLACEMENT =
+  'SHADER = ksPerPixel\nIS_TRANSPARENT = 1\nBLEND_MODE = ALPHA_BLEND\nCAST_SHADOWS = 0'
+
 local GHOST_MESH_FILTERS = {
-  { filter = 'shader:ksPerPixelMultiMap_damage_dirt', tint = GHOST_TINT_BODY, alphaScale = 1.0 },
-  { filter = 'shader:ksPerPixelMultiMap_damage',      tint = GHOST_TINT_BODY, alphaScale = 1.0 },
-  { filter = 'shader:ksPerPixelMultiMap_NMDetail',    tint = GHOST_TINT_BODY, alphaScale = 1.0 },
-  { filter = 'shader:ksPerPixelMultiMap',             tint = GHOST_TINT_BODY, alphaScale = 1.0 },
-  { filter = 'shader:ksPerPixelReflection',           tint = GHOST_TINT_BODY, alphaScale = 0.9 },
-  { filter = 'shader:ksPerPixel',                     tint = GHOST_TINT_BODY, alphaScale = 1.0 },
-  { filter = 'shader:ksPerPixelNM',                   tint = GHOST_TINT_DARK, alphaScale = 0.85 },
-  { filter = 'shader:ksPerPixelAT_NM',                tint = GHOST_TINT_DARK, alphaScale = 0.75 },
-  { filter = 'shader:ksPerPixelAT',                   tint = GHOST_TINT_DARK, alphaScale = 0.75 },
-  { filter = 'shader:ksWindscreen',                   tint = GHOST_TINT_GLASS, alphaScale = 0.85 },
-  { filter = 'shader:ksGlass',                        tint = GHOST_TINT_GLASS, alphaScale = 0.85 },
-  { filter = 'shader:ksBrakeDisc',                    tint = GHOST_TINT_DARK, alphaScale = 0.80 },
-  { filter = 'shader:ksTyres',                        tint = GHOST_TINT_DARK, alphaScale = 0.95 },
-  { filter = 'shader:ksTyre',                         tint = GHOST_TINT_DARK, alphaScale = 0.95 },
-  { filter = 'shader:ksWheel',                        tint = GHOST_TINT_DARK, alphaScale = 0.95 },
+  { filter = 'shader:ksPerPixelMultiMap_damage_dirt', tint = GHOST_TINT_BODY,  alphaScale = 1.00 },
+  { filter = 'shader:ksPerPixelMultiMap_damage',      tint = GHOST_TINT_BODY,  alphaScale = 1.00 },
+  { filter = 'shader:ksPerPixelMultiMap_NMDetail',    tint = GHOST_TINT_BODY,  alphaScale = 1.00 },
+  { filter = 'shader:ksPerPixelMultiMap',             tint = GHOST_TINT_BODY,  alphaScale = 1.00 },
+  { filter = 'shader:ksPerPixelReflection',           tint = GHOST_TINT_GLASS, alphaScale = 0.65 },
+  { filter = 'shader:ksPerPixel',                     tint = GHOST_TINT_BODY,  alphaScale = 0.90 },
+  { filter = 'shader:ksPerPixelNM',                   tint = GHOST_TINT_DARK,  alphaScale = 0.80 },
+  { filter = 'shader:ksPerPixelAT_NM',                tint = GHOST_TINT_DARK,  alphaScale = 0.70 },
+  { filter = 'shader:ksPerPixelAT',                   tint = GHOST_TINT_DARK,  alphaScale = 0.70 },
+  { filter = 'shader:ksWindscreen',                   tint = GHOST_TINT_GLASS, alphaScale = 0.65 },
+  { filter = 'shader:ksGlass',                        tint = GHOST_TINT_GLASS, alphaScale = 0.65 },
+  { filter = 'shader:ksBrakeDisc',                    tint = GHOST_TINT_DARK,  alphaScale = 0.75 },
+  { filter = 'shader:ksTyres',                        tint = GHOST_TINT_DARK,  alphaScale = 0.85 },
+  { filter = 'shader:ksTyre',                         tint = GHOST_TINT_DARK,  alphaScale = 0.85 },
+  { filter = 'shader:ksWheel',                        tint = GHOST_TINT_DARK,  alphaScale = 0.85 },
 }
 
 local function applyAlphaToTarget(target, alpha, tint, alphaScale)
@@ -1015,9 +1039,31 @@ local function applyAlphaToTarget(target, alpha, tint, alphaScale)
   pcall(function() target:setTransparent(translucent) end)
   pcall(function() target:setBlendMode(blendMode) end)
   pcall(function() target:setShadows(not translucent) end)
+  pcall(function() target:excludeFromCubemap(true) end)
+  pcall(function() target:excludeFromSecondary(true) end)
+  -- Disable detail-map alpha hijacking (`useDetail=1` on ksPerPixelMultiMap
+  -- ignores txDiffuse.a for transparency), kill alpha-test cutoff (`ksAlphaRef`),
+  -- and scale additive specular/fresnel reflections with alpha so low opacity
+  -- stays genuinely see-through instead of reflecting an opaque bright sky.
+  pcall(function() target:setMaterialProperty('useDetail', 0) end)
+  pcall(function() target:setMaterialProperty('ksAlphaRef', 0) end)
+  pcall(function() target:setMaterialProperty('ksEmissive', vec3(0, 0, 0)) end)
+  pcall(function() target:setMaterialProperty('ksAmbient', 0.55) end)
+  pcall(function() target:setMaterialProperty('ksDiffuse', 0.75) end)
+  pcall(function() target:setMaterialProperty('ksSpecular', translucent and (0.18 * effective) or 0.5) end)
+  pcall(function() target:setMaterialProperty('sunSpecular', translucent and 0 or 1.0) end)
+  pcall(function() target:setMaterialProperty('fresnelC', translucent and (0.01 * effective) or 0.08) end)
+  pcall(function() target:setMaterialProperty('fresnelMaxLevel', translucent and (0.08 * effective) or 0.4) end)
   pcall(function()
     target:setMaterialTexture('txDiffuse', rgbm(c[1], c[2], c[3], effective))
   end)
+end
+
+local function updateInteriorVisibility(visible, translucent)
+  local showInterior = (visible ~= false) and (not translucent)
+  for _, meshSet in ipairs(state.interiorMeshSets) do
+    pcall(function() meshSet:setVisible(showInterior, false) end)
+  end
 end
 
 local function updateGhostAlpha(alpha)
@@ -1034,6 +1080,7 @@ local function updateGhostAlpha(alpha)
   end
   state.appliedAlpha = clamped
   state.materialMode = clamped < 0.999 and 'alpha' or 'opaque'
+  updateInteriorVisibility(ghostVisibleEnabled(), clamped < 0.999)
 end
 
 local function applyGhostVisibility(visible)
@@ -1045,11 +1092,25 @@ local function applyGhostVisibility(visible)
     pcall(function() state.model:setVisible(want, false) end)
   end
   state.appliedVisible = want
+  updateInteriorVisibility(want, currentAlpha() < 0.999)
+end
+
+local function isInteriorMaterialName(matName)
+  if type(matName) ~= 'string' then return false end
+  local lower = matName:lower()
+  return lower:sub(1, 4) == 'int_'
+    or lower:find('cockpit', 1, true) ~= nil
+    or lower:find('interior', 1, true) ~= nil
+    or lower == 'ext_objects_in_mirror'
+    or lower:find('window_dots', 1, true) ~= nil
+    or lower == 'ext_rear_window_heater'
 end
 
 local function applyGhostMaterials(model)
   local alpha = currentAlpha()
   state.ghostMeshSets = {}
+  state.interiorMeshSets = {}
+  state.interiorMeshes = 0
   if type(render) ~= 'table' or not render.BlendMode then
     return nil, 'render.BlendMode-missing'
   end
@@ -1057,7 +1118,9 @@ local function applyGhostMaterials(model)
   local blendMode = translucent and render.BlendMode.AlphaBlend
     or (render.BlendMode.Opaque or 0)
 
-  -- Root pass first (base fallback for any uncategorised shader).
+  -- First make materials unique relative to the rest of the scene so nothing
+  -- ever leaks onto the player car, then collect mesh sets by their original
+  -- shaders BEFORE switching shaders to ksPerPixel.
   local rsteps = {}
   local function rstep(name, fn)
     local okStep, err = pcall(fn)
@@ -1067,17 +1130,12 @@ local function applyGhostMaterials(model)
   rstep('transparent', function() model:setTransparent(translucent) end)
   rstep('blend', function() model:setBlendMode(blendMode) end)
   rstep('shadows', function() model:setShadows(not translucent) end)
-  rstep('tint', function()
-    model:setMaterialTexture('txDiffuse', rgbm(
-      GHOST_TINT_BODY[1], GHOST_TINT_BODY[2], GHOST_TINT_BODY[3], alpha))
-  end)
-  appendLog(string.format(
-    'GHOSTROOT unique=%s transparent=%s blend=%s shadows=%s tint=%s',
-    sanitizeToken(rsteps.unique or '?'), sanitizeToken(rsteps.transparent or '?'),
-    sanitizeToken(rsteps.blend or '?'), sanitizeToken(rsteps.shadows or '?'),
-    sanitizeToken(rsteps.tint or '?')))
 
-  local total, merged, detail = 0, {}, {}
+  -- Phase 1: collect all mesh sets by their ORIGINAL shaders BEFORE replacing
+  -- shaders (otherwise earlier filters that switch to ksPerPixel would be
+  -- matched again by the later `shader:ksPerPixel` filter).
+  local collected = {}
+  local total, hiddenInt, detail = 0, 0, {}
   for _, spec in ipairs(GHOST_MESH_FILTERS) do
     local filter = spec.filter
     local okFind, found = pcall(function() return model:findMeshes(filter) end)
@@ -1088,35 +1146,72 @@ local function applyGhostMaterials(model)
     end
     detail[#detail + 1] = filter..'='..n
     if n > 0 then
-      state.ghostMeshSets[#state.ghostMeshSets + 1] = {
+      collected[#collected + 1] = {
         meshes = found,
+        count = n,
         tint = spec.tint,
         alphaScale = spec.alphaScale,
       }
-      local steps = {}
-      local function step(name, fn)
-        local okStep, err = pcall(fn)
-        steps[name] = okStep and 'ok' or ('failed:'..tostring(err))
-      end
-      local c = spec.tint or GHOST_TINT_BODY
-      local effAlpha = clamp01(alpha * (spec.alphaScale or 1.0))
-      step('unique', function() found:ensureUniqueMaterials() end)
-      step('transparent', function() found:setTransparent(translucent) end)
-      step('blend', function() found:setBlendMode(blendMode) end)
-      step('shadows', function() found:setShadows(not translucent) end)
-      step('tint', function()
-        found:setMaterialTexture('txDiffuse', rgbm(c[1], c[2], c[3], effAlpha))
-      end)
-      for k, v in pairs(steps) do
-        if merged[k] == nil then merged[k] = v
-        elseif v ~= 'ok' then merged[k] = v end
-      end
       total = total + n
     end
   end
+
+  -- Phase 2: hide interior clutter, make materials unique, switch to clean
+  -- ksPerPixel alpha blend, and apply per-group tint/alpha.
+  local merged = {}
+  for _, item in ipairs(collected) do
+    local found = item.meshes
+    for idx = 1, item.count do
+      local okMat, matName = pcall(function() return found:materialName(idx) end)
+      if okMat and isInteriorMaterialName(matName) then
+        local okAt, single = pcall(function() return found:at(idx) end)
+        if okAt and single then
+          state.interiorMeshSets[#state.interiorMeshSets + 1] = single
+          hiddenInt = hiddenInt + 1
+        end
+      end
+    end
+
+    state.ghostMeshSets[#state.ghostMeshSets + 1] = {
+      meshes = found,
+      tint = item.tint,
+      alphaScale = item.alphaScale,
+    }
+    local steps = {}
+    local function step(name, fn)
+      local okStep, err = pcall(fn)
+      steps[name] = okStep and 'ok' or ('failed:'..tostring(err))
+    end
+    step('unique', function() found:ensureUniqueMaterials() end)
+    step('shader', function()
+      if type(found.applyShaderReplacements) == 'function' then
+        found:applyShaderReplacements(GHOST_SHADER_REPLACEMENT)
+      end
+    end)
+    step('transparent', function() found:setTransparent(translucent) end)
+    step('blend', function() found:setBlendMode(blendMode) end)
+    step('shadows', function() found:setShadows(not translucent) end)
+    step('tint', function()
+      applyAlphaToTarget(found, alpha, item.tint, item.alphaScale)
+    end)
+    for k, v in pairs(steps) do
+      if merged[k] == nil then merged[k] = v
+      elseif v ~= 'ok' then merged[k] = v end
+    end
+  end
+
+  appendLog(string.format(
+    'GHOSTROOT unique=%s shader=%s transparent=%s blend=%s shadows=%s tint=ok',
+    sanitizeToken(rsteps.unique or '?'), sanitizeToken(merged.shader or '?'),
+    sanitizeToken(rsteps.transparent or '?'), sanitizeToken(rsteps.blend or '?'),
+    sanitizeToken(rsteps.shadows or '?')))
+
+  state.interiorMeshes = hiddenInt
+  updateInteriorVisibility(ghostVisibleEnabled(), translucent)
+
   state.appliedAlpha = alpha
   if total <= 0 then return nil, 'no-meshes' end
-  return { count = total, mode = translucent and 'alpha' or 'opaque',
+  return { count = total, hiddenInt = hiddenInt, mode = translucent and 'alpha' or 'opaque',
     steps = merged, filters = table.concat(detail, ',') }, nil
 end
 
@@ -1140,8 +1235,9 @@ local function logGhostMaterials(info, err)
   end
   local steps = info.steps or {}
   appendLog(string.format(
-    'GHOST alpha=%.3f mode=alpha meshes=%d transparent=%s blend=%s shadows=%s tint=%s unique=%s filters=%s',
-    alpha, info.count,
+    'GHOST alpha=%.3f mode=alpha meshes=%d hiddenInt=%d shader=%s transparent=%s blend=%s shadows=%s tint=%s unique=%s filters=%s',
+    alpha, info.count, tonumber(info.hiddenInt) or 0,
+    sanitizeToken(steps.shader or '?'),
     sanitizeToken(steps.transparent or '?'), sanitizeToken(steps.blend or '?'),
     sanitizeToken(steps.shadows or '?'), sanitizeToken(steps.tint or '?'),
     sanitizeToken(steps.unique or '?'), sanitizeToken(info.filters or '?')))
@@ -1236,19 +1332,11 @@ local function initialize()
   state.runtimeCursor = 1
   state.simGameTime = nil
   state.logAccum = LOG_INTERVAL_S -- log the first sample immediately
-  -- v0.5: a new node/clock starts with a re-anchor and a clean smoothness window
-  -- (otherwise the first SMOOTH line would report the load teleport as a step).
-  state.displayTime = 0
-  state.renderLastPrecise = nil
   state.prevPose = nil
-  state.playRate = 1
-  state.rateStepAcc = 0
-  state.rateWallAcc = 0
-  state.lastTickPrecise = nil
   state.activeTicks = 0
-  state.renderPoseFrames = 0
-  state.lastRenderPoseWall = nil
-  state.reanchor = true
+  state.wheelRollRad = 0
+  state.simDtAccS = 0
+  state.simGameTimeAccS = 0
   state.smooth.windowS = 0
   state.smooth.maxStepM = 0
   state.smooth.sumStepM = 0
@@ -1264,9 +1352,8 @@ local function initialize()
   appendLog(string.format('ACTIVE mode=%s frames=%d hook=%s alpha=%.3f log=%s',
     tostring(state.mode), runtime and #runtime.frames or 0,
     oracle.hookAnnounced and 'ok' or 'none', currentAlpha(), tostring(LOG_PATH)))
-  appendLog(string.format('SMOOTHPATH pose=%s event=%s windowS=%.1f',
-    (poseSubscription or renderSubscription) and 'render' or 'tick',
-    poseRenderEvent, SMOOTH_LOG_WINDOW_S))
+  appendLog(string.format('SMOOTHPATH pose=sim-dt event=script.update windowS=%.1f',
+    SMOOTH_LOG_WINDOW_S))
   return true
 end
 
@@ -1285,11 +1372,8 @@ local function resetForSession(token)
   state.logAccum = 0
   state.materialMode = nil
   state.materialMeshes = 0
+  state.interiorMeshes = 0
   state.materialError = nil
-  -- v0.4: the session token change means a new session, so any lap baseline
-  -- belongs to the old one. Clearing it guarantees the first crossing after the
-  -- restart re-syncs once (instead of comparing against a stale lap number and
-  -- either double-firing or missing the crossing).
   state.lapBaseline = nil
   state.lapRestarts = 0
   state.lapSyncUnavailable = false
@@ -1298,10 +1382,7 @@ local function resetForSession(token)
   state.lastLapSyncWallS = -1e9
   state.playerLaunched = false
   state.holdingForLaunch = false
-  -- v0.5: `disposeGhost()` already dropped the pose path; the phase clock restarts
-  -- from zero with the new session.
-  state.displayTime = 0
-  state.reanchor = true
+  state.isPaused = false
   appendLog(string.format('SESSION token=%s syncLaps=%d',
     tostring(token), syncLapsEnabled() and 1 or 0))
 end
@@ -1345,9 +1426,21 @@ local function applyPose(x, y, z, yaw, pitch)
   state.ghostX, state.ghostY, state.ghostZ = x, adjustedY, z
 end
 
--- Returns the interpolated pose at `elapsed` timeline seconds plus the segment
--- speed and pitch. The interpolation itself is position lerp + shortest-arc
--- yaw across the ±pi seam + linear pitch and steer angle.
+-- Catmull-Rom cubic spline interpolation over 4 evenly-spaced control points.
+local function catmullRom(p0, p1, p2, p3, k)
+  local k2 = k * k
+  local k3 = k2 * k
+  return 0.5 * (
+    (2 * p1)
+    + (-p0 + p2) * k
+    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * k2
+    + (-p0 + 3 * p1 - 3 * p2 + p3) * k3
+  )
+end
+
+-- Returns the C1-smooth Catmull-Rom interpolated pose at `elapsed` timeline
+-- seconds plus segment speed and pitch, wrapping seamlessly from frames[count]
+-- back to frames[1] over the exact lap duration `runtimeDurationS`.
 local function sampleRuntimeFrame(elapsed)
   local frames = runtime.frames
   local count = #frames
@@ -1362,14 +1455,28 @@ local function sampleRuntimeFrame(elapsed)
   end
   state.runtimeCursor = index
 
+  local nextIdx = (index < count) and (index + 1) or 1
+  local prevIdx = (index > 1) and (index - 1) or count
+  local next2Idx = (nextIdx < count) and (nextIdx + 1) or 1
+
+  local p0 = frames[prevIdx]
   local a = frames[index]
-  local b = frames[math.min(index + 1, count)]
-  local span = b.timeS - a.timeS
+  local b = frames[nextIdx]
+  local p3 = frames[next2Idx]
+
+  local span = (index < count) and (b.timeS - a.timeS) or (runtimeDurationS - a.timeS)
   local k = span > 1e-6 and math.saturate((t - a.timeS) / span) or 0
 
-  local x = a.positionM[1] + (b.positionM[1] - a.positionM[1]) * k
-  local y = a.positionM[2] + (b.positionM[2] - a.positionM[2]) * k
-  local z = a.positionM[3] + (b.positionM[3] - a.positionM[3]) * k
+  local x, y, z
+  if count >= 4 then
+    x = catmullRom(p0.positionM[1], a.positionM[1], b.positionM[1], p3.positionM[1], k)
+    y = catmullRom(p0.positionM[2], a.positionM[2], b.positionM[2], p3.positionM[2], k)
+    z = catmullRom(p0.positionM[3], a.positionM[3], b.positionM[3], p3.positionM[3], k)
+  else
+    x = a.positionM[1] + (b.positionM[1] - a.positionM[1]) * k
+    y = a.positionM[2] + (b.positionM[2] - a.positionM[2]) * k
+    z = a.positionM[3] + (b.positionM[3] - a.positionM[3]) * k
+  end
 
   -- Pitch (positive = uphill nose up) and yaw (shortest arc into [-pi, pi]).
   local pitchA = a.rotationRad[1] or 0
@@ -1378,9 +1485,7 @@ local function sampleRuntimeFrame(elapsed)
   local yawDelta = wrapAngle(b.rotationRad[2] - a.rotationRad[2])
   local yaw = wrapAngle(a.rotationRad[2] + yawDelta * k)
 
-  -- Segment speed from the timeline itself (no schema change: the JSON carries
-  -- positions and times). A jump of more than 50 m over one 15 ms frame is the
-  -- loop seam, not motion, so keep the previous estimate.
+  -- Segment speed from the timeline itself.
   local speed = state.speedMps
   if span > 1e-6 then
     local segmentM = dist3(a.positionM[1], a.positionM[2], a.positionM[3],
@@ -1397,162 +1502,99 @@ local function sampleRuntimeFrame(elapsed)
   return x, y, z, yaw, speed, pitch
 end
 
--- Steering is absolute, so only push it when it actually changed (four native
--- calls per frame would otherwise run at the render rate for nothing).
-local function setSteerAngle(steerRad)
-  if state.steerApplied and math.abs(steerRad - state.steerApplied) < 1e-4 then
-    return
-  end
-  state.steerApplied = steerRad
+-- Update all 4 wheels: front wheels steer and roll; rear wheels roll.
+-- Uses accumulated absolute `wheelRollRad` so steering + rolling compose
+-- cleanly without drift (same pattern as CSP's TrafficCarFullLOD.lua:155).
+local function updateWheels(steerRad, speedMps, dtPlayback)
   local wheels = state.wheels
+  if type(dtPlayback) == 'number' and dtPlayback > 0 then
+    if type(speedMps) ~= 'number' or speedMps ~= speedMps then
+      speedMps = state.speedMps
+    end
+    if speedMps > MAX_PLAUSIBLE_SPEED_MPS then speedMps = MAX_PLAUSIBLE_SPEED_MPS end
+    local rollDelta = speedMps * dtPlayback / GHOST_WHEEL_RADIUS_M
+    if rollDelta > math.pi then rollDelta = math.pi end
+    if rollDelta > 0 then
+      state.wheelRollRad = (state.wheelRollRad + rollDelta) % (2 * math.pi)
+    end
+  end
+  local sx, sz = math.sin(steerRad or 0), math.cos(steerRad or 0)
+  local roll = state.wheelRollRad
   if wheels[1] and wheels[2] then
-    local sx, sz = math.sin(steerRad), math.cos(steerRad)
     pcall(function()
-      wheels[1]:setOrientation(vec3(sx, 0, sz))
-      wheels[2]:setOrientation(vec3(sx, 0, sz))
+      wheels[1]:setOrientation(vec3(sx, 0, sz)):rotate(vec3(1, 0, 0), roll)
+      wheels[2]:setOrientation(vec3(sx, 0, sz)):rotate(vec3(1, 0, 0), roll)
     end)
   end
-end
-
--- Wheel roll used to be fed a constant `step * 5` rad/s (≈30x too slow at race
--- speed, and it inherited every app-tick delta irregularity). It is now the
--- physical integral over the playback interval just consumed: the same wheel
--- angle whatever the frame rate, and no visible judder when tick deltas vary.
-local function advanceWheels(speedMps, dtPlayback)
-  local wheels = state.wheels
-  if not (wheels[3] and wheels[4]) then return end
-  if type(dtPlayback) ~= 'number' or dtPlayback <= 0 then return end
-  if type(speedMps) ~= 'number' or speedMps ~= speedMps then
-    speedMps = state.speedMps
+  if wheels[3] and wheels[4] then
+    pcall(function()
+      wheels[3]:setOrientation(vec3(0, 0, 1)):rotate(vec3(1, 0, 0), roll)
+      wheels[4]:setOrientation(vec3(0, 0, 1)):rotate(vec3(1, 0, 0), roll)
+    end)
   end
-  if speedMps > MAX_PLAUSIBLE_SPEED_MPS then speedMps = MAX_PLAUSIBLE_SPEED_MPS end
-  local rollDelta = speedMps * dtPlayback / GHOST_WHEEL_RADIUS_M
-  -- Cap a single step at half a turn: past that the rim reads as jitter rather
-  -- than rotation anyway, and one long frame must not spin it a whole turn.
-  if rollDelta > math.pi then rollDelta = math.pi end
-  if rollDelta <= 0 then return end
-  pcall(function()
-    wheels[3]:rotate(vec3(1, 0, 0), rollDelta)
-    wheels[4]:rotate(vec3(1, 0, 0), rollDelta)
-  end)
-end
-
--- v0.5: the per-render-frame pose path. `state.runtimeTime` is the authoritative
--- timeline phase (app tick + lap sync); this turns it into a continuous time and
--- applies the interpolated pose once per drawn frame.
---
--- Two reasons this is smooth where the app tick was not:
---   * the sample rate is the render rate (100+ Hz), not the app tick rate;
---   * the time advanced per frame comes from `os.preciseClock()`, so a
---     `sim.gameTime` that only moves in game-step chunks cannot quantise it.
--- The phase lock is what keeps it honest: the display may lead the authoritative
--- phase by at most LEAD_MAX_S, smaller lags than PHASE_DEADBAND_S are ignored
--- (that is what makes a coarse `sim.gameTime` harmless), real lag is corrected
--- at a capped rate, and anything past PHASE_SNAP_S is a deliberate re-anchor
--- (first frame, session reset, lap restart) counted as `resets=` instead of
--- being smoothed into a slow slide.
-updatePoseInRender = function()
-  if not state.renderPoseActive or not state.root or not runtime then return end
-
-  local now = preciseNow()
-  local last = state.renderLastPrecise
-  state.renderLastPrecise = now
-  if last == nil then return end
-
-  local wall = now - last
-  if wall < 0 then wall = 0 end
-  if wall > MAX_RENDER_WALL_S then wall = MAX_RENDER_WALL_S end
-
-  local previousDisplay = state.displayTime
-  local display = previousDisplay + wall * state.playRate
-  local snapped = false
-  local stepPlayback = 0
-
-  if state.holdingForLaunch then
-    display = state.runtimeTime
-    stepPlayback = 0
-    state.prevPose = nil
-  elseif state.reanchor then
-    state.reanchor = false
-    snapped = true
-  else
-    -- Shortest signed distance on the timeline circle (loop wrap included).
-    local lead = display - state.runtimeTime
-    local half = runtimeDurationS * 0.5
-    if lead > half then lead = lead - runtimeDurationS
-    elseif lead < -half then lead = lead + runtimeDurationS end
-
-    if lead > LEAD_MAX_S then
-      -- Never run ahead of the authoritative phase (see LEAD_MAX_S).
-      display = state.runtimeTime + LEAD_MAX_S
-    elseif lead < -PHASE_SNAP_S then
-      snapped = true
-    elseif lead < -PHASE_DEADBAND_S then
-      -- Real lag only: nudge forward at a capped rate so the correction itself
-      -- can never look like a speed change.
-      local fix = -lead * PHASE_GAIN
-      local cap = wall * PHASE_SPEED_CAP
-      if fix > cap then fix = cap end
-      display = display + fix
-    end
-  end
-
-  if snapped then
-    display = state.runtimeTime
-    state.smooth.resets = state.smooth.resets + 1
-    -- Do not measure a step across a deliberate re-anchor.
-    state.prevPose = nil
-  else
-    stepPlayback = display - previousDisplay
-    if stepPlayback < 0 then stepPlayback = stepPlayback + runtimeDurationS end
-    if stepPlayback > runtimeDurationS * 0.5 then
-      -- A clamp or correction must never move the ghost backwards mid-lap.
-      display = previousDisplay
-      stepPlayback = 0
-    end
-  end
-  display = display % runtimeDurationS
-  state.displayTime = display
-
-  local x, y, z, yaw, speed, pitch = sampleRuntimeFrame(display)
-  applyPose(x, y, z, yaw, pitch)
-  setSteerAngle(state.steerRad)
-  advanceWheels(speed, stepPlayback)
-  state.lastRenderPoseWall = now
-  state.renderPoseFrames = state.renderPoseFrames + 1
-  state.smooth.frames = state.smooth.frames + 1
 end
 
 -- ---------------------------------------------------------------------------
 -- Per-frame update
 -- ---------------------------------------------------------------------------
 
--- Playback must track real session time, not app frame time: app `dt` drops
--- frames and made the ghost clock lag game time by ~1 s per lap, which breaks
--- any "screenshot when ghost-time == X" rule.
+-- v0.8 unified simulation clock:
+--   * Freezes immediately (`0`) when `sim.isPaused` or `sim.isInMainMenu`.
+--   * Uses `sim.dt` (the exact simulation delta time driving AC's player car
+--     and chase camera; 0 when paused, honors replay slow-mo/fast-forward).
+--   * Also tracks `sim.gameTime` deltas while unpaused so `SMOOTH` logs
+--     cumulative `driftS` to prove 1.000x exact lap-time fidelity.
 local function advanceClock(fallback)
   local sim = ac.getSim()
-  local now = sim and sim.gameTime
-  if type(now) == 'number' then
+  local paused = sim ~= nil and (sim.isPaused == true or sim.isInMainMenu == true)
+  local nowGameTime = sim and sim.gameTime
+  if paused then
+    if type(nowGameTime) == 'number' then
+      state.simGameTime = nowGameTime
+    end
+    return 0, true
+  end
+
+  local gameDelta = nil
+  if type(nowGameTime) == 'number' then
     local previous = state.simGameTime
-    state.simGameTime = now
-    if previous and now >= previous then
-      local delta = now - previous
-      if delta <= 1.0 then
-        if state.clockSource ~= 'sim' then
-          state.clockSource = 'sim'
-          appendLog('CLOCK sim')
-        end
-        return delta
+    state.simGameTime = nowGameTime
+    if previous and nowGameTime >= previous then
+      local d = nowGameTime - previous
+      if d <= 0.25 then
+        gameDelta = d
       end
     end
   end
-  -- Skip the first couple of frames: there is no previous sample to diff yet.
+
+  local simDt = sim and sim.dt
+  if type(simDt) == 'number' and simDt == simDt and simDt >= 0 and simDt <= 0.25 then
+    if state.clockSource ~= 'sim.dt' then
+      state.clockSource = 'sim.dt'
+      appendLog('CLOCK sim.dt')
+    end
+    state.simDtAccS = state.simDtAccS + simDt
+    if gameDelta then
+      state.simGameTimeAccS = state.simGameTimeAccS + gameDelta
+    end
+    return simDt, false
+  end
+
+  if gameDelta then
+    if state.clockSource ~= 'sim' then
+      state.clockSource = 'sim'
+      appendLog('CLOCK sim')
+    end
+    return gameDelta, false
+  end
+
   if state.clockSource ~= 'app' and state.clock > 2 then
     state.clockSource = 'app'
     appendLog('CLOCK app')
   end
-  return fallback
+  local step = (type(fallback) == 'number' and fallback >= 0) and fallback or 0
+  if step > 0.25 then step = 0.25 end
+  return step, false
 end
 
 -- ---------------------------------------------------------------------------
@@ -1634,10 +1676,8 @@ local function restartPlaybackForLap(playerLap, nowS, jumps, reason)
   state.holdingForLaunch = false
   state.playerLaunched = true
   state.lastLapSyncWallS = nowS
-  -- v0.5: this is a deliberate timeline jump, so the render clock must re-anchor
-  -- on it instead of phase-locking (which would slide the ghost backwards
-  -- through the whole lap) and the jump must not be measured as a SMOOTH step.
-  state.reanchor = true
+  state.prevPose = nil
+  state.smooth.resets = state.smooth.resets + 1
   state.lapRestarts = state.lapRestarts + 1
   appendLog(string.format(
     'LAPSYNC playerLap=%s ghostRestarted t=0 wallS=%s cursorS=%.3f offsetS=%.3f leadS=%.2f jumps=%d reason=%s',
@@ -1652,7 +1692,8 @@ local function snapGhostToPlayer(nowS, reason)
   local cursor = (nearestT + currentLeadS()) % runtimeDurationS
   state.runtimeTime = cursor
   state.runtimeCursor = 1
-  state.reanchor = true
+  state.prevPose = nil
+  state.smooth.resets = state.smooth.resets + 1
   state.holdingForLaunch = false
   state.playerLaunched = true
   appendLog(string.format(
@@ -1698,7 +1739,7 @@ local function lapSyncTick(player, nowS)
       state.playerLaunched = true
       if state.holdingForLaunch then
         state.holdingForLaunch = false
-        state.reanchor = true
+        state.prevPose = nil
         appendLog(string.format(
           'LAPSYNC launch wallS=%s cursorS=%.3f speedKmh=%.1f',
           fmtNumber(nowS), state.runtimeTime, speedKmh))
@@ -1711,7 +1752,7 @@ local function lapSyncTick(player, nowS)
           state.holdingForLaunch = true
           state.runtimeTime = targetCursor
           state.runtimeCursor = 1
-          state.reanchor = true
+          state.prevPose = nil
           appendLog(string.format(
             'LAPSYNC ready wallS=%s cursorS=%.3f distM=%.1f leadS=%.2f',
             fmtNumber(nowS), targetCursor, distM, currentLeadS()))
@@ -1804,11 +1845,6 @@ local function writeSample()
     state.runtimeTime))
 end
 
--- v0.5 smoothness proof: worst per-frame displacement between two pose
--- applications in the window, plus the rates it was produced at. A smooth run
--- shows `maxStepM ≈ speed / renderHz` (≈0.4 m at 55 m/s and 144 Hz); anything
--- near a timeline frame (0.83 m) or above means the pose is being applied at
--- the app tick, and a value of tens of metres is a teleport.
 local function writeSmooth()
   local window = state.smooth.windowS
   if window <= 0 then return end
@@ -1816,11 +1852,12 @@ local function writeSmooth()
   local renderHz = state.smooth.frames / window
   local avgStepM = state.smooth.stepCount > 0
     and (state.smooth.sumStepM / state.smooth.stepCount) or 0
+  local driftS = state.simDtAccS - state.simGameTimeAccS
   appendLog(string.format(
-    'SMOOTH windowS=%.2f maxStepM=%s maxYawDeg=%.1f renderHz=%.1f tickHz=%.1f resets=%d avgStepM=%s',
+    'SMOOTH windowS=%.2f maxStepM=%s maxYawDeg=%.1f renderHz=%.1f tickHz=%.1f resets=%d avgStepM=%s driftS=%+.4f',
     window, fmtNumber(state.smooth.maxStepM),
     math.deg(state.smooth.maxYawRad), renderHz, tickHz, state.smooth.resets,
-    fmtNumber(avgStepM)))
+    fmtNumber(avgStepM), driftS))
   state.smooth.windowS = 0
   state.smooth.maxStepM = 0
   state.smooth.sumStepM = 0
@@ -1840,83 +1877,45 @@ local function updateGhost(dt)
   state.playerX, state.playerY, state.playerZ =
     playerPosition.x, playerPosition.y, playerPosition.z
 
-  local step = dt
-  if type(step) ~= 'number' or step < 0 then step = 0 end
-  if step > 1 then step = 1 end
-  step = advanceClock(step)
-
-  -- v0.5: playback rate for the render-side clock (playback seconds per wall
-  -- second): 1 at normal speed, ~0 while paused, follows slow motion. Measured
-  -- over PLAYBACK_RATE_WINDOW_S, because a per-tick ratio of a quantised
-  -- `sim.gameTime` is noise (0, 0, 2x, 0, ...) and would bend the ghost's speed.
-  local wall = preciseNow()
-  if state.lastTickPrecise then
-    local wallDelta = wall - state.lastTickPrecise
-    if wallDelta > 0 then
-      state.rateStepAcc = state.rateStepAcc + step
-      state.rateWallAcc = state.rateWallAcc + wallDelta
-      if state.rateWallAcc >= PLAYBACK_RATE_WINDOW_S then
-        local instant = state.rateStepAcc / state.rateWallAcc
-        if instant > MAX_PLAYBACK_RATE then instant = MAX_PLAYBACK_RATE end
-        state.playRate = state.playRate
-          + (instant - state.playRate) * PLAYBACK_RATE_GAIN
-        state.rateStepAcc = 0
-        state.rateWallAcc = 0
-      end
+  local step, paused = advanceClock(dt)
+  if paused ~= state.isPaused then
+    state.isPaused = paused
+    appendLog(string.format('PAUSED state=%d ghostT=%.3f',
+      paused and 1 or 0, state.runtimeTime))
+    if not paused then
+      state.prevPose = nil
     end
   end
-  state.lastTickPrecise = wall
+
+  -- When AC is paused (Escape / main menu), freeze the ghost completely at its
+  -- current pose (no timeline advancement, no wheel spin, no step glitches).
+  if paused then
+    if runtime and not state.poseApplied then
+      local x, y, z, yaw, speed, pitch = sampleRuntimeFrame(state.runtimeTime)
+      applyPose(x, y, z, yaw, pitch)
+      updateWheels(state.steerRad, 0, 0)
+    end
+    return
+  end
+
   state.smooth.ticks = state.smooth.ticks + 1
   state.activeTicks = state.activeTicks + 1
 
   if runtime then
-    -- Lap boundary / launch-hold first, then advance: a restart or launch-hold
-    -- this frame is visible in the pose applied this frame.
     local simNow = ac.getSim()
     lapSyncTick(player, (simNow and simNow.gameTime) or state.clock)
-    if not state.holdingForLaunch then
-      state.runtimeTime = (state.runtimeTime + step) % runtimeDurationS
+    local advanceStep = state.holdingForLaunch and 0 or step
+    if advanceStep > 0 then
+      state.runtimeTime = (state.runtimeTime + advanceStep) % runtimeDurationS
     end
 
-    -- Render-callback posing needs the hook to actually fire. If `render.on`
-    -- returned a subscription but nothing ever arrived, fall back to the app
-    -- tick instead of leaving the ghost frozen at its first pose.
-    local hookAlive = state.renderPoseFrames > 0
-    local hookFresh = state.lastRenderPoseWall ~= nil
-      and (wall - state.lastRenderPoseWall) <= RENDER_HOOK_STALE_S
-    local wasActive = state.renderPoseActive
-    state.renderPoseActive = (poseSubscription ~= nil or renderSubscription ~= nil)
-      and (hookFresh or state.activeTicks <= RENDER_HOOK_GRACE_TICKS)
-    if wasActive ~= state.renderPoseActive then
-      -- Handover between the render clock and the app tick: neither direction
-      -- may be measured (or rendered) as a step.
-      state.prevPose = nil
-      state.reanchor = true
-      state.renderLastPrecise = nil
-      state.displayTime = state.runtimeTime
-      if not state.renderPoseActive and not state.renderFallbackLogged then
-        state.renderFallbackLogged = true
-        local reason = hookAlive and 'render-hook-stalled' or 'no-render-frames'
-        appendLog('SMOOTHPATH pose=tick reason='..reason)
-        ac.warn('GhostCarGenerator Hotlap: render hook '..reason
-          ..'; falling back to app-tick posing (motion may step)')
-      end
-    end
-
-    -- Fallback path (no render hook), plus the very first writer tick: pose from
-    -- the tick so the node is never left at the scene origin while the grace
-    -- window waits for a render callback. Same interpolation, sampled at the
-    -- app-tick rate.
-    if not state.renderPoseActive or state.activeTicks == 1 then
-      local x, y, z, yaw, speed, pitch = sampleRuntimeFrame(state.runtimeTime)
-      applyPose(x, y, z, yaw, pitch)
-      setSteerAngle(state.steerRad)
-      advanceWheels(speed, step)
-    end
+    local x, y, z, yaw, speed, pitch = sampleRuntimeFrame(state.runtimeTime)
+    applyPose(x, y, z, yaw, pitch)
+    updateWheels(state.steerRad, speed, advanceStep)
+    state.smooth.frames = state.smooth.frames + 1
   else
     -- Fallback: keep a second car visible 5 m to the side of the player so the
-    -- render path can be verified even without a runtime timeline. Orientation
-    -- follows the player body directly, as the original spike did.
+    -- render path can be verified even without a runtime timeline.
     local sim = ac.getSim()
     local timeS = (sim and sim.gameTime) or 0
     local x = playerPosition.x + FALLBACK_OFFSET.x
@@ -1927,7 +1926,7 @@ local function updateGhost(dt)
       state.root:setOrientation(player.look, player.up)
     end
     state.ghostX, state.ghostY, state.ghostZ = x, y, z
-    setSteerAngle(math.sin(timeS * 0.5) * 0.25)
+    updateWheels(math.sin(timeS * 0.5) * 0.25, 0, 0)
   end
 
   state.logAccum = state.logAccum + step
@@ -1994,8 +1993,9 @@ function script.windowMain(dt)
     local distM = dist3(state.ghostX, state.ghostY, state.ghostZ,
       state.playerX, state.playerY, state.playerZ)
     if runtime then
-      local tag = state.holdingForLaunch and ' (READY)' or ''
-      ui.text(string.format('Lap %.1f / %.1f s   Dist %.1f m%s',
+      local tag = state.isPaused and ' (PAUSED)'
+        or (state.holdingForLaunch and ' (READY)' or '')
+      ui.text(string.format('Lap %.2f / %.2f s   Dist %.1f m%s',
         state.runtimeTime, runtimeDurationS, distM, tag))
     else
       ui.text(string.format('Fallback 5 m follow   Dist %.1f m', distM))
@@ -2020,7 +2020,7 @@ function script.windowMain(dt)
     end
     if type(ui.slider) == 'function' then
       local newAlpha, changed = ui.slider('##ghost_alpha_main',
-        currentAlpha(), 0.1, 1.0, 'Opacity: %.2f')
+        currentAlpha(), 0.05, 1.0, 'Opacity: %.2f')
       if changed then
         settings.alpha = clamp01(newAlpha)
         updateGhostAlpha(settings.alpha)
@@ -2039,10 +2039,6 @@ end
 
 function script.shutdown()
   disposeGhost()
-  if poseSubscription then
-    pcall(function() poseSubscription:dispose() end)
-    poseSubscription = nil
-  end
   if renderSubscription then
     pcall(function() renderSubscription:dispose() end)
     renderSubscription = nil
@@ -2061,8 +2057,9 @@ end
 
 function script.windowSettings(dt)
   ui.text('GhostCarGenerator Hotlap '..APP_VERSION)
-  ui.text('status: '..tostring(state.status)..' / '..tostring(state.mode or '-')
-    ..'  ('..tostring(state.materialMeshes)..' meshes)')
+  ui.text(string.format('status: %s / %s  (%d ext, %d int hidden)',
+    tostring(state.status), tostring(state.mode or '-'),
+    math.max(0, state.materialMeshes - state.interiorMeshes), state.interiorMeshes))
   if state.materialError then
     ui.text('alpha error: '..tostring(state.materialError))
   end
@@ -2084,7 +2081,7 @@ function script.windowSettings(dt)
 
   if type(ui.slider) == 'function' then
     local newAlpha, alphaChanged = ui.slider('##ghost_alpha',
-      currentAlpha(), 0.1, 1.0, 'Opacity: %.2f')
+      currentAlpha(), 0.05, 1.0, 'Opacity: %.2f')
     if alphaChanged then
       settings.alpha = clamp01(newAlpha)
       updateGhostAlpha(settings.alpha)
@@ -2129,12 +2126,11 @@ function script.windowSettings(dt)
     end
   end
 
-  ui.text(string.format('sync: %s  lap=%s  restarts=%d  frames=%s  clock=%s',
-    syncLapsEnabled() and 'on' or 'off', tostring(state.lapBaseline),
-    state.lapRestarts, runtime and tostring(#runtime.frames) or '0',
-    tostring(state.clockSource or '-')))
-  ui.text(string.format('pose: %s  %.0f Hz  maxStep %.2f m',
-    state.renderPoseActive and 'render' or 'tick',
+  ui.text(string.format('sync: %s  lap=%.3fs  restarts=%d  clock=%s%s',
+    syncLapsEnabled() and 'on' or 'off', runtimeDurationS,
+    state.lapRestarts, tostring(state.clockSource or '-'),
+    state.isPaused and ' (PAUSED)' or ''))
+  ui.text(string.format('pose: sim.dt  %.0f Hz  maxStep %.2f m  drift %+.3fs',
     state.smooth.windowS > 0 and (state.smooth.frames / math.max(0.001, state.smooth.windowS)) or 0,
-    state.smooth.maxStepM))
+    state.smooth.maxStepM, state.simDtAccS - state.simGameTimeAccS))
 end

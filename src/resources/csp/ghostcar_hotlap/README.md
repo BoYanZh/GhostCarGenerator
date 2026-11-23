@@ -14,11 +14,48 @@ It is a port of the `ghostcar_spike` new-mode probe:
 
 Scene recipe: `ac.findNodes('carsRoot:yes')` → `createBoundingSphereNode` →
 `setVirtualCarFlag(true)` → `loadKN5` of the hard-coded Initial G GR86 Premium →
-`setPosition` / `setOrientation` (yaw + pitch) from the
-`render.on('main.root.opaque')` callback (with `main.track.transparent`
-fallback), once per drawn frame.
+`setPosition` / `setOrientation` (yaw + pitch, Catmull-Rom cubic interpolation)
+inside `script.update(dt)` locked to `sim.dt` (once per rendered frame, before
+render passes / TAA motion vectors; `0` when paused).
 
-**Status: v0.7 (in-game proven).**
+**Status: v0.8 (in-game proven).**
+- **v0.8** fixed all four real-drive feedback items from v0.7:
+  1. **True high transparency**: switched ghost meshes (after `ensureUniqueMaterials()`)
+     to `SHADER = ksPerPixel` (`useDetail=0`, `ksAlphaRef=0`, `sunSpecular=0`,
+     alpha-scaled specular/Fresnel), hid 223 interior clutter meshes (`int_*`) while
+     translucent so alpha never stacks 4-6 layers deep inside the cabin, and lowered
+     default `GHOST_ALPHA` to `0.25` (slider `0.05-1.00`, one-time `settingsVersion=8`
+     migration).
+  2. **Silky-smooth motion**: added `smooth_runtime_ghost()` (double periodic cubic
+     Savitzky-Golay in `runtime_ghost.py`, reducing GPS 10/25 Hz stair-step `|dv|` p95
+     88x from `10.66 m/s` to `0.12 m/s` and eliminating the `i=91` seam jump) +
+     automatic Lua load-time jitter guard + Catmull-Rom cubic interpolation + unified
+     `sim.dt` clock inside `script.update(dt)` + 4-wheel spin.
+  3. **Instant pause freeze**: checks `sim.isPaused` and `sim.isInMainMenu` and uses
+     `sim.dt`, freezing the ghost completely during Escape pause and pre-drive menus
+     (`PAUSED state=1/0`).
+  4. **Exact lap-time fidelity**: reads `lapTimeS` (`136.960 s` = `2:16.960`, matching
+     the MoTeC LDX Fastest Lap 2 beacons `392.640 -> 529.600 s` to `0.000 s`) and
+     interpolates seamlessly across the loop wrap `frames[count] -> frames[1]`.
+     Verified across a 47-minute (18+ lap) live soak with `driftS=-0.0000`.
+
+### v0.8 in-game proof (2026-11-23, Thunderhill threemilebypass, GR86)
+
+- **Gates:** `INSTANCE writer`, `INIT ok app=0.8 frames=9131 durationS=136.960
+  alpha=0.250 timeline=clean(p95=0.11)`, `GHOST alpha=0.250 mode=alpha meshes=317
+  hiddenInt=223 shader=ok transparent=ok blend=ok shadows=ok tint=ok unique=ok`,
+  `SMOOTHPATH pose=sim-dt event=script.update`, `CLOCK sim.dt`, zero `ERROR`.
+- **Pause & timing proof:** `PAUSED state=1 ghostT=0.000` held throughout pre-drive
+  menu; `PAUSED state=1 ghostT=130.174 -> PAUSED state=0 ghostT=130.174` and
+  `PAUSED state=1 ghostT=1.030 -> PAUSED state=0 ghostT=1.030` froze with `0.000 s`
+  drift; full-lap wrap `316.097 -> 453.115` and 47-minute soak (`2858 s`) maintained
+  `driftS=-0.0000` (`1.0000x` exact match to `136.960 s`).
+- **Visual proof:** live chase-cam screenshot at `Opacity: 0.25` shows a hollow,
+  crystal-clear ice-blue ghost GR86 grounded on the curb with the blue/yellow curb
+  and white track edge clearly visible right through the body and glass, while the
+  player silver GR86 remains completely untouched.
+
+### Prior milestones (v0.5–v0.7)
 - **v0.5** moved pose application into the render callback with a phase-locked
   `os.preciseClock()` playback clock and speed-derived wheel roll.
 - **v0.6** expanded the shader filter list to all 11 shaders used by the GR86
