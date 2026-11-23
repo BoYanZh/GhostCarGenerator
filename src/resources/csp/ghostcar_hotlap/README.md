@@ -14,16 +14,52 @@ It is a port of the `ghostcar_spike` new-mode probe:
 
 Scene recipe: `ac.findNodes('carsRoot:yes')` → `createBoundingSphereNode` →
 `setVirtualCarFlag(true)` → `loadKN5` of the hard-coded Initial G GR86 Premium →
-per-frame `setPosition` / `setOrientation`.
+`setPosition` / `setOrientation` (yaw + pitch) from the
+`render.on('main.root.opaque')` callback (with `main.track.transparent`
+fallback), once per drawn frame.
 
-**Status: v0.4.** The data path and the *opaque* render path are proven in-game
-(v0.2 proof below); v0.3's transparency and single-writer lease are proven
-in-game (v0.3 proof below). v0.4 adds **lap synchronisation**: the ghost timeline
-restarts at every player start/finish crossing so both cars cross each lap
-together, with a settings toggle (default ON) and a documented alignment
-tunable. v0.4's sync is **driver-verified only** (it cannot be proven without
-driving a lap); see "v0.4 protocol" for the exact gates. No game launch was made
-for v0.4 and the installed AC tree was not modified.
+**Status: v0.7 (in-game proven).**
+- **v0.5** moved pose application into the render callback with a phase-locked
+  `os.preciseClock()` playback clock and speed-derived wheel roll.
+- **v0.6** expanded the shader filter list to all 11 shaders used by the GR86
+  KN5 (**317 / 317** meshes translucent, split body / dark-trim-tyre / glass
+  ghost tint palette), applied timeline pitch and interpolated wheel steering,
+  moved posing to `main.root.opaque`, disabled the red debug cross by default,
+  and added persisted live UI controls (visibility, opacity, height offset,
+  lap start offset, debug cross toggle).
+- **v0.7** fixed the Hotlap UX gap where the ghost ran away during the pre-drive
+  menu and missed the first flying-lap crossing (where AC keeps `lapCount=0`):
+  - **Pre-launch ready hold**: holds the ghost ready right ahead of the player
+    at `nearestTimelineTime(player) + leadS` (default `0.50 s`, ~11 m at
+    `HOTLAP_START`) until the player accelerates (`>= 5 km/h`), then launches
+    smoothly ahead.
+  - **Lap 1 + every-lap S/F crossing sync**: triggers on both `lapCount`
+    increments and forward `splinePosition` wraps (`>0.85 → <0.15`, reset- and
+    pit-filtered, 5 s debounce).
+  - **Live controls**: `Sync to my position` / `Sync to me` button, `Ghost lead`
+    slider (`0.0–3.0 s`), `Reset defaults`, and settings gear button on the main
+    window.
+
+### v0.7 in-game proof (2026-11-23, Thunderhill threemilebypass, GR86 via Content Manager)
+
+- **Gates (same session):** `INSTANCE writer`, `INIT ok app=0.7 frames=9131`,
+  `NODE ok ... aabbMeshes=317 wheels=4`, `GHOST alpha=0.500 mode=alpha
+  meshes=317 transparent=ok blend=ok shadows=ok tint=ok unique=ok` (100% mesh
+  coverage across all 11 GR86 shaders), `SMOOTHPATH pose=render
+  event=main.root.opaque`, `RENDERHOOK ok event=main.track.transparent`,
+  `CLOCK sim`, `ACTIVE mode=runtime`, zero `ERROR`.
+- **Visual & grounding proof (cockpit + chase cam screenshots):** with the
+  ground-calibrated timeline (`-0.464 m` road datum), the ice-blue / smoked-dark
+  translucent GR86 sits directly on the curb/tarmac (~11 m ahead of the player
+  at `HOTLAP_START`, `LAPSYNC ready cursorS=121.235 distM=3.3 leadS=0.50`), no
+  floating gap, no bright white tyres, no red debug cross, front wheels visibly
+  steered into the right-hand corner, and the `GhostCarGenerator Hotlap Info`
+  panel fits cleanly with all controls visible.
+- **Motion & UI proof:** clicking `Sync to my position` logged
+  `LAPSYNC snap ... cursorS=121.235 distM=3.4 leadS=0.50 reason=ui-settings`,
+  launching the ghost smoothly down the straight (`dist` 20 → 121 m,
+  `inFrustum01=1`, centered NDC) with `SMOOTH windowS=5.00 maxStepM=0.5853
+  maxYawDeg=0.4 renderHz=113.3 tickHz=113.3 resets=1 avgStepM=0.2371`.
 
 ## Install
 
@@ -68,21 +104,25 @@ Appended to
 
 (`ac.FolderID.Logs`, with a `%USERPROFILE%\Documents\...` fallback path).
 
-Line shapes (v0.4; v0.3 lines are unchanged unless a new token is appended):
+Line shapes (v0.5; v0.3/v0.4 lines are unchanged unless a new token is appended):
 
 ```
-INIT ok app=0.4 schema=ghost-runtime-v1 frames=9131 durationS=136.950 carId=... trackId=... log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
-INIT missing-runtime fallback=5m-follow player app=0.4 log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
+INIT ok app=0.5 schema=ghost-runtime-v1 frames=9131 durationS=136.950 carId=... trackId=... log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
+INIT missing-runtime fallback=5m-follow player app=0.5 log=... alpha=0.500 syncLaps=1 syncOffsetS=0.000
 INSTANCE writer id=<instanceId> gen=<n> backend=shared|file attempts=<n>
 INSTANCE standby, another writer active id=<instanceId> gen=<n> ageS=<n> backend=shared|file
 INSTANCE takeover id=<instanceId|free> genOld=<n> ageS=<n> gen=<n>
 INSTANCE unavailable <store-write-failed|store-unverified>; running unguarded
-NODE ok app=0.4 rootActive=1 rootChildren=1 modelEmpty=0 modelName=... modelActive=1 modelChildren=89 meshes=317 meshVisible=1 aabbSize=4.20x1.30x1.80 aabbMeshes=317 wheels=4 model=E:/.../toyota_gr86_premium.kn5
+NODE ok app=0.5 rootActive=1 rootChildren=1 modelEmpty=0 modelName=... modelActive=1 modelChildren=89 meshes=317 meshVisible=1 aabbSize=4.20x1.30x1.80 aabbMeshes=317 wheels=4 model=E:/.../toyota_gr86_premium.kn5
 GHOST alpha=0.500 mode=alpha meshes=317 transparent=ok blend=ok shadows=ok tint=ok unique=ok
 GHOST alpha=1.000 mode=opaque meshes=0
 GHOST failed <reason>
 RENDERHOOK ok event=main.track.transparent frames=1
 RENDERHOOK unavailable render.on | RENDERHOOK failed <reason>
+SMOOTHPATH pose=render|tick event=main.track.transparent windowS=5.0
+SMOOTHPATH pose=tick reason=no-render-frames|render-hook-stalled
+SMOOTH windowS=5.00 maxStepM=0.3819 maxYawDeg=0.1 renderHz=144.0 tickHz=60.0 resets=0
+SMOOTH pose-error render-context
 CLOCK sim | CLOCK app
 ACTIVE mode=runtime frames=9131 hook=none|ok alpha=0.500 log=...
 SESSION token=0 syncLaps=1
@@ -96,6 +136,35 @@ WARN init <message>
 ERROR <stage> <message>
 SHUTDOWN role=writer|standby [release=ok]
 ```
+
+v0.5 protocol deltas (motion smoothing):
+
+* `SMOOTHPATH` is written once per `ACTIVE` and says where the pose comes from:
+  `pose=render` means the render callback is moving the node (one sample per
+  drawn frame — the intended path); `pose=tick` means the fallback (no
+  `render.on`, or the callback never fired / stalled) and motion may step, with
+  the cause in `reason=`.
+* `SMOOTH` is written every 5 s of playback while the ghost is being posed, and
+  is the smoothness proof:
+  * `windowS` — length of the measurement window (playback seconds).
+  * `maxStepM` — largest straight-line displacement in **metres** between two
+    consecutive pose applications (i.e. between two rendered frames) in that
+    window. For reference at the bundled timeline's 55 m/s peak this is ~0.38 m
+    at 144 Hz and ~0.46 m at 120 Hz; a value near a timeline frame (0.83 m)
+    means it is being posed at the app tick, and tens of metres means a
+    teleport.
+  * `maxYawDeg` — largest per-frame yaw change, in degrees. It stays in the
+    low tenths; a value near 180 means a ±π seam snap.
+  * `renderHz` / `tickHz` — pose applications per second vs app ticks per
+    second over the window. `renderHz` must exceed `tickHz` on the real path.
+  * `resets` — deliberate re-anchors in the window (first frame after `ACTIVE`,
+    session reset, lap restart). These are excluded from `maxStepM`/`maxYawDeg`,
+    so a restart shows up as `resets=1` and not as a huge `maxStepM`.
+* `SMOOTH pose-error render-context` — one line, only if moving the node from the
+  render callback throws on this CSP build. The app then logs
+  `SMOOTHPATH pose=tick reason=no-render-frames` within ~2 s and keeps working at
+  the older app-tick rate (smoothness gate fails, ghost still correct).
+* No existing line changed shape; the 13-field data row is untouched.
 
 v0.4 protocol deltas:
 
@@ -155,6 +224,103 @@ working on the prefix.
 from `ac.getSim().gameTime` deltas when available (`CLOCK sim`), which removes
 the ~0.7 % drift v0.1 had from accumulating app frame `dt` (v0.1 lost about 1 s
 of ghost time per 137 s lap).
+
+## Motion smoothing (v0.5)
+
+In-game report: "the ghost motion is choppy, visible stepping". Reproduced in
+the code, not in the data.
+
+### Root cause
+
+The timeline sampling was already interpolated — nothing in v0.2–v0.4 rounded
+positions or jumped whole frames. `sampleRuntimeFrame()` (v0.5 line 1190, this
+file) picks the bracketing frames, lerps the position with
+`k = (t − a.timeS) / span`, and interpolates yaw along the shortest arc into
+`[−π, π]`. The defect was the **rate at which that sample was applied**:
+
+* `applyPose()` (the only `setPosition` on the runtime path) had exactly one
+  caller chain: `sampleRuntimeFrame()` → `updateGhost()` → `script.update()`.
+  The `render.on('main.track.transparent')` callback only *read* the pose (it
+  projected it for the oracle and drew the debug cross). So the node was
+  re-posed once per app tick, and the on-screen motion was quantised to the
+  app-tick rate.
+* The per-tick amount was the `ac.getSim().gameTime` delta. That value is a
+  millisecond snapshot of the game step (`ac.getSim().time`/1000, SDK
+  `ac_apps/lib.lua:5098`) — the same reason the SDK ships a separate
+  `os.preciseGameTime()` "at the time of the call" (lib.lua:4432) and
+  `os.preciseClock()` (lib.lua:4427). Advancing playback from it means the pose
+  advances in game-step chunks: 0 for a frame, then 2–3× the average for the
+  next one.
+* At the timeline's 55 m/s peak a 0.83 m timeline frame is 15 ms, so a 60 Hz app
+  tick moves the ghost ~0.9 m per update — that is the stepping. The offline
+  harness measures the v0.4 path at **maxStepM = 1.10 m** against its own
+  144 Hz bound of 0.66 m.
+* `steerWheels(steer, step * 5)` fed `rotate()` a constant **5 rad/s** wheel
+  roll on the rear wheels: ~30× too slow at racing speed, and it inherited every
+  app-tick delta irregularity, so the rims juddered on their own.
+
+Two other suspects were ruled out with code evidence: there is **no**
+interpolation bypass or snap branch on the runtime path (the fallback that snaps
+is the "no timeline" 5 m-follow mode), and nothing rounds a position before
+`setPosition` (the only `%` is on time). The single-writer lease was audited
+again: the only overlap window is one heartbeat (≤1 s) at a simultaneous cold
+start, it is logged twice (`INSTANCE writer` twice), and it ends in `standby` —
+it cannot produce a persistent chop.
+
+### Fix (smallest change that removes the stepping)
+
+1. **Apply the pose once per drawn frame.** `updatePoseInRender()` (v0.5 line
+   1286) is called from the existing render callback before the oracle samples,
+   so the node moves on every frame the game draws. `state.renderPoseActive`
+   records which path is live, and the app tick still poses whenever the hook
+   is missing, has never fired, or has stalled (`SMOOTHPATH ... reason=`).
+2. **Do not chase a quantised clock.** The render path advances a separate
+   display time by `wall × playRate`, with `wall` from `os.preciseClock()` and
+   `playRate` measured over `PLAYBACK_RATE_WINDOW_S = 0.5 s` (so a 0/0/2×
+   gameTime pattern cannot become speed modulation). Phase error against
+   `state.runtimeTime` is corrected only outside a 50 ms deadband, at ≤8 % of
+   the frame's advance, and the display may never lead the authoritative phase
+   (`LEAD_MAX_S = 0.03`) — which is also what makes a pause self-limiting
+   without a drift-then-snap.
+3. **Wheel roll from timeline speed.** `advanceWheels()` integrates
+   `segmentSpeed × playbackStep / 0.32 m`, i.e. the physical angle for the
+   distance actually travelled, and caps a single step at half a turn.
+4. **Deliberate jumps stay jumps.** Session reset, first frame and lap restart
+   set `state.reanchor`; the render clock snaps instead of sliding, and the
+   discontinuity is excluded from `maxStepM` and counted in `resets=`.
+
+Nothing about lap sync, heights or the timeline schema changed: `runtimeTime`
+is still advanced/lap-restarted exactly as in v0.4, `ghostT` is still
+`state.runtimeTime`, and the JSON format is untouched.
+
+### In-game gate
+
+Drive (or watch the ghost) for ≥20 s, then:
+
+```powershell
+$log = "$env:USERPROFILE\Documents\Assetto Corsa\logs\ghostcar_hotlap_verify.log"
+Select-String -Path $log -Pattern '^SMOOTHPATH|^SMOOTH ' | Select-Object -Last 6
+```
+
+* `SMOOTHPATH pose=render` — the pose is coming from the render callback.
+  `pose=tick reason=...` means the render hook did not fire and motion may still
+  step; that line is the only acceptable failure mode.
+* Every `SMOOTH` line has `maxStepM` consistent with the ghost's speed divided
+  by `renderHz`: ~0.38 m at 55 m/s and 144 Hz, ~0.46 m at 120 Hz. **Pass rule:**
+  `maxStepM` stays within a few percent of `speed / renderHz`, never approaches a
+  15 ms timeline frame (0.83 m) at a render rate above 66 Hz, and never reaches
+  metres. A `maxStepM` of ~1 m with `renderHz` ≈ 60 means the pose fell back to
+  the app tick (check `SMOOTHPATH`).
+* `renderHz` > `tickHz` (typically 100–165 vs 60). `resets` is `0` in steady
+  state, `1` in the window that contains `ACTIVE`, and `1` in the window that
+  contains a `LAPSYNC ... ghostRestarted`.
+* `maxYawDeg` stays in the low tenths; anything near 180 is a ±π seam snap and
+  a regression.
+* If `SMOOTH pose-error render-context` appears, scene mutation is not allowed
+  from the render callback on this CSP build; the app has already fallen back to
+  app-tick posing (`SMOOTHPATH pose=tick reason=no-render-frames`). Report that
+  line instead of the smoothness numbers: it is an environment limit, not a
+  timeline/data problem.
 
 ## Lap synchronisation (v0.4)
 
@@ -309,13 +475,42 @@ rebasing, non-zero `GHOST_START_OFFSET_S` cursor arithmetic
 (`cursorS = duration − offset`), and fallback mode staying silent. `luac -p` is
 clean on the shipped script.
 
+v0.5 adds a second offline harness (same temp-file method, no repo test) that
+targets the smoothing path: it loads the **real** script against the stubbed
+API, writes a 13.5 s / 900-frame synthetic timeline (15..55 m/s, yaw that
+deliberately crosses the ±π seam, sinusoid steering), and then drives the app
+with `script.update` at 30/60 Hz while invoking the captured render callback at
+120/144 Hz, recording every `setPosition` / `setOrientation` the app hands to
+the node. 27 assertions:
+
+| scenario | what it proves | result |
+| --- | --- | --- |
+| 144 Hz render / 60 Hz tick | max per-frame displacement within `speed/renderHz` | `maxStepM=0.3819` m (bound 0.66) |
+| 120 Hz render / 60 Hz tick | same at a second rate | `0.4572` m (bound 0.78) |
+| 144 Hz / 60 Hz, `sim.gameTime` quantised to 30 Hz | a coarse sim clock cannot quantise motion | `0.3820` m, `p99=0.3819` |
+| 144 Hz render / **30 Hz** tick | the app-tick rate no longer matters | `0.3811` m |
+| no `render.on` (v0.4 path) | the old per-tick posing steps | `1.1033` m → fails the same bound |
+| yaw across the ±π seam | no seam snap | `maxYawDeg=0.28` |
+| pause (gameTime frozen 0.4 s) | no lurch, no catch-up jump | <0.6 m total |
+| lap restart | exactly one re-anchor, smooth after | 1 step, tail within bound |
+| wheel roll | integral of speed/R, not constant 5 rad/s | ratio 1.003 vs path/radius |
+
+Plus grammar checks on the app's own log (`SMOOTHPATH pose=render`,
+`SMOOTH ... maxStepM/renderHz/tickHz/resets`, no `nan`/`inf`).
+
 ## Verification
 
-### v0.4 protocol (use this one; driver-verified)
+**Start with the v0.5 smoothing gate** — it needs no driving, only watching the
+ghost for ~20 s: `SMOOTHPATH pose=render` + `SMOOTH maxStepM` ≈ speed /
+`renderHz` (see "Motion smoothing (v0.5)" → "In-game gate"). The v0.4 section
+below is the lap-sync procedure and is additive to it.
+
+### v0.4 protocol (driver-verified)
 
 Sync cannot be validated without **driving a lap**, so this section is the
-driver's procedure, not a screenshot gate. It assumes the v0.3 gates below
-already pass (one writer, `GHOST ... mode=alpha`, `ACTIVE mode=runtime`).
+driver's procedure, not a screenshot gate. It assumes the v0.5 gate above and
+the v0.3 gates below already pass (one writer, `GHOST ... mode=alpha`,
+`ACTIVE mode=runtime`).
 
 **Step 0 — pre-flight (no driving needed).**
 
@@ -324,7 +519,7 @@ $log = "$env:USERPROFILE\Documents\Assetto Corsa\logs\ghostcar_hotlap_verify.log
 Select-String -Path $log -Pattern '^INIT ok|^SESSION |^LAPSYNC ' | Select-Object -Last 8
 ```
 
-* `INIT ok app=0.4 ... syncLaps=1 syncOffsetS=0.000` — sync enabled at the
+* `INIT ok app=0.5 ... syncLaps=1 syncOffsetS=0.000` — sync enabled at the
   shipped defaults. `syncLaps=0` means the toggle was persisted OFF; turn it on
   in the settings window and check for `LAPSYNC toggle syncLaps=1`.
 * exactly one `LAPSYNC baseline playerLap=<n> ...` appears shortly after
@@ -370,7 +565,7 @@ teleport, and one `LAPSYNC baseline` at the start.
 
 ### v0.3 protocol (historical; still the transparency/single-writer gate)
 
-> The sample lines below say `app=0.3`. v0.4 writes `app=0.4` and appends
+> The sample lines below say `app=0.3`. v0.4 wrote `app=0.4`, v0.5 writes `app=0.5`; v0.4 appended
 > `syncLaps=`/`syncOffsetS=` to `INIT` and `syncLaps=` to `SESSION`; every gate
 > in this section is otherwise unchanged and still required.
 
@@ -786,11 +981,23 @@ decides it without relying on human eyes.
 * The single-instance lease lives in the shared store; it is a lease with a
   0.6 s settle window, not a mutex (see "How v0.3 elects a single writer" for
   the limits and the file fallback).
+* UNKNOWN: whether `render.on()` callbacks may *mutate* a scene node on every
+  supported CSP build. The SDK documents the callback as "called when AC is
+  drawing something" and lists `main.track.transparent` for content added in the
+  transparent pass (SDK `ac_apps/README.md` "Function render.on"), and the
+  installed ac-tracer uses the same event, but only for drawing. v0.5 relies on
+  it for the pose; if a build rejects it, the app logs one
+  `SMOOTH pose-error render-context` and falls back to app-tick posing, so the
+  worst case is v0.4 behaviour rather than a broken ghost.
 * UNKNOWN: whether `script.update` keeps running when the app window is closed
   in-session. Installed apps (`map_display`, `ac-tracer`) update state from
   `script.update` unconditionally, which is the assumption here; the v0.2 log is
   written from `script.update`, so a silent log after a long drive would mean
-  that assumption is wrong.
+  that assumption is wrong. Since v0.5 the *pose* is applied from the render
+  callback, so if `script.update` did stop, the ghost would keep driving on the
+  render path alone with the display clock free-running at `playRate` and no
+  1 Hz rows / `SMOOTH` lines -- i.e. a frozen log with a moving ghost is now the
+  signature of that case, not a frozen ghost.
 * No native replay/template/private telemetry is distributed with this app.
 
 ## v0.3 in-game proof (2026-11-22, Thunderhill threemilebypass, GR86)
