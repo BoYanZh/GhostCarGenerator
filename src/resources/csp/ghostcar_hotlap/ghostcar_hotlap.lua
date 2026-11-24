@@ -100,18 +100,19 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.12'
+local APP_VERSION = '0.13'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
 -- 0.25 with depth-write (`DEPTH_MODE = NORMAL`) + interior meshes hidden gives
 -- a single-layer, see-through silhouette without multi-surface white stacking.
 local GHOST_ALPHA = 0.25
--- Near-distance fade (metres): smoothly fades ghost alpha from full at
--- GHOST_FADE_FAR_M down to 0 (hidden) at GHOST_FADE_NEAR_M so overlapping or
--- passing right in front of the player/camera never blocks sightlines.
+-- Near-distance fade (metres): smoothly interpolates ghost alpha from full
+-- (`currentAlpha()`) at GHOST_FADE_FAR_M down to a floor of GHOST_FADE_MIN_ALPHA
+-- (0.10) at GHOST_FADE_NEAR_M so the ghost never pops out or vanishes abruptly.
 local GHOST_FADE_NEAR_M = 4.5
 local GHOST_FADE_FAR_M = 18.0
+local GHOST_FADE_MIN_ALPHA = 0.10
 -- Default lead time in seconds so the ghost runs just ahead of the player
 -- (~11-25 m depending on speed), matching AC's built-in 0.5 s ghost advantage.
 local GHOST_DEFAULT_LEAD_S = 0.5
@@ -1150,16 +1151,15 @@ end
 
 local function refreshGhostOpacity(force)
   local base = currentAlpha()
-  local scale = computeDistanceFadeScale()
-  state.fadeScale = scale
-  local eff = clamp01(base * scale)
-  local shouldHide = eff <= 0.01
-  if shouldHide ~= state.fadeHidden then
-    state.fadeHidden = shouldHide
+  local t = computeDistanceFadeScale()
+  state.fadeScale = t
+  local minAlpha = math.min(base, GHOST_FADE_MIN_ALPHA)
+  local eff = clamp01(minAlpha + (base - minAlpha) * t)
+  if state.fadeHidden then
+    state.fadeHidden = false
     applyGhostVisibility(ghostVisibleEnabled())
   end
-  if shouldHide then return end
-  local threshold = force and 1e-3 or 0.015
+  local threshold = force and 1e-3 or 0.004
   if not state.appliedAlpha or math.abs(eff - state.appliedAlpha) >= threshold then
     updateGhostAlpha(eff)
   end
