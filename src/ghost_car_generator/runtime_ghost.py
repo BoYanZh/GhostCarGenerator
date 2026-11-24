@@ -313,6 +313,8 @@ def export_runtime_ghost_from_ld(
     yaw_smoothing_s: float = 0.35,
     fit_pavement: bool = True,
     pavement_search_radius_m: float = 8.0,
+    clamp_pavement: bool = True,
+    pavement_margin_m: float = 0.55,
     align_start_line: bool = True,
     smooth: bool = True,
 ) -> dict[str, Any]:
@@ -321,6 +323,7 @@ def export_runtime_ghost_from_ld(
     from .ld_replay import (
         align_replay_heights,
         build_poses_from_xyz,
+        clamp_to_pavement,
         fit_pavement_offset,
         gps_track_to_ac,
         smooth_replay_positions,
@@ -354,6 +357,7 @@ def export_runtime_ghost_from_ld(
     )
 
     pavement_diag: dict[str, Any] | None = None
+    clamp_diag: dict[str, Any] | None = None
     road_only = None
     if has_surfaces:
         road_only = TrackSurface.from_files([surface_paths[0]])
@@ -363,6 +367,14 @@ def export_runtime_ghost_from_ld(
                 road_only,
                 ref,
                 search_radius_m=float(pavement_search_radius_m),
+            )
+        if clamp_pavement:
+            ac_xyz, clamp_diag = clamp_to_pavement(
+                ac_xyz,
+                road_only,
+                ref,
+                margin_m=float(pavement_margin_m),
+                frequency_hz=pts["frequencyHz"],
             )
 
     full_surface = TrackSurface.from_files(surface_paths) if effective_height_mode == "kn5" else None
@@ -421,6 +433,7 @@ def export_runtime_ghost_from_ld(
         "heightOffsetM": effective_height_offset_m,
         "heightAlignment": height_diag,
         "pavementFit": pavement_diag,
+        "pavementClamp": clamp_diag,
         "onPavementPct": on_pavement_pct,
         "smoothed": bool(smooth),
         "startLineShiftFrames": sf_shift,

@@ -1275,6 +1275,8 @@ def _handle_replay_export_runtime(args: argparse.Namespace) -> None:
             yaw_smoothing_s=args.yaw_smoothing_s,
             fit_pavement=not args.no_fit_pavement,
             pavement_search_radius_m=args.pavement_search_radius_m,
+            clamp_pavement=not args.no_clamp_pavement,
+            pavement_margin_m=args.pavement_margin_m,
             align_start_line=True if args.align_start_line is None else args.align_start_line,
             smooth=True if args.smooth is None else args.smooth,
         )
@@ -1292,6 +1294,16 @@ def _handle_replay_export_runtime(args: argparse.Namespace) -> None:
                     z=off["z"],
                     before=pf["pavementOnRoadBefore"],
                     after=pf["pavementOnRoadAfter"],
+                )
+            )
+        if result["pavementClamp"] is not None:
+            pc = result["pavementClamp"]
+            print(
+                "Pavement clamp: margin={m:.2f}m, off-road pts {b} -> {a}, max pull {mp:.2f}m".format(
+                    m=pc["pavementClampMarginM"],
+                    b=pc["pavementClampOffBefore"],
+                    a=pc["pavementClampOffAfter"],
+                    mp=pc["pavementClampMaxPullM"],
                 )
             )
         if result["onPavementPct"] is not None:
@@ -1670,6 +1682,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=8.0,
         help="Search radius in metres for global pavement offset optimization (default: 8.0)",
+    )
+    replay_export_runtime.add_argument(
+        "--no-clamp-pavement",
+        action="store_true",
+        help="Disable smooth local corridor clamping of off-pavement corner excursions (.ld mode)",
+    )
+    replay_export_runtime.add_argument(
+        "--pavement-margin-m",
+        type=float,
+        default=0.55,
+        help="Inward clearance margin in metres from pavement edge when clamping (default: 0.55)",
     )
     replay_export_runtime.add_argument(
         "--align-start-line",

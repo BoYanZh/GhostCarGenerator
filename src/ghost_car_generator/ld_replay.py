@@ -20,6 +20,7 @@ from __future__ import annotations
 __all__ = [
     "align_replay_heights",
     "build_poses_from_xyz",
+    "clamp_to_pavement",
     "convert_ld_to_acreplay",
     "fit_pavement_offset",
     "gps_track_to_ac",
@@ -348,6 +349,154 @@ def fit_pavement_offset(
         "pavementRefRmsAfterM": after_rms,
     }
     return shifted, diagnostics
+
+
+def _periodic_gaussian(values, sigma_samples):
+    """Zero-phase periodic Gaussian smoothing for a closed-loop 1D correction."""
+    arr = np.asarray(values, dtype=np.float64)
+    n = len(arr)
+    if n < 3 or sigma_samples <= 0.0:
+        return arr.copy()
+    radius = min(n // 2, max(1, int(math.ceil(3.0 * sigma_samples))))
+    coords = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (coords / sigma_samples) ** 2)
+    kernel /= kernel.sum()
+    padded = np.concatenate([arr[-radius:], arr, arr[:radius]])
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def clamp_to_pavement(
+    positions_xyz,
+    road_surface,
+    reference_xyz,
+    *,
+    margin_m=0.55,
+    smooth_window_s=1.2,
+    frequency_hz=25.0,
+    passes=2,
+):
+    """Smoothly pull off-pavement excursions back inside the AC road mesh.
+
+    Real-world GPS laps can drift 1-3 m outside a virtual AC mod track in
+    high-speed sweepers even after optimal global ``(dx, dz)`` alignment.
+    For every sample whose centerline or outer wheel edge (``margin_m``) falls
+    outside ``road_surface``, this function pulls the sample inward toward the
+    nearest AC reference centerline point and smooths the sparse correction
+    vector with a zero-phase periodic Gaussian so on-track sections stay
+    untouched and corner transitions remain C2-smooth with zero lap-time change.
+    """
+    positions = np.asarray(positions_xyz, dtype=np.float64)
+    reference = np.asarray(reference_xyz, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
+        raise ValueError("Positions must be a non-empty Nx3 array")
+    if reference.ndim != 2 or reference.shape[1] != 3 or len(reference) < 2:
+        raise ValueError("Reference path must be an Mx3 array")
+
+    margin = max(0.0, float(margin_m))
+    sigma = max(0.0, float(frequency_hz) * float(smooth_window_s) * 0.25)
+    current = positions.copy()
+    ref_xz = reference[:, [0, 2]]
+
+    def _on_road_mask(pts):
+        delta = pts[:, None, [0, 2]] - ref_xz[None, :, :]
+        dist_sq = np.einsum("qri,qri->qr", delta, delta)
+        nearest_idx = np.argmin(dist_sq, axis=1)
+        q = pts.copy()
+        q[:, 1] = reference[nearest_idx, 1]
+        h, _ = road_surface.sample(q)
+        return np.isfinite(h), nearest_idx
+
+    before_on, _ = _on_road_mask(current)
+    total_clamped_before = int((~before_on).sum())
+
+    for _ in range(max(1, int(passes))):
+        on_center, nearest_idx = _on_road_mask(current)
+        ref_pts = reference[nearest_idx]
+        inward_xz = ref_pts[:, [0, 2]] - current[:, [0, 2]]
+        inward_len = np.linalg.norm(inward_xz, axis=1)
+        inward_unit = np.zeros_like(inward_xz)
+        nonzero = inward_len > 1e-6
+        inward_unit[nonzero] = inward_xz[nonzero] / inward_len[nonzero, None]
+
+        # Check outer-edge clearance (stepping outward by margin_m).
+        if margin > 0.0:
+            outer_pts = current.copy()
+            outer_pts[:, 0] -= inward_unit[:, 0] * margin
+            outer_pts[:, 2] -= inward_unit[:, 1] * margin
+            outer_pts[:, 1] = ref_pts[:, 1]
+            h_out, _ = road_surface.sample(outer_pts)
+            needs_pull = (~on_center) | (~np.isfinite(h_out))
+        else:
+            needs_pull = ~on_center
+
+        if not np.any(needs_pull):
+            break
+
+        corr_xz = np.zeros((len(current), 2), dtype=np.float64)
+        pull_indices = np.flatnonzero(needs_pull)
+        for idx in pull_indices:
+            if inward_len[idx] <= 1e-6:
+                continue
+            p0 = current[idx]
+            ref_y = ref_pts[idx, 1]
+            inv = inward_xz[idx]
+            unit = inward_unit[idx]
+            # Binary search smallest alpha in [0, 1] that puts both center and
+            # outer edge (margin_m) on pavement; fall back to center-only if narrow.
+            lo, hi = 0.0, 1.0
+            for _it in range(12):
+                mid = 0.5 * (lo + hi)
+                cx = p0[0] + mid * inv[0]
+                cz = p0[2] + mid * inv[1]
+                q = np.array(
+                    [
+                        [cx, ref_y, cz],
+                        [cx - unit[0] * margin, ref_y, cz - unit[1] * margin],
+                    ],
+                    dtype=np.float64,
+                )
+                hq, _ = road_surface.sample(q)
+                if np.isfinite(hq[0]) and (margin <= 0.0 or np.isfinite(hq[1])):
+                    hi = mid
+                else:
+                    lo = mid
+            # Verify hi puts center on road; if margin was too wide for road, retry center-only.
+            cx = p0[0] + hi * inv[0]
+            cz = p0[2] + hi * inv[1]
+            hq_c, _ = road_surface.sample(np.array([[cx, ref_y, cz]], dtype=np.float64))
+            if not np.isfinite(hq_c[0]):
+                lo2, hi2 = 0.0, 1.0
+                for _it in range(12):
+                    mid = 0.5 * (lo2 + hi2)
+                    q2 = np.array(
+                        [[p0[0] + mid * inv[0], ref_y, p0[2] + mid * inv[1]]],
+                        dtype=np.float64,
+                    )
+                    if np.isfinite(road_surface.sample(q2)[0][0]):
+                        hi2 = mid
+                    else:
+                        lo2 = mid
+                hi = hi2
+            corr_xz[idx] = hi * inv
+
+        if sigma > 0.0:
+            corr_xz[:, 0] = _periodic_gaussian(corr_xz[:, 0], sigma)
+            corr_xz[:, 1] = _periodic_gaussian(corr_xz[:, 1], sigma)
+
+        current[:, 0] += corr_xz[:, 0]
+        current[:, 2] += corr_xz[:, 1]
+
+    after_on, _ = _on_road_mask(current)
+    pulls = np.linalg.norm(current[:, [0, 2]] - positions[:, [0, 2]], axis=1)
+    diagnostics = {
+        "pavementClampMarginM": margin,
+        "pavementClampOffBefore": total_clamped_before,
+        "pavementClampOffAfter": int((~after_on).sum()),
+        "pavementOnRoadAfterClamp": float(after_on.mean()),
+        "pavementClampMaxPullM": round(float(np.max(pulls)), 3),
+        "pavementClampRmsPullM": round(float(np.sqrt(np.mean(pulls ** 2))), 3),
+    }
+    return current, diagnostics
 
 
 def _project_reference_segments(reference_xyz, query_xyz):

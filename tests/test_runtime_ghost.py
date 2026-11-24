@@ -10,7 +10,7 @@ import numpy as np
 
 from ghost_car_generator.acreplay import CAR_FRAME, VERSION
 from ghost_car_generator.cli import main as cli_main
-from ghost_car_generator.ld_replay import fit_pavement_offset
+from ghost_car_generator.ld_replay import clamp_to_pavement, fit_pavement_offset
 from ghost_car_generator.runtime_ghost import (
     DEFAULT_KN5_HEIGHT_OFFSET_M,
     SCHEMA,
@@ -299,3 +299,34 @@ def test_export_runtime_ghost_from_ld_cli(tmp_path: Path, monkeypatch):
     p0 = payload["frames"][0]["positionM"]
     assert math.hypot(p0[0] - 0.0, p0[2] - 50.0) < 2.0
     assert math.isclose(p0[1], 2.0 + DEFAULT_KN5_HEIGHT_OFFSET_M, abs_tol=0.05)
+
+
+def test_clamp_to_pavement_pulls_high_speed_corner_inside_road():
+    angles = np.linspace(0.0, 2.0 * math.pi, 240, endpoint=False)
+    ref = np.column_stack([50.0 * np.cos(angles), np.zeros_like(angles), 50.0 * np.sin(angles)])
+    verts = []
+    tris = []
+    for a in angles:
+        verts.append([45.0 * math.cos(a), 0.0, 45.0 * math.sin(a)])
+        verts.append([55.0 * math.cos(a), 0.0, 55.0 * math.sin(a)])
+    n = len(angles)
+    for i in range(n):
+        j = (i + 1) % n
+        tris.append([2 * i, 2 * i + 1, 2 * j + 1])
+        tris.append([2 * i, 2 * j + 1, 2 * j])
+    surface = TrackSurface(np.array(verts, dtype=np.float64), np.array(tris, dtype=np.int64))
+
+    # Push a 20-sample high-speed corner bulge 3.5 m outside the outer pavement edge (r = 58.5 m).
+    radii = np.full(n, 50.0)
+    radii[40:60] += 8.5 * np.sin(np.linspace(0.0, math.pi, 20))
+    bulged = np.column_stack([radii * np.cos(angles), np.zeros_like(angles), radii * np.sin(angles)])
+
+    clamped, diag = clamp_to_pavement(
+        bulged, surface, ref, margin_m=0.5, smooth_window_s=0.4, frequency_hz=25.0
+    )
+    assert diag["pavementClampOffBefore"] > 10
+    assert diag["pavementClampOffAfter"] == 0
+    assert diag["pavementOnRoadAfterClamp"] == 1.0
+    assert diag["pavementClampMaxPullM"] > 3.0
+    # Unaffected straight opposite the bulge remains untouched.
+    assert np.linalg.norm(clamped[160, [0, 2]] - bulged[160, [0, 2]]) < 1e-3
