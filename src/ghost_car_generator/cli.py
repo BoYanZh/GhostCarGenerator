@@ -1289,11 +1289,15 @@ def _handle_replay_export_runtime(args: argparse.Namespace) -> None:
             pf = result["pavementFit"]
             off = pf["pavementOffsetAcM"]
             print(
-                "Pavement fit: dx={x:+.2f}m, dz={z:+.2f}m, on-road {before:.1%} -> {after:.1%}".format(
+                "Pavement fit: dx={x:+.2f}m, dz={z:+.2f}m, rot={rot:+.2f}deg, "
+                "on-road {before:.1%} -> {after:.1%}, both-wheels {b2:.1%} -> {a2:.1%}".format(
                     x=off["x"],
                     z=off["z"],
+                    rot=pf.get("pavementRotationDeg", 0.0),
                     before=pf["pavementOnRoadBefore"],
                     after=pf["pavementOnRoadAfter"],
+                    b2=pf["pavementBothWheelsBefore"],
+                    a2=pf["pavementBothWheelsAfter"],
                 )
             )
         if result["pavementClamp"] is not None:

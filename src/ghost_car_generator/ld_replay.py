@@ -258,16 +258,20 @@ def fit_pavement_offset(
     search_radius_m=8.0,
     coarse_step_m=1.0,
     fine_step_m=0.2,
+    max_rotation_deg=0.5,
+    coarse_rot_step_deg=0.1,
+    fine_rot_step_deg=0.05,
     car_half_width_m=0.85,
-    max_samples=550,
+    max_samples=250,
 ):
-    """Find a global 2D AC-world (dx, dz) translation that maximizes pavement coverage.
+    """Find a global 2D rigid AC-world transform (tiny rotation + dx/dz) maximizing pavement coverage.
 
-    Removes receiver/session-level constant GPS horizontal bias without warping
+    Removes receiver/session-level constant GPS horizontal bias and small heading
+    mismatch (up to ``±max_rotation_deg`` around the lap centroid) without warping
     local racing lines, speeds, or lap time.  Scoring prioritizes centerline
     hits on ``road_surface`` (e.g. ``road-pit.gcsurface``), then full car-width
     hits (``±car_half_width_m``), with lower RMS to ``reference_xyz`` breaking
-    ties.  Returns ``(shifted_xyz, diagnostics)``.
+    ties.  Returns ``(transformed_xyz, diagnostics)``.
     """
     positions = np.asarray(positions_xyz, dtype=np.float64)
     reference = np.asarray(reference_xyz, dtype=np.float64)
@@ -279,11 +283,25 @@ def fit_pavement_offset(
     stride = max(1, len(positions) // int(max(1, max_samples)))
     sample_pts = positions[::stride].copy()
     ref_xz = reference[:, [0, 2]]
+    pivot_x = float(np.mean(positions[:, 0]))
+    pivot_z = float(np.mean(positions[:, 2]))
 
-    def _evaluate(dx, dz, pts_arr):
+    def _apply_rigid(pts_arr, dx, dz, rot_deg):
         q = pts_arr.copy()
-        q[:, 0] += dx
-        q[:, 2] += dz
+        if rot_deg != 0.0:
+            rad = math.radians(rot_deg)
+            c, s = math.cos(rad), math.sin(rad)
+            rx = q[:, 0] - pivot_x
+            rz = q[:, 2] - pivot_z
+            q[:, 0] = pivot_x + c * rx - s * rz + dx
+            q[:, 2] = pivot_z + s * rx + c * rz + dz
+        else:
+            q[:, 0] += dx
+            q[:, 2] += dz
+        return q
+
+    def _evaluate(dx, dz, rot_deg, pts_arr):
+        q = _apply_rigid(pts_arr, dx, dz, rot_deg)
         delta = q[:, None, [0, 2]] - ref_xz[None, :, :]
         d2 = np.einsum("qri,qri->qr", delta, delta)
         idx = np.argmin(d2, axis=1)
@@ -310,37 +328,69 @@ def fit_pavement_offset(
             float(np.sqrt(np.mean(nearest_d ** 2))),
         )
 
-    before_on, before_both, before_rms = _evaluate(0.0, 0.0, positions)
+    before_on, before_both, before_rms = _evaluate(0.0, 0.0, 0.0, positions)
 
     best_key = (-1.0, -1.0, -1e9)
-    best_dx, best_dz = 0.0, 0.0
+    best_dx, best_dz, best_rot = 0.0, 0.0, 0.0
     radius = float(max(0.0, search_radius_m))
     cstep = float(max(0.1, coarse_step_m))
+    max_rot = float(max(0.0, max_rotation_deg))
+
+    # Stage 1: coarse translation search at rot = 0 to locate the global basin.
     for dx in np.arange(-radius, radius + cstep * 0.5, cstep):
         for dz in np.arange(-radius, radius + cstep * 0.5, cstep):
-            on_r, both_r, rms = _evaluate(float(dx), float(dz), sample_pts)
+            on_r, both_r, rms = _evaluate(float(dx), float(dz), 0.0, sample_pts)
             key = (round(on_r, 4), round(both_r, 4), -rms)
             if key > best_key:
                 best_key = key
                 best_dx, best_dz = float(dx), float(dz)
 
-    fstep = float(max(0.05, fine_step_m))
-    fine_span = cstep * 1.2
-    bx, bz = best_dx, best_dz
-    for dx in np.arange(bx - fine_span, bx + fine_span + fstep * 0.5, fstep):
-        for dz in np.arange(bz - fine_span, bz + fine_span + fstep * 0.5, fstep):
-            on_r, both_r, rms = _evaluate(float(dx), float(dz), sample_pts)
-            key = (round(on_r, 4), round(both_r, 4), -rms)
-            if key > best_key:
-                best_key = key
-                best_dx, best_dz = round(float(dx), 4), round(float(dz), 4)
+    # Stage 2: joint coarse rotation + local translation refinement around basin.
+    if max_rot > 0.0:
+        rstep = float(max(0.02, coarse_rot_step_deg))
+        bx, bz = best_dx, best_dz
+        local_span = max(cstep * 1.5, 1.5)
+        local_step = max(0.5, cstep * 0.5)
+        for rot_deg in np.arange(-max_rot, max_rot + rstep * 0.5, rstep):
+            for dx in np.arange(bx - local_span, bx + local_span + local_step * 0.5, local_step):
+                for dz in np.arange(bz - local_span, bz + local_span + local_step * 0.5, local_step):
+                    on_r, both_r, rms = _evaluate(float(dx), float(dz), float(rot_deg), sample_pts)
+                    key = (round(on_r, 4), round(both_r, 4), -rms)
+                    if key > best_key:
+                        best_key = key
+                        best_dx, best_dz, best_rot = float(dx), float(dz), float(rot_deg)
 
-    after_on, after_both, after_rms = _evaluate(best_dx, best_dz, positions)
-    shifted = positions.copy()
-    shifted[:, 0] += best_dx
-    shifted[:, 2] += best_dz
+    # Stage 3: fine joint refinement over (dx, dz, rot_deg).
+    fstep = float(max(0.05, fine_step_m))
+    fine_span = max(fstep * 2.5, 0.5)
+    bx, bz, br = best_dx, best_dz, best_rot
+    if max_rot > 0.0:
+        frstep = float(max(0.01, fine_rot_step_deg))
+        rot_candidates = np.arange(
+            max(-max_rot, br - coarse_rot_step_deg),
+            min(max_rot, br + coarse_rot_step_deg) + frstep * 0.5,
+            frstep,
+        )
+    else:
+        rot_candidates = [0.0]
+
+    for rot_deg in rot_candidates:
+        for dx in np.arange(bx - fine_span, bx + fine_span + fstep * 0.5, fstep):
+            for dz in np.arange(bz - fine_span, bz + fine_span + fstep * 0.5, fstep):
+                on_r, both_r, rms = _evaluate(float(dx), float(dz), float(rot_deg), sample_pts)
+                key = (round(on_r, 4), round(both_r, 4), -rms)
+                if key > best_key:
+                    best_key = key
+                    best_dx = round(float(dx), 4)
+                    best_dz = round(float(dz), 4)
+                    best_rot = round(float(rot_deg), 4)
+
+    after_on, after_both, after_rms = _evaluate(best_dx, best_dz, best_rot, positions)
+    transformed = _apply_rigid(positions, best_dx, best_dz, best_rot)
     diagnostics = {
         "pavementOffsetAcM": {"x": float(best_dx), "z": float(best_dz)},
+        "pavementRotationDeg": float(best_rot),
+        "pavementPivotAcM": {"x": round(pivot_x, 3), "z": round(pivot_z, 3)},
         "pavementOnRoadBefore": before_on,
         "pavementOnRoadAfter": after_on,
         "pavementBothWheelsBefore": before_both,
@@ -348,7 +398,7 @@ def fit_pavement_offset(
         "pavementRefRmsBeforeM": before_rms,
         "pavementRefRmsAfterM": after_rms,
     }
-    return shifted, diagnostics
+    return transformed, diagnostics
 
 
 def _periodic_gaussian(values, sigma_samples):

@@ -123,6 +123,53 @@ def test_fit_pavement_offset_recovers_global_gps_shift():
     assert corrected.shape == biased.shape
 
 
+def test_fit_pavement_offset_recovers_small_rotation_and_translation():
+    # Elongated 500 m x 80 m oval so a 0.4 deg heading error shifts the far ends by ~3.5 m.
+    angles = np.linspace(0.0, 2.0 * math.pi, 240, endpoint=False)
+    ref = np.column_stack([250.0 * np.cos(angles), np.zeros_like(angles), 40.0 * np.sin(angles)])
+    tang = np.roll(ref[:, [0, 2]], -1, axis=0) - np.roll(ref[:, [0, 2]], 1, axis=0)
+    tang /= np.maximum(np.linalg.norm(tang, axis=1, keepdims=True), 1e-6)
+    perp = np.column_stack([-tang[:, 1], tang[:, 0]])
+    verts = []
+    tris = []
+    for i in range(len(angles)):
+        cx, cz = ref[i, 0], ref[i, 2]
+        px, pz = perp[i, 0] * 3.0, perp[i, 1] * 3.0
+        verts.append([cx - px, 0.0, cz - pz])
+        verts.append([cx + px, 0.0, cz + pz])
+    n = len(angles)
+    for i in range(n):
+        j = (i + 1) % n
+        tris.append([2 * i, 2 * i + 1, 2 * j + 1])
+        tris.append([2 * i, 2 * j + 1, 2 * j])
+    surface = TrackSurface(np.array(verts, dtype=np.float64), np.array(tris, dtype=np.int64))
+
+    # Apply +0.4 deg rotation + (+2.0, -1.5) m shift to the driven path.
+    rad = math.radians(0.4)
+    c, s = math.cos(rad), math.sin(rad)
+    biased = ref.copy()
+    biased[:, 0] = c * ref[:, 0] - s * ref[:, 2] + 2.0
+    biased[:, 2] = s * ref[:, 0] + c * ref[:, 2] - 1.5
+
+    corrected, diag = fit_pavement_offset(
+        biased,
+        surface,
+        ref,
+        search_radius_m=4.0,
+        coarse_step_m=1.0,
+        fine_step_m=0.25,
+        max_rotation_deg=0.5,
+        coarse_rot_step_deg=0.1,
+        fine_rot_step_deg=0.05,
+    )
+    assert diag["pavementOnRoadBefore"] < 0.92
+    assert diag["pavementOnRoadAfter"] == 1.0
+    assert abs(diag["pavementRotationDeg"] - (-0.4)) <= 0.1
+    assert abs(diag["pavementOffsetAcM"]["x"] - (-2.0)) <= 0.5
+    assert abs(diag["pavementOffsetAcM"]["z"] - 1.5) <= 0.5
+    assert corrected.shape == biased.shape
+
+
 def _write_surface_file(path: Path, vertices: np.ndarray, triangles: np.ndarray) -> None:
     verts = np.asarray(vertices, dtype="<f4")
     tris = np.asarray(triangles, dtype="<u4")
