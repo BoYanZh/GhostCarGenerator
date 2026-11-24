@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.15'
+local APP_VERSION = '0.16'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -2329,6 +2329,39 @@ local function drawGhostDeltaRow()
   end
 end
 
+local function drawGhostDeltaHero(distM)
+  local d = state.deltaS
+  local bigStr = '--.--'
+  local col = rgbm(0.88, 0.90, 0.92, 1.0)
+  local subStr
+  if type(d) == 'number' and d == d then
+    bigStr = math.abs(d) >= 10.0 and string.format('%+.1fs', d) or string.format('%+.2fs', d)
+    col = iRacingDeltaColor(d, 0.15, 0.88, 0.90, 0.92)
+    subStr = string.format('Est %s   Ref %s   %.1fm',
+      formatLapTimeS(state.deltaEstLapS), formatLapTimeS(runtimeDurationS), distM or 0)
+  else
+    local tag = state.isPaused and 'PAUSED'
+      or (state.holdingForLaunch and 'READY' or 'vs Ghost')
+    subStr = string.format('Ref %s   %.1fm   (%s)',
+      formatLapTimeS(runtimeDurationS), distM or 0, tag)
+  end
+
+  local availW = (type(ui.availableSpaceX) == 'function' and math.max(180, ui.availableSpaceX())) or 280
+  if type(ui.dwriteTextAligned) == 'function' and ui.Alignment and ui.Alignment.Center ~= nil then
+    local bigSize = 26
+    ui.dwriteTextAligned(bigStr, bigSize, ui.Alignment.Center, ui.Alignment.Center,
+      vec2(availW, bigSize + 6), false, col)
+    ui.dwriteTextAligned(subStr, 13, ui.Alignment.Center, ui.Alignment.Center,
+      vec2(availW, 18), false, rgbm(0.76, 0.78, 0.82, 1.0))
+  elseif type(ui.textColored) == 'function' then
+    ui.textColored('Delta vs Ghost: '..bigStr, col)
+    ui.text(subStr)
+  else
+    ui.text('Delta vs Ghost: '..bigStr)
+    ui.text(subStr)
+  end
+end
+
 function script.windowMain(dt)
   drawTranslucentPanelBg()
   if instance.role == 'standby' then
@@ -2344,11 +2377,7 @@ function script.windowMain(dt)
       state.playerX, state.playerY, state.playerZ)
     if runtime then
       drawGhostDeltaBar()
-      drawGhostDeltaRow()
-      local tag = state.isPaused and '  PAUSED'
-        or (state.holdingForLaunch and '  READY' or '')
-      ui.text(string.format('Ref %s   Lap %.1fs   Dist %.1fm%s',
-        formatLapTimeS(runtimeDurationS), state.runtimeTime, distM, tag))
+      drawGhostDeltaHero(distM)
     else
       ui.text(string.format('Ghost Fallback (5m)   Dist %.1fm', distM))
     end
