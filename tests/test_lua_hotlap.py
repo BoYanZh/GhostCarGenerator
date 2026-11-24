@@ -134,7 +134,6 @@ def test_lua_headless_runtime_smoke(tmp_path: Path):
     )
 
     harness = tmp_path / "harness.lua"
-    log_file = tmp_path / "verify.log"
     harness.write_text(
         f"""
 __dirname = {json.dumps(str(tmp_path))}
