@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.14'
+local APP_VERSION = '0.15'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -2096,11 +2096,11 @@ local function updateGhostDelta(player, step)
   local ghostTimeAtPos = tim[i] + slope * (s - pos[i])
   local delta = (lapMs * 0.001) - ghostTimeAtPos
 
-  -- Smoothed instantaneous d(delta)/dt (s/s) for iRacing-style bar color.
+  -- Fast-response smoothed instantaneous d(delta)/dt (s/s) for iRacing bar color.
   if step and step > 0 then
     if state.deltaPrevRaw ~= nil and math.abs(delta - state.deltaPrevRaw) < 2.0 then
       local instRate = (delta - state.deltaPrevRaw) / math.max(0.005, step)
-      local alpha = math.min(1.0, step / 0.22)
+      local alpha = math.min(1.0, step / 0.12)
       state.deltaRateSps = state.deltaRateSps + (instRate - state.deltaRateSps) * alpha
     else
       state.deltaRateSps = 0
@@ -2258,19 +2258,20 @@ local function drawTranslucentPanelBg()
   end
 end
 
-local function iRacingDeltaColor(value, span)
+local function iRacingDeltaColor(value, span, nr, ng, nb)
+  local r0, g0, b0 = nr or 0.88, ng or 0.90, nb or 0.92
   if type(value) ~= 'number' or value ~= value then
-    return rgbm(0.86, 0.88, 0.90, 1.0)
+    return rgbm(r0, g0, b0, 1.0)
   end
   local n = math.max(-1.0, math.min(1.0, value / span))
   local a = math.abs(n)
-  -- Neutral white-grey (0.86, 0.88, 0.90) -> vivid green (0.12, 0.96, 0.24) or vivid red (1.0, 0.20, 0.14)
+  -- Neutral -> vivid iRacing neon green (0.08, 0.98, 0.28) or bright red (1.0, 0.16, 0.14)
   if n < 0 then
-    return rgbm(0.86 + (0.12 - 0.86) * a, 0.88 + (0.96 - 0.88) * a, 0.90 + (0.24 - 0.90) * a, 1.0)
+    return rgbm(r0 + (0.08 - r0) * a, g0 + (0.98 - g0) * a, b0 + (0.28 - b0) * a, 1.0)
   elseif n > 0 then
-    return rgbm(0.86 + (1.00 - 0.86) * a, 0.88 + (0.20 - 0.88) * a, 0.90 + (0.14 - 0.90) * a, 1.0)
+    return rgbm(r0 + (1.00 - r0) * a, g0 + (0.16 - g0) * a, b0 + (0.14 - b0) * a, 1.0)
   end
-  return rgbm(0.86, 0.88, 0.90, 1.0)
+  return rgbm(r0, g0, b0, 1.0)
 end
 
 local function drawGhostDeltaBar()
@@ -2287,9 +2288,9 @@ local function drawGhostDeltaBar()
   ui.drawRectFilled(vec2(barX, barY), vec2(barX + barW, barY + barH), rgbm(0.10, 0.11, 0.14, 0.80), 3)
   local d = state.deltaS
   if type(d) == 'number' and d == d then
-    local norm = math.max(-1.0, math.min(1.0, -d / 1.5))
+    local norm = math.max(-1.0, math.min(1.0, -d / 2.0))
     local fillW = math.abs(norm) * (barW * 0.5)
-    local barCol = iRacingDeltaColor(state.deltaRateSps or 0, 0.20)
+    local barCol = iRacingDeltaColor(state.deltaRateSps or 0, 0.30, 0.32, 0.34, 0.38)
     if fillW >= 1 then
       if norm >= 0 then
         ui.drawRectFilled(vec2(midX, barY + 1), vec2(midX + fillW, barY + barH - 1), barCol, 2)
@@ -2312,12 +2313,12 @@ end
 local function drawGhostDeltaRow()
   local d = state.deltaS
   local text
-  local col = rgbm(0.86, 0.88, 0.90, 1.0)
+  local col = rgbm(0.88, 0.90, 0.92, 1.0)
   if type(d) == 'number' and d == d then
     local dStr = math.abs(d) >= 10.0 and string.format('%+.1f', d) or string.format('%+.2f', d)
     text = string.format('Delta vs Ghost: %ss  (Est %s)',
       dStr, formatLapTimeS(state.deltaEstLapS))
-    col = iRacingDeltaColor(d, 0.50)
+    col = iRacingDeltaColor(d, 0.15, 0.88, 0.90, 0.92)
   else
     text = string.format('Delta vs Ghost: -.--  (Ref %s)', formatLapTimeS(runtimeDurationS))
   end
