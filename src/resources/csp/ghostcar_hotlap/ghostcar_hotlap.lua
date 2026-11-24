@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.11'
+local APP_VERSION = '0.12'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -2282,61 +2282,29 @@ end
 function script.windowMain(dt)
   drawTranslucentPanelBg()
   if instance.role == 'standby' then
-    ui.text('GhostCarGenerator Hotlap: STANDBY (another writer active)')
-    ui.text('instance '..tostring(instance.id)..' - no node, no rows')
+    ui.text('GhostCarGenerator Delta: STANDBY')
     return
   end
   if instance.role == 'claiming' then
-    ui.text('GhostCarGenerator Hotlap: INIT claiming writer lease')
+    ui.text('GhostCarGenerator Delta: INIT')
     return
   end
   if state.status == 'ACTIVE' then
-    ui.text('GhostCarGenerator Hotlap: ACTIVE ['..tostring(state.mode)..']')
     local distM = dist3(state.ghostX, state.ghostY, state.ghostZ,
       state.playerX, state.playerY, state.playerZ)
     if runtime then
-      local tag = state.isPaused and ' (PAUSED)'
-        or (state.holdingForLaunch and ' (READY)' or '')
-      ui.text(string.format('Lap %.2f / %.2f s   Dist %.1f m%s',
-        state.runtimeTime, runtimeDurationS, distM, tag))
       drawGhostDeltaRow()
+      local tag = state.isPaused and '  PAUSED'
+        or (state.holdingForLaunch and '  READY' or '')
+      ui.text(string.format('Ref %s   Lap %.1fs   Dist %.1fm%s',
+        formatLapTimeS(runtimeDurationS), state.runtimeTime, distM, tag))
     else
-      ui.text(string.format('Fallback 5 m follow   Dist %.1f m', distM))
-    end
-    if type(ui.checkbox) == 'function' then
-      local vis = ghostVisibleEnabled()
-      if ui.checkbox('Show ghost', vis) then
-        settings.visible = not vis
-        applyGhostVisibility(settings.visible)
-      end
-      if type(ui.sameLine) == 'function' then ui.sameLine(0, 12) end
-      if ui.checkbox('Sync laps', syncLapsEnabled()) then
-        toggleLapSync()
-      end
-      if runtime and type(ui.button) == 'function' then
-        if type(ui.sameLine) == 'function' then ui.sameLine(0, 12) end
-        if ui.button('Sync to me') then
-          local sim = ac.getSim()
-          snapGhostToPlayer((sim and sim.gameTime) or state.clock, 'ui-main')
-        end
-      end
-    end
-    if type(ui.slider) == 'function' then
-      local newAlpha, changed = ui.slider('##ghost_alpha_main',
-        currentAlpha(), 0.05, 1.0, 'Opacity: %.2f')
-      if changed then
-        settings.alpha = clamp01(newAlpha)
-        refreshGhostOpacity(true)
-      end
-    else
-      ui.text(string.format('alpha %.2f mode %s  meshes %d  sync %s',
-        currentAlpha(), tostring(state.materialMode or 'pending'), state.materialMeshes,
-        syncLapsEnabled() and 'on' or 'off'))
+      ui.text(string.format('Ghost Fallback (5m)   Dist %.1fm', distM))
     end
   elseif state.status == 'ERROR' then
     ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
   else
-    ui.text('GhostCarGenerator Hotlap: INIT waiting for car/scene')
+    ui.text('GhostCarGenerator Delta: waiting for scene')
   end
 end
 
