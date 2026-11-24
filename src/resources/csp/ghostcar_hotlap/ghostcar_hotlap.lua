@@ -100,13 +100,18 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.9'
+local APP_VERSION = '0.11'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
--- 0.25 with interior meshes hidden + specular/fresnel scaled by alpha gives a
--- crisp, see-through GT/iRacing-style silhouette that never blocks sightlines.
+-- 0.25 with depth-write (`DEPTH_MODE = NORMAL`) + interior meshes hidden gives
+-- a single-layer, see-through silhouette without multi-surface white stacking.
 local GHOST_ALPHA = 0.25
+-- Near-distance fade (metres): smoothly fades ghost alpha from full at
+-- GHOST_FADE_FAR_M down to 0 (hidden) at GHOST_FADE_NEAR_M so overlapping or
+-- passing right in front of the player/camera never blocks sightlines.
+local GHOST_FADE_NEAR_M = 4.5
+local GHOST_FADE_FAR_M = 18.0
 -- Default lead time in seconds so the ghost runs just ahead of the player
 -- (~11-25 m depending on speed), matching AC's built-in 0.5 s ghost advantage.
 local GHOST_DEFAULT_LEAD_S = 0.5
@@ -152,8 +157,10 @@ do
   local defaults = {
     settingsVersion = 0,
     syncLaps = true,
+    syncSectors = true,
     visible = true,
     alpha = GHOST_ALPHA,
+    distanceFade = true,
     heightOffsetM = 0.0,
     startOffsetS = GHOST_START_OFFSET_S,
     leadS = GHOST_DEFAULT_LEAD_S,
@@ -176,8 +183,10 @@ do
   end
   -- An older/partial settings file must not leave nil fields.
   if settings.syncLaps == nil then settings.syncLaps = true end
+  if settings.syncSectors == nil then settings.syncSectors = true end
   if settings.visible == nil then settings.visible = true end
   if type(settings.alpha) ~= 'number' then settings.alpha = GHOST_ALPHA end
+  if settings.distanceFade == nil then settings.distanceFade = true end
   if type(settings.heightOffsetM) ~= 'number' then settings.heightOffsetM = 0.0 end
   if type(settings.startOffsetS) ~= 'number' then settings.startOffsetS = GHOST_START_OFFSET_S end
   if type(settings.leadS) ~= 'number' then settings.leadS = GHOST_DEFAULT_LEAD_S end
@@ -195,12 +204,20 @@ local function syncLapsEnabled()
   return settings.syncLaps ~= false
 end
 
+local function syncSectorsEnabled()
+  return settings.syncSectors ~= false
+end
+
 local function ghostVisibleEnabled()
   return settings.visible ~= false
 end
 
 local function currentAlpha()
   return clamp01(settings.alpha)
+end
+
+local function distanceFadeEnabled()
+  return settings.distanceFade ~= false
 end
 
 local function currentHeightOffsetM()
@@ -351,6 +368,18 @@ local state = {
   interiorMeshSets = {},
   appliedAlpha = nil,
   appliedVisible = nil,
+  fadeScale = 1.0,
+  fadeHidden = false,
+  fadeDistM = nil,
+  -- Sidekick-style spline-interpolated delta vs ghost car.
+  deltaTable = nil,
+  deltaTableBuilt = false,
+  deltaS = nil,
+  deltaEstLapS = nil,
+  deltaTrend = 0,
+  deltaPrev1 = nil,
+  deltaPrev2 = nil,
+  deltaTrendAccum = 0,
   -- v0.4/v0.7 lap sync. `lapBaseline` is the last player `lapCount` seen; nil
   -- means "not tracking yet". `prevSpline` tracks `splinePosition` so Lap 1
   -- from HOTLAP_START (where `lapCount` stays 0 across S/F) also syncs cleanly.
@@ -358,8 +387,10 @@ local state = {
   lapRestarts = 0,
   lapSyncUnavailable = false,
   prevSpline = nil,
+  prevSector = nil,
   prevResetCounter = nil,
   lastLapSyncWallS = -1e9,
+  lastSectorSyncWallS = -1e9,
   playerLaunched = false,
   holdingForLaunch = false,
   isPaused = false,
@@ -1009,7 +1040,7 @@ local GHOST_INTERIOR_FILTERS = {
 }
 
 local GHOST_SHADER_REPLACEMENT =
-  'SHADER = ksPerPixel\nIS_TRANSPARENT = 1\nBLEND_MODE = ALPHA_BLEND\nCAST_SHADOWS = 0'
+  'SHADER = ksPerPixel\nIS_TRANSPARENT = 1\nBLEND_MODE = ALPHA_BLEND\nDEPTH_MODE = NORMAL\nCAST_SHADOWS = 0'
 
 local GHOST_MESH_FILTERS = {
   { filter = 'shader:ksPerPixelMultiMap_damage_dirt', tint = GHOST_TINT_BODY,  alphaScale = 1.00 },
@@ -1037,6 +1068,9 @@ local function applyAlphaToTarget(target, alpha, tint, alphaScale)
   local c = tint or GHOST_TINT_BODY
   pcall(function() target:setTransparent(translucent) end)
   pcall(function() target:setBlendMode(blendMode) end)
+  if render.DepthMode and render.DepthMode.Normal ~= nil then
+    pcall(function() target:setDepthMode(render.DepthMode.Normal) end)
+  end
   pcall(function() target:setShadows(not translucent) end)
   pcall(function() target:excludeFromCubemap(true) end)
   pcall(function() target:excludeFromSecondary(true) end)
@@ -1083,7 +1117,7 @@ local function updateGhostAlpha(alpha)
 end
 
 local function applyGhostVisibility(visible)
-  local want = visible ~= false
+  local want = (visible ~= false) and (not state.fadeHidden)
   if state.appliedVisible == want then return end
   if not state.root then return end
   pcall(function() state.root:setVisible(want, false) end)
@@ -1091,7 +1125,44 @@ local function applyGhostVisibility(visible)
     pcall(function() state.model:setVisible(want, false) end)
   end
   state.appliedVisible = want
-  updateInteriorVisibility(want, currentAlpha() < 0.999)
+  updateInteriorVisibility(want, (state.appliedAlpha or currentAlpha()) < 0.999)
+end
+
+local function computeDistanceFadeScale()
+  local playerDist = dist3(state.ghostX, state.ghostY, state.ghostZ,
+    state.playerX, state.playerY, state.playerZ)
+  local minDist = playerDist
+  local okCam, camPos = pcall(ac.getCameraPosition)
+  if okCam and camPos then
+    local camDist = dist3(state.ghostX, state.ghostY, state.ghostZ,
+      camPos.x, camPos.y, camPos.z)
+    if camDist < minDist then minDist = camDist end
+  end
+  state.fadeDistM = minDist
+  if not distanceFadeEnabled() then
+    return 1.0
+  end
+  if minDist <= GHOST_FADE_NEAR_M then return 0.0 end
+  if minDist >= GHOST_FADE_FAR_M then return 1.0 end
+  local t = (minDist - GHOST_FADE_NEAR_M) / (GHOST_FADE_FAR_M - GHOST_FADE_NEAR_M)
+  return t * t * (3.0 - 2.0 * t)
+end
+
+local function refreshGhostOpacity(force)
+  local base = currentAlpha()
+  local scale = computeDistanceFadeScale()
+  state.fadeScale = scale
+  local eff = clamp01(base * scale)
+  local shouldHide = eff <= 0.01
+  if shouldHide ~= state.fadeHidden then
+    state.fadeHidden = shouldHide
+    applyGhostVisibility(ghostVisibleEnabled())
+  end
+  if shouldHide then return end
+  local threshold = force and 1e-3 or 0.015
+  if not state.appliedAlpha or math.abs(eff - state.appliedAlpha) >= threshold then
+    updateGhostAlpha(eff)
+  end
 end
 
 local function isInteriorMaterialName(matName)
@@ -1701,6 +1772,26 @@ local function snapGhostToPlayer(nowS, reason)
   return true
 end
 
+local function lookupGhostTimeBySpline(s)
+  local tbl = state.deltaTable
+  if not tbl or type(s) ~= 'number' or s ~= s then return nil end
+  local pos = tbl.pos
+  local tim = tbl.tim
+  local lo, hi = 1, tbl.count
+  while lo < hi do
+    local mid = math.floor((lo + hi) * 0.5)
+    if pos[mid] <= s then
+      lo = mid + 1
+    else
+      hi = mid
+    end
+  end
+  local i = math.max(1, math.min(tbl.count - 1, lo - 1))
+  local ds = pos[i + 1] - pos[i]
+  local slope = ds > 1e-9 and ((tim[i + 1] - tim[i]) / ds) or 0
+  return tim[i] + slope * (s - pos[i])
+end
+
 local function lapSyncTick(player, nowS)
   if not runtime then return end
   if not syncLapsEnabled() then
@@ -1811,8 +1902,44 @@ local function lapSyncTick(player, nowS)
   if spline ~= nil and state.prevSpline ~= nil and not resetChanged and not inPit
     and not debounced and state.prevSpline > 0.85 and spline < 0.15 then
     state.prevSpline = spline
+    state.prevSector = player and player.currentSector
     restartPlaybackForLap(count, nowS, 1, 'sf-crossing')
     return
+  end
+
+  -- Per-sector ghost reset: when entering a new track sector (e.g. S1 -> S2,
+  -- S2 -> S3), snap the ghost right ahead of the player (+leadS) so the player
+  -- always gets a fresh visual reference in every sector.
+  local sector = player and player.currentSector
+  if type(sector) == 'number' and sector == sector then
+    if state.prevSector ~= nil and sector ~= state.prevSector then
+      local sectorDebounced = (nowS - state.lastSectorSyncWallS) < 2.0
+      if syncSectorsEnabled() and state.playerLaunched and not resetChanged
+        and not inPit and not debounced and not sectorDebounced and sector > 0 then
+        local baseT = lookupGhostTimeBySpline(spline)
+        if baseT == nil then
+          local nearestT, distM = findNearestTimelineTime(state.playerX, state.playerY, state.playerZ)
+          if nearestT and distM <= NEAREST_MAX_DIST_M then
+            baseT = nearestT
+          end
+        end
+        if baseT ~= nil then
+          local offsetS = currentStartOffsetS()
+          local leadS = currentLeadS()
+          local target = (baseT + offsetS + leadS) % runtimeDurationS
+          state.runtimeTime = target
+          state.runtimeCursor = 1
+          state.prevPose = nil
+          state.smooth.resets = state.smooth.resets + 1
+          state.lapRestarts = state.lapRestarts + 1
+          state.lastSectorSyncWallS = nowS
+          appendLog(string.format(
+            'LAPSYNC sector playerSector=%d prevSector=%d wallS=%s cursorS=%.3f leadS=%.2f reason=sector-change',
+            sector, state.prevSector, fmtNumber(nowS), target, leadS))
+        end
+      end
+    end
+    state.prevSector = sector
   end
 
   state.prevSpline = spline
@@ -1867,10 +1994,126 @@ local function writeSmooth()
   state.smooth.resets = 0
 end
 
+local function buildGhostDeltaTable()
+  state.deltaTableBuilt = true
+  state.deltaTable = nil
+  local count = (runtime and runtime.frames) and #runtime.frames or 0
+  if count < 10 or runtimeDurationS <= 0 then return end
+  if type(ac.worldCoordinateToTrackProgress) ~= 'function' then return end
+
+  -- Sample up to ~2000 points around the ghost lap into AC's exact
+  -- NormalizedSplinePosition space (same space as player.splinePosition).
+  local step = math.max(1, math.floor(count / 2000))
+  local raw = {}
+  local minS, minIdx = 2.0, 1
+  for i = 1, count, step do
+    local fr = runtime.frames[i]
+    local p = fr.positionM
+    local ok, s = pcall(ac.worldCoordinateToTrackProgress, vec3(p[1], p[2], p[3]))
+    if not ok or type(s) ~= 'number' or s < 0 or s ~= s then
+      return
+    end
+    local idx = #raw + 1
+    raw[idx] = { s = s, t = fr.timeS }
+    if s < minS then
+      minS = s
+      minIdx = idx
+    end
+  end
+  local nRaw = #raw
+  if nRaw < 10 then return end
+
+  -- Rotate so table starts right after S/F (minS -> 0.0) and enforce strict
+  -- monotonicity in spline progress, matching Sidekick's delta harvesting.
+  local pos = { 0.0 }
+  local tim = { 0.0 }
+  local t0 = raw[minIdx].t
+  local prevS = 0.0
+  local prevT = 0.0
+  for k = 0, nRaw - 1 do
+    local item = raw[((minIdx - 1 + k) % nRaw) + 1]
+    local relT = (item.t - t0) % runtimeDurationS
+    if item.s > prevS + 1e-6 and item.s < 0.9999 and relT >= prevT then
+      pos[#pos + 1] = item.s
+      tim[#tim + 1] = relT
+      prevS = item.s
+      prevT = relT
+    end
+  end
+  pos[#pos + 1] = 1.0
+  tim[#tim + 1] = runtimeDurationS
+  if #pos < 10 then return end
+  state.deltaTable = { pos = pos, tim = tim, count = #pos }
+end
+
+local function updateGhostDelta(player, step)
+  if not state.deltaTableBuilt then
+    buildGhostDeltaTable()
+  end
+  local tbl = state.deltaTable
+  if not tbl or not player then
+    state.deltaS = nil
+    state.deltaEstLapS = nil
+    state.deltaTrend = 0
+    return
+  end
+
+  local lapMs = player.lapTimeMs
+  local s = player.splinePosition
+  local inPit = player.isInPit or player.isInPitlane
+  if inPit or state.holdingForLaunch
+    or type(lapMs) ~= 'number' or lapMs <= 1500
+    or type(s) ~= 'number' or s ~= s or s <= 0.003 or s >= 0.997
+    or (lapMs * 0.001) > (runtimeDurationS * 2.5) then
+    state.deltaS = nil
+    state.deltaEstLapS = nil
+    state.deltaTrend = 0
+    state.deltaPrev1 = nil
+    state.deltaPrev2 = nil
+    state.deltaTrendAccum = 0
+    return
+  end
+
+  -- Sidekick (Erwin Schmidt) bisect_right + linear interpolation on spline progress.
+  local pos = tbl.pos
+  local tim = tbl.tim
+  local lo, hi = 1, tbl.count
+  while lo < hi do
+    local mid = math.floor((lo + hi) * 0.5)
+    if pos[mid] <= s then
+      lo = mid + 1
+    else
+      hi = mid
+    end
+  end
+  local i = math.max(1, math.min(tbl.count - 1, lo - 1))
+  local ds = pos[i + 1] - pos[i]
+  local slope = ds > 1e-9 and ((tim[i + 1] - tim[i]) / ds) or 0
+  local ghostTimeAtPos = tim[i] + slope * (s - pos[i])
+  local delta = (lapMs * 0.001) - ghostTimeAtPos
+
+  state.deltaS = delta
+  state.deltaEstLapS = math.max(0, runtimeDurationS + delta)
+
+  -- Sidekick trend indicator (`ttb = 2*t - prevt - prevt2`), sampled at 5 Hz.
+  state.deltaTrendAccum = state.deltaTrendAccum + (step or 0)
+  if state.deltaTrendAccum >= 0.2 then
+    state.deltaTrendAccum = 0
+    if state.deltaPrev2 ~= nil and state.deltaPrev1 ~= nil then
+      state.deltaTrend = 2.0 * delta - state.deltaPrev1 - state.deltaPrev2
+    end
+    state.deltaPrev2 = state.deltaPrev1
+    state.deltaPrev1 = delta
+  end
+end
+
 local function updateGhost(dt)
   local player = ac.getCar(0)
   if not player then return end
   if not initialize() then return end
+  if runtime and not state.deltaTableBuilt then
+    buildGhostDeltaTable()
+  end
 
   local playerPosition = player.position
   state.playerX, state.playerY, state.playerZ =
@@ -1911,6 +2154,8 @@ local function updateGhost(dt)
     local x, y, z, yaw, speed, pitch = sampleRuntimeFrame(state.runtimeTime)
     applyPose(x, y, z, yaw, pitch)
     updateWheels(state.steerRad, speed, advanceStep)
+    refreshGhostOpacity(false)
+    updateGhostDelta(player, step)
     state.smooth.frames = state.smooth.frames + 1
   else
     -- Fallback: keep a second car visible 5 m to the side of the player so the
@@ -1926,6 +2171,7 @@ local function updateGhost(dt)
     end
     state.ghostX, state.ghostY, state.ghostZ = x, y, z
     updateWheels(math.sin(timeS * 0.5) * 0.25, 0, 0)
+    refreshGhostOpacity(false)
   end
 
   state.logAccum = state.logAccum + step
@@ -1977,7 +2223,64 @@ local function toggleLapSync()
     syncLapsEnabled() and 1 or 0, fmtNumber(nowS), state.runtimeTime))
 end
 
+local function formatLapTimeS(seconds)
+  if type(seconds) ~= 'number' or seconds ~= seconds or seconds <= 0 then
+    return '-:--.---'
+  end
+  local mins = math.floor(seconds / 60)
+  local rem = seconds - mins * 60
+  return string.format('%d:%06.3f', mins, rem)
+end
+
+local function drawTranslucentPanelBg()
+  if type(ui.drawRectFilled) == 'function' and type(ui.windowSize) == 'function' then
+    local sz = ui.windowSize()
+    ui.drawRectFilled(vec2(0, 0), sz, rgbm(0.05, 0.06, 0.08, 0.48), 6)
+    if type(ui.drawRect) == 'function' then
+      ui.drawRect(vec2(0, 0), sz, rgbm(1.0, 1.0, 1.0, 0.10), 6, nil, 1)
+    end
+  end
+end
+
+local function drawGhostDeltaRow()
+  local d = state.deltaS
+  local colorNeutral = rgbm(0.86, 0.86, 0.86, 1.0)
+  local colorFast = rgbm(0.17, 1.0, 0.20, 1.0)
+  local colorSlow = rgbm(1.0, 0.22, 0.12, 1.0)
+  local text
+  local col = colorNeutral
+  if type(d) == 'number' and d == d then
+    local dStr
+    if math.abs(d) >= 10.0 then
+      dStr = string.format('%+.1f', d)
+    else
+      dStr = string.format('%+.2f', d)
+    end
+    local trendTag = ''
+    if state.deltaTrend < -0.003 then
+      trendTag = ' [GAIN]'
+    elseif state.deltaTrend > 0.003 then
+      trendTag = ' [LOSS]'
+    end
+    text = string.format('Delta vs Ghost: %ss%s  (Est %s)',
+      dStr, trendTag, formatLapTimeS(state.deltaEstLapS))
+    if d < -0.005 then
+      col = colorFast
+    elseif d > 0.005 then
+      col = colorSlow
+    end
+  else
+    text = string.format('Delta vs Ghost: -.--  (Ref %s)', formatLapTimeS(runtimeDurationS))
+  end
+  if type(ui.textColored) == 'function' then
+    ui.textColored(text, col)
+  else
+    ui.text(text)
+  end
+end
+
 function script.windowMain(dt)
+  drawTranslucentPanelBg()
   if instance.role == 'standby' then
     ui.text('GhostCarGenerator Hotlap: STANDBY (another writer active)')
     ui.text('instance '..tostring(instance.id)..' - no node, no rows')
@@ -1996,6 +2299,7 @@ function script.windowMain(dt)
         or (state.holdingForLaunch and ' (READY)' or '')
       ui.text(string.format('Lap %.2f / %.2f s   Dist %.1f m%s',
         state.runtimeTime, runtimeDurationS, distM, tag))
+      drawGhostDeltaRow()
     else
       ui.text(string.format('Fallback 5 m follow   Dist %.1f m', distM))
     end
@@ -2022,7 +2326,7 @@ function script.windowMain(dt)
         currentAlpha(), 0.05, 1.0, 'Opacity: %.2f')
       if changed then
         settings.alpha = clamp01(newAlpha)
-        updateGhostAlpha(settings.alpha)
+        refreshGhostOpacity(true)
       end
     else
       ui.text(string.format('alpha %.2f mode %s  meshes %d  sync %s',
@@ -2055,7 +2359,9 @@ function script.shutdown()
 end
 
 function script.windowSettings(dt)
+  drawTranslucentPanelBg()
   ui.text('GhostCarGenerator Hotlap '..APP_VERSION)
+  drawGhostDeltaRow()
   ui.text(string.format('status: %s / %s  (%d ext, %d int hidden)',
     tostring(state.status), tostring(state.mode or '-'),
     math.max(0, state.materialMeshes - state.interiorMeshes), state.interiorMeshes))
@@ -2072,6 +2378,15 @@ function script.windowSettings(dt)
     if ui.checkbox('Sync ghost to my laps', syncLapsEnabled()) then
       toggleLapSync()
     end
+    local syncSec = syncSectorsEnabled()
+    if ui.checkbox('Sync ghost at every sector', syncSec) then
+      settings.syncSectors = not syncSec
+    end
+    local fade = distanceFadeEnabled()
+    if ui.checkbox('Near-distance fade (4.5-18m)', fade) then
+      settings.distanceFade = not fade
+      refreshGhostOpacity(true)
+    end
     local cross = debugCrossEnabled()
     if ui.checkbox('Show debug cross', cross) then
       settings.debugCross = not cross
@@ -2083,7 +2398,7 @@ function script.windowSettings(dt)
       currentAlpha(), 0.05, 1.0, 'Opacity: %.2f')
     if alphaChanged then
       settings.alpha = clamp01(newAlpha)
-      updateGhostAlpha(settings.alpha)
+      refreshGhostOpacity(true)
     end
     local newLead, leadChanged = ui.slider('##ghost_lead',
       currentLeadS(), 0.0, 3.0, 'Ghost lead: %.2f s')
@@ -2111,13 +2426,16 @@ function script.windowSettings(dt)
     if ui.button('Reset defaults') then
       settings.visible = true
       settings.syncLaps = true
+      settings.syncSectors = true
       settings.alpha = GHOST_ALPHA
+      settings.distanceFade = true
       settings.leadS = GHOST_DEFAULT_LEAD_S
       settings.heightOffsetM = 0.0
       settings.startOffsetS = GHOST_START_OFFSET_S
       settings.debugCross = false
+      state.fadeHidden = false
       applyGhostVisibility(true)
-      updateGhostAlpha(GHOST_ALPHA)
+      refreshGhostOpacity(true)
     end
     if type(ui.sameLine) == 'function' then ui.sameLine(0, 8) end
     if ui.button('Copy log path') then
