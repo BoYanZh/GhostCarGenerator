@@ -289,10 +289,22 @@ render = {{
 }}
 
 local uiTexts = {{}}
+local barFillColors = {{}}
 ui = {{
+  Alignment = {{ Center = 1 }},
   windowSize = function() return vec2(400, 300) end,
-  drawRectFilled = function() end,
+  availableSpaceX = function() return 300 end,
+  getCursor = function() return vec2(0, 0) end,
+  drawRectFilled = function(p1, p2, col)
+    -- Record interior bar fill colors (height <= 10, not background rect).
+    if col and (p2.y - p1.y) <= 10 and (p2.y - p1.y) >= 4 then
+      barFillColors[#barFillColors + 1] = col
+    end
+  end,
   drawRect = function() end,
+  drawLine = function() end,
+  dummy = function() end,
+  dwriteTextAligned = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
   text = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
   textColored = function(t, _) uiTexts[#uiTexts + 1] = tostring(t) end,
   checkbox = function(_, _) return false end,
@@ -315,21 +327,23 @@ for step = 1, 50 do
 end
 
 -- 2. Launch car and advance across Sector 0 -> Sector 1 -> Sector 2 (>2s apart).
+-- Keep lapTimeMs < 2.5 * runtimeDurationS (4.5s) while losing ~0.35 s/s vs ghost.
 car0.speedKmh = 95.0
-for step = 1, 70 do
+for step = 1, 55 do
   sim.gameTime = sim.gameTime + 0.1
   sim.dt = 0.1
-  car0.lapTimeMs = 1600 + step * 100
-  car0.splinePosition = 0.05 + step * 0.012
+  car0.lapTimeMs = 1600 + step * 50
+  car0.splinePosition = 0.05 + step * 0.008
   if step == 20 then car0.currentSector = 1 end
-  if step == 50 then car0.currentSector = 2 end
+  if step == 45 then car0.currentSector = 2 end
   local theta = car0.splinePosition * 2 * math.pi
   car0.position = makeVec3(50 * math.cos(theta), 0, 50 * math.sin(theta))
   script.update(0.1)
 end
 
--- 3. Render both UI windows (verifies translucent bg + delta-t formatting).
+-- 3. Render both UI windows (verifies translucent bg + delta-t formatting + red bar color when losing).
 uiTexts = {{}}
+barFillColors = {{}}
 script.windowMain(0.016)
 script.windowSettings(0.016)
 
@@ -341,6 +355,11 @@ for _, line in ipairs(uiTexts) do
   assert(not line:find('ERROR:', 1, true), 'UI reported error: ' .. line)
 end
 assert(foundDelta, 'Delta vs Ghost row missing from UI output')
+-- In step 2, player lapTimeMs grew faster than ghost spline (losing time -> bar must turn vivid red, r > 0.85, g < 0.30).
+assert(#barFillColors >= 1, 'Expected Delta Bar fill rect to be drawn')
+local lastBarCol = barFillColors[#barFillColors]
+assert(lastBarCol.r > 0.85 and lastBarCol.g < 0.30,
+  string.format('Expected red Delta Bar when losing time, got rgb=(%.2f,%.2f,%.2f)', lastBarCol.r, lastBarCol.g, lastBarCol.b))
 
 script.shutdown()
 print('HEADLESS_SMOKE_OK')
