@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.16'
+local APP_VERSION = '0.17'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -2315,12 +2315,12 @@ local function drawGhostDeltaRow()
   local text
   local col = rgbm(0.88, 0.90, 0.92, 1.0)
   if type(d) == 'number' and d == d then
-    local dStr = math.abs(d) >= 10.0 and string.format('%+.1f', d) or string.format('%+.2f', d)
+    local dStr = string.format('%+.3f', d)
     text = string.format('Delta vs Ghost: %ss  (Est %s)',
       dStr, formatLapTimeS(state.deltaEstLapS))
     col = iRacingDeltaColor(d, 0.15, 0.88, 0.90, 0.92)
   else
-    text = string.format('Delta vs Ghost: -.--  (Ref %s)', formatLapTimeS(runtimeDurationS))
+    text = string.format('Delta vs Ghost: --.---  (Ref %s)', formatLapTimeS(runtimeDurationS))
   end
   if type(ui.textColored) == 'function' then
     ui.textColored(text, col)
@@ -2331,11 +2331,11 @@ end
 
 local function drawGhostDeltaHero(distM)
   local d = state.deltaS
-  local bigStr = '--.--'
+  local bigStr = '--.---'
   local col = rgbm(0.88, 0.90, 0.92, 1.0)
   local subStr
   if type(d) == 'number' and d == d then
-    bigStr = math.abs(d) >= 10.0 and string.format('%+.1fs', d) or string.format('%+.2fs', d)
+    bigStr = string.format('%+.3fs', d)
     col = iRacingDeltaColor(d, 0.15, 0.88, 0.90, 0.92)
     subStr = string.format('Est %s   Ref %s   %.1fm',
       formatLapTimeS(state.deltaEstLapS), formatLapTimeS(runtimeDurationS), distM or 0)
@@ -2409,6 +2409,7 @@ end
 function script.windowSettings(dt)
   drawTranslucentPanelBg()
   ui.text('GhostCarGenerator Hotlap '..APP_VERSION)
+  drawGhostDeltaBar()
   drawGhostDeltaRow()
   ui.text(string.format('status: %s / %s  (%d ext, %d int hidden)',
     tostring(state.status), tostring(state.mode or '-'),
