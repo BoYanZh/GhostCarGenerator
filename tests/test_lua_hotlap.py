@@ -264,6 +264,8 @@ ac = {{
   end,
   getSim = function() return sim end,
   getCar = function(i) return i == 0 and car0 or nil end,
+  getTrackID = function() return 'synth_track' end,
+  getTrackLayout = function() return 'loop' end,
   findNodes = function(_) return makeNode('carsRoot') end,
   getCameraPosition = function() return makeVec3(50, 2, -5) end,
   isVisibleInMainCamera = function() return true end,
@@ -388,3 +390,116 @@ print('HEADLESS_SMOKE_OK')
     assert "INIT ok app=" in log_text
     assert "LAPSYNC sector playerSector=1 prevSector=0" in log_text
     assert "LAPSYNC sector playerSector=2 prevSector=1" in log_text
+
+
+@pytest.mark.skipif(_find_lua() is None, reason="lua interpreter not installed")
+def test_lua_idle_on_track_mismatch(tmp_path: Path):
+    """Ensure ghostcar_hotlap stays completely idle and never loads KN5 on a different track."""
+    lua = _find_lua()
+    assert lua is not None
+
+    frames = [
+        {
+            "timeS": round(i * 0.015, 6),
+            "positionM": [float(i), 0.0, float(i)],
+            "rotationRad": [0.0, 0.0, 0.0],
+            "steerAngleDeg": 0.0,
+            "velocityMS": [0.0, 0.0, 20.0],
+        }
+        for i in range(40)
+    ]
+    (tmp_path / "ghost-runtime-v1.json").write_text(
+        json.dumps(
+            {
+                "schema": "ghost-runtime-v1",
+                "carId": "ig_toyota_gr86_premium",
+                "trackId": "thunderhill_raceway_park/threemilebypass",
+                "frameIntervalS": 0.015,
+                "lapTimeS": 0.6,
+                "frames": frames,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    harness = tmp_path / "harness_mismatch.lua"
+    harness.write_text(
+        f"""
+__dirname = {json.dumps(str(tmp_path))}
+script = {{}}
+math.saturate = math.saturate or function(x) return math.max(0, math.min(1, x)) end
+math.atan2 = math.atan2 or math.atan
+function vec2(x, y) return {{ x = x or 0, y = y or 0 }} end
+function vec3(x, y, z) return {{ x = x or 0, y = y or 0, z = z or 0 }} end
+function rgbm(r, g, b, m) return {{ r = r or 0, g = g or 0, b = b or 0, mult = m or 1 }} end
+json = {{}}
+function json.decode(text)
+  local lua_src = text:gsub('%[', '{{'):gsub('%]', '}}'):gsub('"([^"]+)"%s*:', '["%1"]=')
+  return assert(load('return ' .. lua_src))()
+end
+function io.fileExists(p) local f = io.open(p, 'r'); if f then f:close(); return true end; return false end
+function io.load(p, fb) local f = io.open(p, 'r'); if not f then return fb end; local d = f:read('*a'); f:close(); return d end
+function io.save(p, c) local f = io.open(p, 'w'); if not f then return false end; f:write(c); f:close(); return true end
+function io.createDir(_) return true end
+
+local store = {{}}
+local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local kn5Loaded = false
+ac = {{
+  FolderID = {{ Root = 1, Logs = 2, ContentCars = 4 }},
+  getFolder = function(id)
+    if id == 2 then return {json.dumps(str(tmp_path / "logs"))} end
+    return {json.dumps(str(tmp_path))}
+  end,
+  getSim = function() return sim end,
+  getCar = function(i) return i == 0 and car0 or nil end,
+  getTrackID = function() return 'monza' end,
+  getTrackLayout = function() return '' end,
+  findNodes = function(_)
+    return {{
+      createBoundingSphereNode = function() kn5Loaded = true; error('should not create ghost node on wrong track') end,
+    }}
+  end,
+  store = function(k, v) store[k] = v end,
+  load = function(k) return store[k] end,
+  storage = function(d, _) return d end,
+  warn = function(_) end,
+  log = function(_) end,
+}}
+render = {{ on = function() return {{ dispose = function() end }} end }}
+local uiTexts = {{}}
+ui = {{
+  windowSize = function() return vec2(320, 100) end,
+  drawRectFilled = function() end,
+  drawRect = function() end,
+  text = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
+}}
+
+dofile({json.dumps(str(LUA_SCRIPT))})
+for _ = 1, 45 do
+  sim.gameTime = sim.gameTime + 0.02
+  script.update(0.02)
+end
+script.windowMain(0.02)
+assert(not kn5Loaded, 'Ghost node/KN5 must not be loaded on a non-matching track')
+local sawIdle = false
+for _, line in ipairs(uiTexts) do
+  if line:find('IDLE (wrong track)', 1, true) then sawIdle = true end
+end
+assert(sawIdle, 'Expected IDLE (wrong track) in windowMain UI')
+script.shutdown()
+print('MISMATCH_IDLE_OK')
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run([lua, str(harness)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Track mismatch test failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "MISMATCH_IDLE_OK" in proc.stdout
+    log_text = (tmp_path / "logs" / "ghostcar_hotlap_verify.log").read_text(encoding="utf-8")
+    assert "IDLE track-mismatch" in log_text
+    assert "ACTIVE mode=" not in log_text
+    assert "ERROR " not in log_text

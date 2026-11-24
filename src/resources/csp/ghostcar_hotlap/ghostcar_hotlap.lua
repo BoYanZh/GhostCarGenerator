@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.17'
+local APP_VERSION = '0.18'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -435,6 +435,7 @@ local MAX_INIT_FAILURES = 15
 local runtime = nil
 local runtimeDurationS = 0
 local runtimeSmoothedTag = 'none'
+local runtimeTrackMismatch = nil
 local renderSubscription = nil
 
 -- ---------------------------------------------------------------------------
@@ -456,11 +457,75 @@ local function isVector3(value)
     and type(value[2]) == 'number' and type(value[3]) == 'number'
 end
 
+local function trimLower(value)
+  if type(value) ~= 'string' then return '' end
+  return (value:gsub('^%s+', ''):gsub('%s+$', ''):lower())
+end
+
+local function getCurrentTrackAndLayout()
+  local curTrack, curLayout = '', ''
+  if type(ac.getTrackID) == 'function' then
+    local ok, t = pcall(ac.getTrackID)
+    if ok and type(t) == 'string' then curTrack = trimLower(t) end
+  end
+  if type(ac.getTrackLayout) == 'function' then
+    local ok, l = pcall(ac.getTrackLayout)
+    if ok and type(l) == 'string' then curLayout = trimLower(l) end
+  end
+  local combined = curTrack
+  if curTrack ~= '' and curLayout ~= '' then
+    combined = curTrack..'/'..curLayout
+  end
+  return curTrack, curLayout, combined
+end
+
+local function trackMatchesRuntime(expectedTrackId)
+  local curTrack, curLayout, curCombined = getCurrentTrackAndLayout()
+  if curTrack == '' then
+    return true, 'unknown'
+  end
+  local expRaw = trimLower(expectedTrackId)
+  if expRaw == '' then
+    return false, curCombined
+  end
+  local expTrack, expLayout = expRaw:match('^([^/]+)/(.+)$')
+  if not expTrack then
+    expTrack, expLayout = expRaw, ''
+  end
+  if curTrack ~= expTrack then
+    return false, curCombined
+  end
+  if expLayout ~= '' and curLayout ~= '' and curLayout ~= expLayout then
+    return false, curCombined
+  end
+  return true, curCombined
+end
+
+local function resolveRuntimePath()
+  local curTrack, curLayout = getCurrentTrackAndLayout()
+  local candidates = {}
+  if curTrack ~= '' and curLayout ~= '' then
+    candidates[#candidates + 1] = __dirname..'/tracks/'..curTrack..'/'..curLayout..'/ghost-runtime-v1.json'
+  end
+  if curTrack ~= '' then
+    candidates[#candidates + 1] = __dirname..'/tracks/'..curTrack..'/ghost-runtime-v1.json'
+  end
+  candidates[#candidates + 1] = RUNTIME_FILENAME
+  for _, path in ipairs(candidates) do
+    if io.fileExists(path) then
+      return path
+    end
+  end
+  return nil
+end
+
 local function loadRuntime()
-  if not io.fileExists(RUNTIME_FILENAME) then
+  runtimeTrackMismatch = nil
+  local path = resolveRuntimePath()
+  if not path then
     return nil, 'missing-runtime'
   end
-  local text = io.load(RUNTIME_FILENAME)
+  local text = io.load(path)
   if not text or text == '' then
     return nil, 'runtime-unreadable'
   end
@@ -484,6 +549,14 @@ local function loadRuntime()
   end
   if type(last.timeS) ~= 'number' or last.timeS <= 0 then
     return nil, 'runtime-duration-invalid'
+  end
+  local matched, curCombined = trackMatchesRuntime(decoded.trackId)
+  if not matched then
+    runtimeTrackMismatch = {
+      current = curCombined,
+      expected = tostring(decoded.trackId or 'unknown'),
+    }
+    return nil, 'track-mismatch'
   end
   return decoded, nil
 end
@@ -597,6 +670,11 @@ local function announceInit()
       tostring(runtime.carId), tostring(runtime.trackId), tostring(LOG_PATH),
       currentAlpha(), syncLapsEnabled() and 1 or 0, currentStartOffsetS(),
       tostring(runtimeSmoothedTag)))
+  elseif runtimeTrackMismatch then
+    appendLog(string.format(
+      'IDLE track-mismatch app=%s current=%s expected=%s log=%s',
+      APP_VERSION, sanitizeToken(runtimeTrackMismatch.current),
+      sanitizeToken(runtimeTrackMismatch.expected), tostring(LOG_PATH)))
   else
     appendLog(string.format(
       'INIT %s app=%s fallback=5m-follow player log=%s alpha=%.3f syncLaps=%d syncOffsetS=%.3f',
@@ -1370,6 +1448,10 @@ local function collectWheels(model)
 end
 
 local function initialize()
+  if runtimeTrackMismatch then
+    state.status = 'IDLE'
+    return false
+  end
   if state.failed then return false end
   if state.root then return true end
   if state.clock < state.nextInitAttemptAt then return false end
@@ -2381,6 +2463,10 @@ function script.windowMain(dt)
     else
       ui.text(string.format('Ghost Fallback (5m)   Dist %.1fm', distM))
     end
+  elseif state.status == 'IDLE' and runtimeTrackMismatch then
+    ui.text('GhostCarGenerator: IDLE (wrong track)')
+    ui.text('Track: '..tostring(runtimeTrackMismatch.current))
+    ui.text('Ghost: '..tostring(runtimeTrackMismatch.expected))
   elseif state.status == 'ERROR' then
     ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
   else
