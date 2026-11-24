@@ -31,6 +31,10 @@ from .ld_replay import (
 )
 from .motec import extract_motec_points, parse_channel_overrides
 from .replay_writer import _estimate_wheel_position_offsets
+from .runtime_ghost import (
+    export_runtime_ghost_from_acreplay,
+    export_runtime_ghost_from_ld,
+)
 
 
 def _csv_values(text: str, converter: Callable[[str], Any]) -> List[Any]:
@@ -1249,6 +1253,73 @@ def _handle_replay_offset_track(args: argparse.Namespace) -> None:
     )
 
 
+def _handle_replay_export_runtime(args: argparse.Namespace) -> None:
+    input_path = Path(args.input).expanduser()
+    output_path = Path(args.output).expanduser()
+    is_ld = input_path.suffix.lower() == ".ld"
+    if is_ld:
+        if not args.gps_track:
+            raise ValueError("--gps-track is required when exporting from a MoTeC .ld file")
+        result = export_runtime_ghost_from_ld(
+            input_path,
+            output_path,
+            gps_track_path=args.gps_track,
+            car_id=args.car_id or "ig_toyota_gr86_premium",
+            track_id=args.track_id,
+            lap=args.lap,
+            channel_overrides=parse_channel_overrides(args.channel),
+            height_mode=args.height_mode,
+            height_offset_m=args.height_offset_m,
+            track_surface_paths=args.track_surface,
+            position_smoothing_s=args.position_smoothing_s,
+            yaw_smoothing_s=args.yaw_smoothing_s,
+            fit_pavement=not args.no_fit_pavement,
+            pavement_search_radius_m=args.pavement_search_radius_m,
+            align_start_line=True if args.align_start_line is None else args.align_start_line,
+            smooth=True if args.smooth is None else args.smooth,
+        )
+        print(
+            "Exported LD lap {selectedLap} ({lapTimeS:.3f}s, {frameCount} frames) -> {output}".format(
+                **result
+            )
+        )
+        if result["pavementFit"] is not None:
+            pf = result["pavementFit"]
+            off = pf["pavementOffsetAcM"]
+            print(
+                "Pavement fit: dx={x:+.2f}m, dz={z:+.2f}m, on-road {before:.1%} -> {after:.1%}".format(
+                    x=off["x"],
+                    z=off["z"],
+                    before=pf["pavementOnRoadBefore"],
+                    after=pf["pavementOnRoadAfter"],
+                )
+            )
+        if result["onPavementPct"] is not None:
+            print(
+                "Height: {heightMode} (offset {heightOffsetM:+.4f}m), final on-pavement {onPavementPct:.2f}%".format(
+                    **result
+                )
+            )
+    else:
+        result = export_runtime_ghost_from_acreplay(
+            input_path,
+            output_path,
+            car_index=args.car,
+            car_id=args.car_id,
+            track_id=args.track_id,
+            height_offset_m=0.0 if args.height_offset_m is None else args.height_offset_m,
+            gps_track_path=args.gps_track,
+            align_start_line=False if args.align_start_line is None else args.align_start_line,
+            smooth=False if args.smooth is None else args.smooth,
+            lap_time_s=args.lap_time_s,
+        )
+        print(
+            "Exported acreplay car {car} ({carId} @ {trackId}, {lapTimeS:.3f}s, {frameCount} frames) -> {output}".format(
+                car=args.car, **result
+            )
+        )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ghost-car",
@@ -1535,6 +1606,109 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override an LD channel; repeat for multiple roles",
     )
     replay_convert.set_defaults(handler=_handle_replay_convert)
+
+    replay_export_runtime = replay_commands.add_parser(
+        "export-runtime",
+        help="Export a CSP Lua ghost-runtime-v1.json from a MoTeC .ld or AC .acreplay",
+    )
+    replay_export_runtime.add_argument(
+        "input", help="Input MoTeC .ld or Assetto Corsa .acreplay path"
+    )
+    replay_export_runtime.add_argument(
+        "-o", "--output", required=True, help="Output ghost-runtime-v1.json path"
+    )
+    replay_export_runtime.add_argument(
+        "--gps-track",
+        help=(
+            "Calibrated track.json, track package dir, or builtin:<path> "
+            "(required for .ld; optional for .acreplay start-line alignment)"
+        ),
+    )
+    replay_export_runtime.add_argument(
+        "--car",
+        type=int,
+        default=0,
+        help="Zero-based car index when input is .acreplay (default: 0)",
+    )
+    replay_export_runtime.add_argument(
+        "--car-id",
+        help="Override AC carId metadata (default: ig_toyota_gr86_premium for .ld, replay carID for .acreplay)",
+    )
+    replay_export_runtime.add_argument(
+        "--track-id",
+        help="Override AC trackId metadata",
+    )
+    replay_export_runtime.add_argument(
+        "--lap",
+        type=int,
+        help="Specific numbered LD lap; defaults to fastest",
+    )
+    replay_export_runtime.add_argument(
+        "--height-mode",
+        choices=("auto", "kn5", "track", "gps-offset", "gps"),
+        default="auto",
+        help="Vertical mapping for .ld input (default: kn5 when surfaces exist, else track)",
+    )
+    replay_export_runtime.add_argument(
+        "--track-surface",
+        action="append",
+        help="KN5-derived .gcsurface override; repeat for road and terrain",
+    )
+    replay_export_runtime.add_argument(
+        "--height-offset-m",
+        type=float,
+        default=None,
+        help="Vertical body offset in metres (default: -0.4645 for kn5, 0.0 otherwise)",
+    )
+    replay_export_runtime.add_argument(
+        "--no-fit-pavement",
+        action="store_true",
+        help="Disable global 2D GPS-to-pavement translation optimization (.ld mode)",
+    )
+    replay_export_runtime.add_argument(
+        "--pavement-search-radius-m",
+        type=float,
+        default=8.0,
+        help="Search radius in metres for global pavement offset optimization (default: 8.0)",
+    )
+    replay_export_runtime.add_argument(
+        "--align-start-line",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Circularly align frame 0 to track startLineAc (default: enabled for .ld, disabled for .acreplay)",
+    )
+    replay_export_runtime.add_argument(
+        "--smooth",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply zero-phase periodic Savitzky-Golay smoothing (default: enabled for .ld, disabled for .acreplay)",
+    )
+    replay_export_runtime.add_argument(
+        "--position-smoothing-s",
+        type=float,
+        default=0.75,
+        help="Pre-projection GPS X/Z smoothing window in seconds (.ld mode, default: 0.75)",
+    )
+    replay_export_runtime.add_argument(
+        "--yaw-smoothing-s",
+        type=float,
+        default=0.35,
+        help="Body yaw smoothing window in seconds (.ld mode, default: 0.35)",
+    )
+    replay_export_runtime.add_argument(
+        "--lap-time-s",
+        type=float,
+        default=None,
+        help="Explicit lap time in seconds (.acreplay mode override)",
+    )
+    replay_export_runtime.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="ROLE=NAME",
+        help="Override an LD channel; repeat for multiple roles",
+    )
+    replay_export_runtime.set_defaults(handler=_handle_replay_export_runtime)
 
     profile = commands.add_parser("profile", help="Manage reusable target profiles")
     profile_commands = profile.add_subparsers(dest="profile_command", required=True)

@@ -26,6 +26,28 @@ render passes / TAA motion vectors; `0` when paused).
   against the track's KN5 `road-pit.gcsurface` pavement mesh (boosting Saurabh's
   `2:07.321` Thunderhill lap from 91.9% to 96.6% centerline-on-pavement with
   zero speed or lap-time distortion).
+- **CLI exporter (`ghost-car replay export-runtime`)** now exports
+  `ghost-runtime-v1.json` directly from either a MoTeC `.ld` (with
+  `--gps-track`, automatic `fit_pavement_offset()`, KN5 road grounding at
+  `-0.4645 m`, start/finish alignment, and periodic Savitzky-Golay smoothing)
+  or an Assetto Corsa `.acreplay`.
+
+### v0.9 in-game proof (2026-11-23, Thunderhill threemilebypass, GR86, Saurabh 2:07.321)
+
+- **Gates:** `INSTANCE writer`, `INIT ok app=0.9 schema=ghost-runtime-v1
+  frames=8489 durationS=127.321 carId=ig_toyota_gr86_premium
+  trackId=thunderhill_raceway_park/threemilebypass alpha=0.250 syncLaps=1
+  timeline=clean(p95=0.11)`, `GHOST alpha=0.250 mode=alpha meshes=317
+  hiddenInt=223 shader=ok transparent=ok blend=ok shadows=ok tint=ok unique=ok`,
+  `CLOCK sim.dt`, zero `ERROR`.
+- **2-lap driving proof:** `LAPSYNC ready` → `LAPSYNC launch` → Lap 1
+  `sf-crossing` (`wallS=176.3159`) → full lap → Lap 2 `sf-crossing`
+  (`wallS=310.2507`) → `PAUSED state=1 ghostT=67.737`. Every 5 s `SMOOTH`
+  window across 363 log rows held `driftS=±0.0000`, `renderHz == tickHz`
+  (100–135 Hz), `maxYawDeg 0.2–1.0`.
+- **Visual proof:** live chase-cam frames side-by-side with AC's native ghost
+  confirm the neutral silver-white translucent body (zero blue cast) tracking
+  cleanly inside the asphalt pavement through Turn 1 and Turn 2.
 - **v0.8** fixed all four real-drive feedback items from v0.7:
   1. **True high transparency**: switched ghost meshes (after `ensureUniqueMaterials()`)
      to `SHADER = ksPerPixel` (`useDetail=0`, `ksAlphaRef=0`, `sunSpecular=0`,
@@ -114,12 +136,20 @@ render passes / TAA motion vectors; `0` when paused).
    Copy-Item -Recurse -Force '<repo>\src\resources\csp\ghostcar_hotlap' "$ac\apps\lua\ghostcar_hotlap"
    ```
 
-2. The runtime timeline is **not** stored in this repo (2.2 MB generated data).
-   Copy the already generated file next to the app script:
+2. The runtime timeline is **not** stored in this repo (generated data).
+   Generate it directly with `ghost-car replay export-runtime` from a MoTeC
+   `.ld` lap (recommended, includes automatic KN5 pavement-offset fit, road
+   grounding, S/F alignment, and smoothing) or from an `.acreplay`:
 
    ```powershell
-   $src = "$ac\extension\lua\new-modes\ghostcargenerator-spike\ghost-runtime-v1.json"
-   Copy-Item -Force $src "$ac\apps\lua\ghostcar_hotlap\ghost-runtime-v1.json"
+   # From MoTeC .ld (Thunderhill East Bypass built-in track package):
+   uv run ghost-car replay export-runtime path\to\session.ld `
+     --gps-track builtin:assetto_corsa/thunderhill_raceway_park/threemilebypass `
+     -o "$ac\apps\lua\ghostcar_hotlap\ghost-runtime-v1.json"
+
+   # Or from an existing .acreplay:
+   uv run ghost-car replay export-runtime path\to\replay.acreplay `
+     -o "$ac\apps\lua\ghostcar_hotlap\ghost-runtime-v1.json"
    ```
 
    Expected source file: 2 220 695 bytes, `schema = ghost-runtime-v1`,
