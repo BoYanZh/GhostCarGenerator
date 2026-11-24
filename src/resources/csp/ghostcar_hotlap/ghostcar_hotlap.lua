@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.13'
+local APP_VERSION = '0.14'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -372,11 +372,13 @@ local state = {
   fadeScale = 1.0,
   fadeHidden = false,
   fadeDistM = nil,
-  -- Sidekick-style spline-interpolated delta vs ghost car.
+  -- Sidekick-style spline-interpolated delta vs ghost car + iRacing rate.
   deltaTable = nil,
   deltaTableBuilt = false,
   deltaS = nil,
   deltaEstLapS = nil,
+  deltaRateSps = 0,
+  deltaPrevRaw = nil,
   deltaTrend = 0,
   deltaPrev1 = nil,
   deltaPrev2 = nil,
@@ -2067,6 +2069,8 @@ local function updateGhostDelta(player, step)
     or (lapMs * 0.001) > (runtimeDurationS * 2.5) then
     state.deltaS = nil
     state.deltaEstLapS = nil
+    state.deltaRateSps = 0
+    state.deltaPrevRaw = nil
     state.deltaTrend = 0
     state.deltaPrev1 = nil
     state.deltaPrev2 = nil
@@ -2091,6 +2095,18 @@ local function updateGhostDelta(player, step)
   local slope = ds > 1e-9 and ((tim[i + 1] - tim[i]) / ds) or 0
   local ghostTimeAtPos = tim[i] + slope * (s - pos[i])
   local delta = (lapMs * 0.001) - ghostTimeAtPos
+
+  -- Smoothed instantaneous d(delta)/dt (s/s) for iRacing-style bar color.
+  if step and step > 0 then
+    if state.deltaPrevRaw ~= nil and math.abs(delta - state.deltaPrevRaw) < 2.0 then
+      local instRate = (delta - state.deltaPrevRaw) / math.max(0.005, step)
+      local alpha = math.min(1.0, step / 0.22)
+      state.deltaRateSps = state.deltaRateSps + (instRate - state.deltaRateSps) * alpha
+    else
+      state.deltaRateSps = 0
+    end
+  end
+  state.deltaPrevRaw = delta
 
   state.deltaS = delta
   state.deltaEstLapS = math.max(0, runtimeDurationS + delta)
@@ -2242,33 +2258,66 @@ local function drawTranslucentPanelBg()
   end
 end
 
+local function iRacingDeltaColor(value, span)
+  if type(value) ~= 'number' or value ~= value then
+    return rgbm(0.86, 0.88, 0.90, 1.0)
+  end
+  local n = math.max(-1.0, math.min(1.0, value / span))
+  local a = math.abs(n)
+  -- Neutral white-grey (0.86, 0.88, 0.90) -> vivid green (0.12, 0.96, 0.24) or vivid red (1.0, 0.20, 0.14)
+  if n < 0 then
+    return rgbm(0.86 + (0.12 - 0.86) * a, 0.88 + (0.96 - 0.88) * a, 0.90 + (0.24 - 0.90) * a, 1.0)
+  elseif n > 0 then
+    return rgbm(0.86 + (1.00 - 0.86) * a, 0.88 + (0.20 - 0.88) * a, 0.90 + (0.14 - 0.90) * a, 1.0)
+  end
+  return rgbm(0.86, 0.88, 0.90, 1.0)
+end
+
+local function drawGhostDeltaBar()
+  if type(ui.drawRectFilled) ~= 'function' or type(ui.getCursor) ~= 'function' then
+    return
+  end
+  local availW = (type(ui.availableSpaceX) == 'function' and math.max(180, ui.availableSpaceX())) or 280
+  local barW = math.max(140, availW - 12)
+  local barH = 11
+  local cur = ui.getCursor()
+  local barX = cur.x + (availW - barW) * 0.5
+  local barY = cur.y + 2
+  local midX = barX + barW * 0.5
+  ui.drawRectFilled(vec2(barX, barY), vec2(barX + barW, barY + barH), rgbm(0.10, 0.11, 0.14, 0.80), 3)
+  local d = state.deltaS
+  if type(d) == 'number' and d == d then
+    local norm = math.max(-1.0, math.min(1.0, -d / 1.5))
+    local fillW = math.abs(norm) * (barW * 0.5)
+    local barCol = iRacingDeltaColor(state.deltaRateSps or 0, 0.20)
+    if fillW >= 1 then
+      if norm >= 0 then
+        ui.drawRectFilled(vec2(midX, barY + 1), vec2(midX + fillW, barY + barH - 1), barCol, 2)
+      else
+        ui.drawRectFilled(vec2(midX - fillW, barY + 1), vec2(midX, barY + barH - 1), barCol, 2)
+      end
+    end
+  end
+  if type(ui.drawRect) == 'function' then
+    ui.drawRect(vec2(barX, barY), vec2(barX + barW, barY + barH), rgbm(1.0, 1.0, 1.0, 0.25), 3, nil, 1)
+  end
+  if type(ui.drawLine) == 'function' then
+    ui.drawLine(vec2(midX, barY - 1), vec2(midX, barY + barH + 1), rgbm(1.0, 1.0, 1.0, 0.85), 1.5)
+  end
+  if type(ui.dummy) == 'function' then
+    ui.dummy(vec2(availW, barH + 5))
+  end
+end
+
 local function drawGhostDeltaRow()
   local d = state.deltaS
-  local colorNeutral = rgbm(0.86, 0.86, 0.86, 1.0)
-  local colorFast = rgbm(0.17, 1.0, 0.20, 1.0)
-  local colorSlow = rgbm(1.0, 0.22, 0.12, 1.0)
   local text
-  local col = colorNeutral
+  local col = rgbm(0.86, 0.88, 0.90, 1.0)
   if type(d) == 'number' and d == d then
-    local dStr
-    if math.abs(d) >= 10.0 then
-      dStr = string.format('%+.1f', d)
-    else
-      dStr = string.format('%+.2f', d)
-    end
-    local trendTag = ''
-    if state.deltaTrend < -0.003 then
-      trendTag = ' [GAIN]'
-    elseif state.deltaTrend > 0.003 then
-      trendTag = ' [LOSS]'
-    end
-    text = string.format('Delta vs Ghost: %ss%s  (Est %s)',
-      dStr, trendTag, formatLapTimeS(state.deltaEstLapS))
-    if d < -0.005 then
-      col = colorFast
-    elseif d > 0.005 then
-      col = colorSlow
-    end
+    local dStr = math.abs(d) >= 10.0 and string.format('%+.1f', d) or string.format('%+.2f', d)
+    text = string.format('Delta vs Ghost: %ss  (Est %s)',
+      dStr, formatLapTimeS(state.deltaEstLapS))
+    col = iRacingDeltaColor(d, 0.50)
   else
     text = string.format('Delta vs Ghost: -.--  (Ref %s)', formatLapTimeS(runtimeDurationS))
   end
@@ -2293,6 +2342,7 @@ function script.windowMain(dt)
     local distM = dist3(state.ghostX, state.ghostY, state.ghostZ,
       state.playerX, state.playerY, state.playerZ)
     if runtime then
+      drawGhostDeltaBar()
       drawGhostDeltaRow()
       local tag = state.isPaused and '  PAUSED'
         or (state.holdingForLaunch and '  READY' or '')
