@@ -21,6 +21,7 @@ __all__ = [
     "align_replay_heights",
     "build_poses_from_xyz",
     "convert_ld_to_acreplay",
+    "fit_pavement_offset",
     "gps_track_to_ac",
     "offset_track_calibration",
     "rigid_fit_2d",
@@ -246,6 +247,107 @@ def gps_track_to_ac(points, track_ref):
     # The 4x4 matrix maps (e, n, u) to (x, y, z); the horizontal
     # rotation is rows 0 and 2, columns 0 and 1.
     return ac, rms, matrix[[0, 2], :2]
+
+
+def fit_pavement_offset(
+    positions_xyz,
+    road_surface,
+    reference_xyz,
+    *,
+    search_radius_m=8.0,
+    coarse_step_m=1.0,
+    fine_step_m=0.2,
+    car_half_width_m=0.85,
+    max_samples=550,
+):
+    """Find a global 2D AC-world (dx, dz) translation that maximizes pavement coverage.
+
+    Removes receiver/session-level constant GPS horizontal bias without warping
+    local racing lines, speeds, or lap time.  Scoring prioritizes centerline
+    hits on ``road_surface`` (e.g. ``road-pit.gcsurface``), then full car-width
+    hits (``±car_half_width_m``), with lower RMS to ``reference_xyz`` breaking
+    ties.  Returns ``(shifted_xyz, diagnostics)``.
+    """
+    positions = np.asarray(positions_xyz, dtype=np.float64)
+    reference = np.asarray(reference_xyz, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) < 3:
+        raise ValueError("Positions must be an Nx3 array with at least 3 points")
+    if reference.ndim != 2 or reference.shape[1] != 3 or len(reference) < 2:
+        raise ValueError("Reference path must be an Mx3 array with at least 2 points")
+
+    stride = max(1, len(positions) // int(max(1, max_samples)))
+    sample_pts = positions[::stride].copy()
+    ref_xz = reference[:, [0, 2]]
+
+    def _evaluate(dx, dz, pts_arr):
+        q = pts_arr.copy()
+        q[:, 0] += dx
+        q[:, 2] += dz
+        delta = q[:, None, [0, 2]] - ref_xz[None, :, :]
+        d2 = np.einsum("qri,qri->qr", delta, delta)
+        idx = np.argmin(d2, axis=1)
+        nearest_d = np.sqrt(d2[np.arange(len(q)), idx])
+        q[:, 1] = reference[idx, 1]
+        heights, _ = road_surface.sample(q)
+        on_road = np.isfinite(heights)
+        tang = np.roll(q[:, [0, 2]], -1, axis=0) - np.roll(q[:, [0, 2]], 1, axis=0)
+        tlen = np.maximum(np.linalg.norm(tang, axis=1, keepdims=True), 1e-6)
+        tang /= tlen
+        perp = np.column_stack([-tang[:, 1], tang[:, 0]])
+        ql = q.copy()
+        ql[:, 0] += perp[:, 0] * car_half_width_m
+        ql[:, 2] += perp[:, 1] * car_half_width_m
+        qr = q.copy()
+        qr[:, 0] -= perp[:, 0] * car_half_width_m
+        qr[:, 2] -= perp[:, 1] * car_half_width_m
+        hl, _ = road_surface.sample(ql)
+        hr, _ = road_surface.sample(qr)
+        both_on = on_road & np.isfinite(hl) & np.isfinite(hr)
+        return (
+            float(on_road.mean()),
+            float(both_on.mean()),
+            float(np.sqrt(np.mean(nearest_d ** 2))),
+        )
+
+    before_on, before_both, before_rms = _evaluate(0.0, 0.0, positions)
+
+    best_key = (-1.0, -1.0, -1e9)
+    best_dx, best_dz = 0.0, 0.0
+    radius = float(max(0.0, search_radius_m))
+    cstep = float(max(0.1, coarse_step_m))
+    for dx in np.arange(-radius, radius + cstep * 0.5, cstep):
+        for dz in np.arange(-radius, radius + cstep * 0.5, cstep):
+            on_r, both_r, rms = _evaluate(float(dx), float(dz), sample_pts)
+            key = (round(on_r, 4), round(both_r, 4), -rms)
+            if key > best_key:
+                best_key = key
+                best_dx, best_dz = float(dx), float(dz)
+
+    fstep = float(max(0.05, fine_step_m))
+    fine_span = cstep * 1.2
+    bx, bz = best_dx, best_dz
+    for dx in np.arange(bx - fine_span, bx + fine_span + fstep * 0.5, fstep):
+        for dz in np.arange(bz - fine_span, bz + fine_span + fstep * 0.5, fstep):
+            on_r, both_r, rms = _evaluate(float(dx), float(dz), sample_pts)
+            key = (round(on_r, 4), round(both_r, 4), -rms)
+            if key > best_key:
+                best_key = key
+                best_dx, best_dz = round(float(dx), 4), round(float(dz), 4)
+
+    after_on, after_both, after_rms = _evaluate(best_dx, best_dz, positions)
+    shifted = positions.copy()
+    shifted[:, 0] += best_dx
+    shifted[:, 2] += best_dz
+    diagnostics = {
+        "pavementOffsetAcM": {"x": float(best_dx), "z": float(best_dz)},
+        "pavementOnRoadBefore": before_on,
+        "pavementOnRoadAfter": after_on,
+        "pavementBothWheelsBefore": before_both,
+        "pavementBothWheelsAfter": after_both,
+        "pavementRefRmsBeforeM": before_rms,
+        "pavementRefRmsAfterM": after_rms,
+    }
+    return shifted, diagnostics
 
 
 def _project_reference_segments(reference_xyz, query_xyz):

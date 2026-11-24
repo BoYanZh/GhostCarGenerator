@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.8'
+local APP_VERSION = '0.9'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -123,12 +123,11 @@ local GHOST_WHEEL_RADIUS_M = 0.32
 local MAX_PLAUSIBLE_SPEED_MPS = 120
 local SMOOTH_LOG_WINDOW_S = 5.0
 -- Flat tints written into txDiffuse; the ghost keeps its shape/normals without
--- its livery. Splitting body vs dark-trim/tyre/glass tints avoids bright milky
--- tyres or distracting underbody bleed-through, giving a clean GT/iRacing-style
--- translucent ghost silhouette.
-local GHOST_TINT_BODY = { 0.58, 0.78, 0.98 }
-local GHOST_TINT_DARK = { 0.22, 0.30, 0.40 }
-local GHOST_TINT_GLASS = { 0.18, 0.28, 0.42 }
+-- its livery. Neutral silver-white body + charcoal tyres/trim + smoked glass
+-- matches AC's native ghost look without a blue cast or milky tyres.
+local GHOST_TINT_BODY = { 0.78, 0.80, 0.82 }
+local GHOST_TINT_DARK = { 0.28, 0.29, 0.30 }
+local GHOST_TINT_GLASS = { 0.24, 0.25, 0.27 }
 -- v0.4 lap sync. `GHOST_START_OFFSET_S` is how far the timeline runs AHEAD of
 -- the player's lap at the start/finish crossing, in seconds: playback starts at
 -- (duration - offset) when the player's lap counter increments. 0.0 shows the

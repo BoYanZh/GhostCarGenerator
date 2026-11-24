@@ -5,11 +5,13 @@ import math
 
 import numpy as np
 
+from ghost_car_generator.ld_replay import fit_pavement_offset
 from ghost_car_generator.runtime_ghost import (
     SCHEMA,
     build_runtime_ghost,
     smooth_runtime_ghost,
 )
+from ghost_car_generator.track_surface import TrackSurface
 
 
 def _circle_poses(count: int = 400, dt: float = 0.015, radius: float = 100.0, quantize_step: int = 0):
@@ -77,3 +79,39 @@ def test_smooth_runtime_ghost_removes_gps_staircase_and_preserves_lap_time():
     # Loop seam should remain close after circular smoothing.
     seam_m = math.dist(smoothed["frames"][-1]["positionM"], smoothed["frames"][0]["positionM"])
     assert seam_m < 3.0
+
+
+def test_fit_pavement_offset_recovers_global_gps_shift():
+    # Build a synthetic rectangular asphalt loop centered on a 50 m circle (width 10 m).
+    angles = np.linspace(0.0, 2.0 * math.pi, 120, endpoint=False)
+    ref = np.column_stack([50.0 * np.cos(angles), np.zeros_like(angles), 50.0 * np.sin(angles)])
+    verts = []
+    tris = []
+    for i in range(len(angles)):
+        a = angles[i]
+        inner = [45.0 * math.cos(a), 0.0, 45.0 * math.sin(a)]
+        outer = [55.0 * math.cos(a), 0.0, 55.0 * math.sin(a)]
+        verts.append(inner)
+        verts.append(outer)
+    n = len(angles)
+    for i in range(n):
+        j = (i + 1) % n
+        tris.append([2 * i, 2 * i + 1, 2 * j + 1])
+        tris.append([2 * i, 2 * j + 1, 2 * j])
+    surface = TrackSurface(np.array(verts, dtype=np.float64), np.array(tris, dtype=np.int64))
+
+    # Shift the driven path off-road by (+6.0, -4.0) m (>5 m half-width) to mimic GPS receiver bias.
+    biased = ref.copy()
+    biased[:, 0] += 6.0
+    biased[:, 2] -= 4.0
+    corrected, diag = fit_pavement_offset(
+        biased, surface, ref, search_radius_m=8.0, coarse_step_m=1.0, fine_step_m=0.5
+    )
+
+    assert diag["pavementOnRoadBefore"] < 0.75
+    assert diag["pavementOnRoadAfter"] == 1.0
+    assert diag["pavementBothWheelsAfter"] == 1.0
+    assert abs(diag["pavementOffsetAcM"]["x"] - (-6.0)) <= 1.0
+    assert abs(diag["pavementOffsetAcM"]["z"] - 4.0) <= 1.0
+    assert diag["pavementRefRmsAfterM"] < 1.0
+    assert corrected.shape == biased.shape

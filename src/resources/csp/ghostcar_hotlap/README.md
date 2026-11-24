@@ -18,7 +18,14 @@ Scene recipe: `ac.findNodes('carsRoot:yes')` → `createBoundingSphereNode` →
 inside `script.update(dt)` locked to `sim.dt` (once per rendered frame, before
 render passes / TAA motion vectors; `0` when paused).
 
-**Status: v0.8 (in-game proven).**
+**Status: v0.9 (in-game proven).**
+- **v0.9** refined the ghost tint from cyan-blue to neutral silver-white
+  (`GHOST_TINT_BODY = {0.78, 0.80, 0.82}`, charcoal tyres/trim, smoked glass)
+  to match AC's built-in ghost look, and added `fit_pavement_offset()` in
+  `ld_replay.py` to remove constant receiver/session GPS horizontal offsets
+  against the track's KN5 `road-pit.gcsurface` pavement mesh (boosting Saurabh's
+  `2:07.321` Thunderhill lap from 91.9% to 96.6% centerline-on-pavement with
+  zero speed or lap-time distortion).
 - **v0.8** fixed all four real-drive feedback items from v0.7:
   1. **True high transparency**: switched ghost meshes (after `ensureUniqueMaterials()`)
      to `SHADER = ksPerPixel` (`useDetail=0`, `ksAlphaRef=0`, `sunSpecular=0`,
