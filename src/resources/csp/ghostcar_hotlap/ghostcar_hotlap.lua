@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.19'
+local APP_VERSION = '0.20'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -440,6 +440,7 @@ local runtimeCandidates = {}
 local activeRuntimeIndex = 0
 local activeRuntimePath = nil
 local activeRuntimeLabel = 'none'
+local importState = { running = false, status = nil }
 local renderSubscription = nil
 
 -- ---------------------------------------------------------------------------
@@ -1713,6 +1714,164 @@ local function reloadRuntime(preferredPath, reason)
   end
 end
 
+local function sanitizeGhostStem(name)
+  local s = tostring(name or ''):gsub('%.[^%.]+$', '')
+  s = s:gsub('[^%w%._%-]+', '_'):gsub('^[%._%-]+', ''):gsub('[%._%-]+$', '')
+  return (s ~= '' and s) or 'imported_ghost'
+end
+
+local function getPlayerCarId()
+  if type(ac.getCarID) == 'function' then
+    local ok, cid = pcall(ac.getCarID, 0)
+    if ok and type(cid) == 'string' and cid ~= '' then
+      return cid
+    end
+  end
+  return 'ig_toyota_gr86_premium'
+end
+
+local function lastNonEmptyLine(text)
+  if type(text) ~= 'string' or text == '' then return '' end
+  local last = ''
+  for line in text:gmatch('[^\r\n]+') do
+    local trimmed = line:gsub('^%s+', ''):gsub('%s+$', '')
+    if trimmed ~= '' then last = trimmed end
+  end
+  return last
+end
+
+local function importTelemetryFile(filename)
+  if type(filename) ~= 'string' or filename == '' then return end
+  local base = basenameOf(filename)
+  local ext = (base:match('(%.[^%.]+)$') or ''):lower()
+  local curTrack, curLayout = getCurrentTrackAndLayout()
+  local stem = sanitizeGhostStem(base)
+
+  -- Direct .json import: copy into current track directory and hot-reload
+  if ext == '.json' then
+    local text = io.load(filename)
+    if not text or text == '' then
+      importState.status = 'Import failed: unreadable json'
+      return
+    end
+    local targetDir = __dirname
+    if curTrack ~= '' and curLayout ~= '' then
+      targetDir = __dirname..'/tracks/'..curTrack..'/'..curLayout
+    elseif curTrack ~= '' then
+      targetDir = __dirname..'/tracks/'..curTrack
+    end
+    local destPath = targetDir..'/'..stem..'.json'
+    if type(io.createFileDir) == 'function' then pcall(io.createFileDir, destPath) end
+    if io.save(destPath, text) then
+      importState.status = 'Loaded '..basenameOf(destPath)
+      appendLog('IMPORT ok mode=json file='..sanitizeToken(base)..' deployed='..sanitizeToken(destPath))
+      reloadRuntime(destPath, 'ui-import-json')
+    else
+      importState.status = 'Import failed: cannot write '..basenameOf(destPath)
+      appendLog('IMPORT failed mode=json file='..sanitizeToken(base))
+    end
+    return
+  end
+
+  if type(os.runConsoleProcess) ~= 'function' then
+    importState.status = 'Import unavailable: os.runConsoleProcess missing'
+    return
+  end
+
+  local acRoot = (ac.FolderID and ac.FolderID.Root and type(ac.getFolder) == 'function')
+    and ac.getFolder(ac.FolderID.Root) or nil
+  if not acRoot or acRoot == '' then
+    importState.status = 'Import failed: cannot resolve AC root folder'
+    return
+  end
+  acRoot = acRoot:gsub('[/\\]+$', '')
+
+  local args = {
+    '-m', 'ghost_car_generator', 'replay', 'export-runtime', filename,
+  }
+  if ext ~= '.acreplay' then
+    if curTrack == '' then
+      importState.status = 'Import failed: unknown current track'
+      return
+    end
+    args[#args + 1] = '--ac-track-dir'
+    args[#args + 1] = acRoot..'/content/tracks/'..curTrack
+    if curLayout ~= '' then
+      args[#args + 1] = '--ac-layout'
+      args[#args + 1] = curLayout
+    end
+  end
+  args[#args + 1] = '--car-id'
+  args[#args + 1] = getPlayerCarId()
+  args[#args + 1] = '--ghost-name'
+  args[#args + 1] = stem
+  args[#args + 1] = '--deploy-ac'
+  args[#args + 1] = acRoot
+  args[#args + 1] = '--no-sync-lua'
+
+  importState.running = true
+  importState.status = 'Importing '..base..'...'
+  appendLog('IMPORT start file='..sanitizeToken(base)..' track='..sanitizeToken(curTrack..'/'..curLayout))
+
+  os.runConsoleProcess({
+    filename = 'python',
+    arguments = args,
+    inheritEnvironment = true,
+    separateStderr = true,
+    timeout = 120000,
+    terminateWithScript = true,
+  }, function(err, data)
+    importState.running = false
+    local exitCode = (type(data) == 'table' and data.exitCode) or -1
+    local stdout = (type(data) == 'table' and data.stdout) or ''
+    local stderr = (type(data) == 'table' and data.stderr) or ''
+    if not err and exitCode == 0 then
+      local deployed = stdout:match('Deployed to AC:%s*([^\r\n]+)')
+      if deployed then
+        deployed = deployed:gsub('^%s+', ''):gsub('%s+$', '')
+      end
+      importState.status = 'Imported '..basenameOf(deployed or base)
+      appendLog('IMPORT ok file='..sanitizeToken(base)..' deployed='..sanitizeToken(deployed or stem))
+      reloadRuntime(deployed, 'ui-import')
+    else
+      local msg = lastNonEmptyLine(stderr)
+      if msg == '' then msg = lastNonEmptyLine(stdout) end
+      if msg == '' then msg = tostring(err or ('exit='..tostring(exitCode))) end
+      if #msg > 90 then msg = msg:sub(1, 87)..'...' end
+      importState.status = 'Import failed: '..msg
+      appendLog('IMPORT failed file='..sanitizeToken(base)..' code='..tostring(exitCode)..' err='..sanitizeToken(msg))
+    end
+  end)
+end
+
+local function openImportTelemetryDialog()
+  if importState.running then return end
+  if type(os.openFileDialog) ~= 'function' then
+    importState.status = 'File dialog unavailable in this CSP build'
+    return
+  end
+  os.openFileDialog({
+    title = 'Select telemetry or ghost file for this track',
+    fileTypes = {
+      { name = 'Telemetry & Ghost Files', mask = '*.ld;*.ibt;*.csv;*.rcz;*.xrk;*.xrz;*.acreplay;*.json' },
+      { name = 'MoTeC LD', mask = '*.ld' },
+      { name = 'iRacing IBT', mask = '*.ibt' },
+      { name = 'CSV / RaceChrono', mask = '*.csv;*.rcz' },
+      { name = 'AiM XRK', mask = '*.xrk;*.xrz' },
+      { name = 'Ghost Runtime JSON', mask = '*.json' },
+    },
+    addAllFilesFileType = true,
+  }, function(err, filename)
+    if err then
+      importState.status = 'Dialog error: '..tostring(err)
+      return
+    end
+    if type(filename) == 'string' and filename ~= '' then
+      importTelemetryFile(filename)
+    end
+  end)
+end
+
 -- ---------------------------------------------------------------------------
 -- Pose application
 -- ---------------------------------------------------------------------------
@@ -2639,8 +2798,17 @@ function script.windowMain(dt)
     ui.text('GhostCarGenerator: IDLE (wrong track)')
     ui.text('Track: '..tostring(runtimeTrackMismatch.current))
     ui.text('Ghost: '..tostring(runtimeTrackMismatch.expected))
-    if type(ui.button) == 'function' and ui.button('Reload ghosts') then
-      reloadRuntime(nil, 'ui-idle-reload')
+    if type(ui.button) == 'function' then
+      if not importState.running and ui.button('Import telemetry...') then
+        openImportTelemetryDialog()
+      end
+      if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
+      if ui.button('Reload') then
+        reloadRuntime(nil, 'ui-idle-reload')
+      end
+    end
+    if importState.status then
+      ui.text(tostring(importState.status))
     end
   elseif state.status == 'ERROR' then
     ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
@@ -2682,29 +2850,47 @@ function script.windowSettings(dt)
   if #runtimeCandidates > 0 then
     ui.text(string.format('Ghost [%d/%d]: %s',
       activeRuntimeIndex, #runtimeCandidates, tostring(activeRuntimeLabel)))
+    if type(ui.combo) == 'function' and type(ui.selectable) == 'function' then
+      ui.combo('##ghost_picker', tostring(activeRuntimeLabel), nil, function()
+        for idx, item in ipairs(runtimeCandidates) do
+          if ui.selectable(item.label, idx == activeRuntimeIndex) then
+            reloadRuntime(item.path, 'ui-combo')
+          end
+        end
+      end)
+    end
   elseif runtimeTrackMismatch then
     ui.text('Ghost: IDLE (wrong track: '..tostring(runtimeTrackMismatch.current)..')')
   else
     ui.text('Ghost: none (5m fallback)')
   end
   if type(ui.button) == 'function' then
+    if not importState.running and ui.button('Import telemetry...') then
+      openImportTelemetryDialog()
+    elseif importState.running then
+      ui.text('Importing telemetry...')
+    end
+    if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
+    if ui.button('Reload ghosts') then
+      reloadRuntime(activeRuntimePath, 'ui-reload')
+    end
     if #runtimeCandidates > 1 then
+      if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
       if ui.button('< Prev') then
         local prevIdx = activeRuntimeIndex - 1
         if prevIdx < 1 then prevIdx = #runtimeCandidates end
         reloadRuntime(runtimeCandidates[prevIdx].path, 'ui-prev')
       end
-      if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
+      if type(ui.sameLine) == 'function' then ui.sameLine(0, 4) end
       if ui.button('Next >') then
         local nextIdx = activeRuntimeIndex + 1
         if nextIdx > #runtimeCandidates then nextIdx = 1 end
         reloadRuntime(runtimeCandidates[nextIdx].path, 'ui-next')
       end
-      if type(ui.sameLine) == 'function' then ui.sameLine(0, 8) end
     end
-    if ui.button('Reload ghosts') then
-      reloadRuntime(activeRuntimePath, 'ui-reload')
-    end
+  end
+  if importState.status then
+    ui.text(tostring(importState.status))
   end
 
   if type(ui.checkbox) == 'function' then

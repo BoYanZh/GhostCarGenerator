@@ -662,3 +662,173 @@ print('MULTI_GHOST_OK')
     assert "RELOAD reason=ui-next status=ok file=beta_slow.json carId=car_beta" in log_text
     assert "RELOAD reason=ui-reload status=ok file=beta_slow.json" in log_text
     assert "ERROR " not in log_text
+
+
+@pytest.mark.skipif(_find_lua() is None, reason="lua interpreter not installed")
+def test_lua_in_game_import_telemetry_and_combo(tmp_path: Path):
+    """Verify clicking 'Import telemetry...' invokes os.openFileDialog + os.runConsoleProcess and hot-loads."""
+    lua = _find_lua()
+    assert lua is not None
+
+    track_dir = tmp_path / "tracks" / "synth_track" / "loop"
+    track_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    frames = [
+        {
+            "timeS": round(i * 0.015, 6),
+            "positionM": [float(i), 0.0, float(i)],
+            "rotationRad": [0.0, 0.0, 0.0],
+            "steerAngleDeg": 0.0,
+            "velocityMS": [0.0, 0.0, 20.0],
+        }
+        for i in range(40)
+    ]
+    imported_json = track_dir / "new_lap.json"
+    imported_json.write_text(
+        json.dumps(
+            {
+                "schema": "ghost-runtime-v1",
+                "carId": "ks_mazda_mx5_cup",
+                "trackId": "synth_track/loop",
+                "frameIntervalS": 0.015,
+                "lapTimeS": 91.234,
+                "frames": frames,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    harness = tmp_path / "harness_import.lua"
+    harness.write_text(
+        f"""
+__dirname = {json.dumps(str(tmp_path))}
+script = {{}}
+math.saturate = math.saturate or function(x) return math.max(0, math.min(1, x)) end
+math.atan2 = math.atan2 or math.atan
+function vec2(x, y) return {{ x = x or 0, y = y or 0 }} end
+function vec3(x, y, z) return {{ x = x or 0, y = y or 0, z = z or 0 }} end
+function rgbm(r, g, b, m) return {{ r = r or 0, g = g or 0, b = b or 0, mult = m or 1 }} end
+json = {{}}
+function json.decode(text)
+  local lua_src = text:gsub('%[', '{{'):gsub('%]', '}}'):gsub('"([^"]+)"%s*:', '["%1"]=')
+  return assert(load('return ' .. lua_src))()
+end
+function io.fileExists(p) local f = io.open(p, 'r'); if f then f:close(); return true end; return false end
+function io.load(p, fb) local f = io.open(p, 'r'); if not f then return fb end; local d = f:read('*a'); f:close(); return d end
+function io.save(p, c) local f = io.open(p, 'w'); if not f then return false end; f:write(c); f:close(); return true end
+function io.createDir(_) return true end
+function io.createFileDir(_) return true end
+
+local scanned = {{}}
+function io.scanDir(dir, mask, cb)
+  if dir:gsub('\\\\', '/'):find('tracks/synth_track/loop', 1, true) then
+    for _, name in ipairs(scanned) do cb(name) end
+  end
+end
+
+local procCalls = {{}}
+os.openFileDialog = function(params, cb)
+  cb(nil, 'D:/telemetry/new_lap.ld')
+end
+os.runConsoleProcess = function(params, cb)
+  procCalls[#procCalls + 1] = params
+  scanned = {{ 'new_lap.json' }}
+  cb(nil, {{
+    exitCode = 0,
+    stdout = 'Deployed to AC: ' .. {json.dumps(str(imported_json))} .. '\\n',
+    stderr = '',
+  }})
+end
+
+local store = {{}}
+local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local function makeNode()
+  local n = {{}}
+  function n:createBoundingSphereNode() return makeNode() end
+  function n:loadKN5() return makeNode() end
+  function n:findMeshes() return {{}} end
+  function n:findNodes() return makeNode() end
+  function n:setPosition() end
+  function n:setOrientation() end
+  function n:setVisible() end
+  function n:dispose() end
+  return n
+end
+ac = {{
+  FolderID = {{ Root = 1, Logs = 2, ContentCars = 4 }},
+  getFolder = function(id)
+    if id == 2 then return {json.dumps(str(tmp_path / "logs"))} end
+    return {json.dumps(str(tmp_path))}
+  end,
+  getSim = function() return sim end,
+  getCar = function(i) return i == 0 and car0 or nil end,
+  getCarID = function(_) return 'ks_mazda_mx5_cup' end,
+  getTrackID = function() return 'synth_track' end,
+  getTrackLayout = function() return 'loop' end,
+  findNodes = function(_) return makeNode() end,
+  store = function(k, v) store[k] = v end,
+  load = function(k) return store[k] end,
+  storage = function(d, _) return d end,
+  warn = function(_) end,
+  log = function(_) end,
+}}
+render = {{ on = function() return {{ dispose = function() end }} end }}
+local clickTarget = nil
+local uiTexts = {{}}
+ui = {{
+  windowSize = function() return vec2(420, 480) end,
+  drawRectFilled = function() end,
+  drawRect = function() end,
+  sameLine = function() end,
+  combo = function(lbl, preview, flags, fn) if fn then fn() end end,
+  selectable = function(lbl, sel) return false end,
+  text = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
+  button = function(label)
+    if clickTarget == label then
+      clickTarget = nil
+      return true
+    end
+    return false
+  end,
+}}
+
+dofile({json.dumps(str(LUA_SCRIPT))})
+for _ = 1, 20 do
+  sim.gameTime = sim.gameTime + 0.02
+  script.update(0.02)
+end
+
+clickTarget = 'Import telemetry...'
+script.windowSettings(0.02)
+assert(#procCalls == 1, 'Expected 1 os.runConsoleProcess call')
+local argsStr = table.concat(procCalls[1].arguments, ' ')
+assert(argsStr:find('export-runtime', 1, true), 'Missing export-runtime arg')
+assert(argsStr:find('--ac-track-dir', 1, true), 'Missing --ac-track-dir arg')
+assert(argsStr:find('--ac-layout loop', 1, true), 'Missing --ac-layout loop arg')
+assert(argsStr:find('--car-id ks_mazda_mx5_cup', 1, true), 'Missing --car-id arg')
+assert(argsStr:find('--deploy-ac', 1, true), 'Missing --deploy-ac arg')
+
+uiTexts = {{}}
+script.windowSettings(0.02)
+local sawImported = false
+for _, line in ipairs(uiTexts) do
+  if line:find('Ghost [1/1]: new_lap.json', 1, true) then sawImported = true end
+end
+assert(sawImported, 'Expected hot-loaded Ghost [1/1]: new_lap.json after import')
+script.shutdown()
+print('IMPORT_TELEMETRY_OK')
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run([lua, str(harness)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Import test failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "IMPORT_TELEMETRY_OK" in proc.stdout
+    log_text = (tmp_path / "logs" / "ghostcar_hotlap_verify.log").read_text(encoding="utf-8")
+    assert "IMPORT start file=new_lap.ld" in log_text
+    assert "IMPORT ok file=new_lap.ld" in log_text
+    assert "RELOAD reason=ui-import status=ok file=new_lap.json" in log_text
+    assert "ERROR " not in log_text
