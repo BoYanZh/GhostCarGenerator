@@ -96,7 +96,7 @@ def _finite_vector(value: Any, size: int, name: str) -> list[float]:
     return result
 
 
-def _normalize_brake(value: Any) -> float:
+def _normalize_unit_control(value: Any) -> float:
     if value is None:
         return 0.0
     try:
@@ -108,6 +108,19 @@ def _normalize_brake(value: Any) -> float:
     if v > 1.0:
         v = v / 255.0 if v <= 255.0 else 1.0
     return round(max(0.0, min(1.0, v)), 3)
+
+
+def _normalize_gear(value: Any, *, ac_offset: bool = False) -> int:
+    if value is None:
+        return 0
+    try:
+        g = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    if ac_offset:
+        # AC replay gear encoding: 0=R, 1=N, 2=1st, 3=2nd...
+        g -= 1
+    return max(-1, min(8, g))
 
 
 def build_runtime_ghost(
@@ -131,12 +144,16 @@ def build_runtime_ghost(
     for index, pose in enumerate(pose_list):
         position = _finite_vector(pose.get("positionM"), 3, "positionM")
         rotation = _finite_vector(pose.get("rotationRad"), 3, "rotationRad")
+        raw_throttle = pose.get("throttle", pose.get("gas", 0.0))
+        has_ac_gear = "gas" in pose and "throttle" not in pose
         frame: dict[str, Any] = {
             "timeS": float(pose.get("timeS", index * interval_s)),
             "positionM": position,
             "rotationRad": rotation,
             "steerAngleDeg": float(pose.get("steerAngleDeg", 0.0)),
-            "brake": _normalize_brake(pose.get("brake", 0.0)),
+            "brake": _normalize_unit_control(pose.get("brake", 0.0)),
+            "throttle": _normalize_unit_control(raw_throttle),
+            "gear": _normalize_gear(pose.get("gear", 0), ac_offset=has_ac_gear),
             "velocityMS": _finite_vector(
                 pose.get("velocityMS", [0.0, 0.0, 0.0]), 3, "velocityMS"
             ),
@@ -275,7 +292,9 @@ def export_runtime_ghost_from_acreplay(
                 "positionM": [round(float(pos[0]), 4), round(float(pos[1]), 4), round(float(pos[2]), 4)],
                 "rotationRad": [round(float(v), 6) for v in fr["rotationRad"]],
                 "steerAngleDeg": round(float(fr.get("steerAngleDeg", 0.0)), 4),
-                "brake": _normalize_brake(fr.get("brake", 0.0)),
+                "brake": _normalize_unit_control(fr.get("brake", 0.0)),
+                "throttle": _normalize_unit_control(fr.get("gas", fr.get("throttle", 0.0))),
+                "gear": _normalize_gear(fr.get("gear", 0), ac_offset=("gas" in fr)),
                 "velocityMS": [round(float(v), 4) for v in fr.get("velocityMS", [0.0, 0.0, 0.0])],
             }
         )

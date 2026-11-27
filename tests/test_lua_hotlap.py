@@ -995,5 +995,5 @@ print('BRAKE_LIGHTS_OK')
     assert proc.returncode == 0, f"Brake lights test failed:\n{proc.stdout}\n{proc.stderr}"
     assert "BRAKE_LIGHTS_OK" in proc.stdout
     log_text = (tmp_path / "logs" / "ghostcar_hotlap_verify.log").read_text(encoding="utf-8")
-    assert "BRAKELIGHTS count=1 source=carData" in log_text
+    assert "BRAKELIGHTS count=1 headlights=0 discs=0 source=carData" in log_text
     assert "ERROR " not in log_text

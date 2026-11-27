@@ -100,8 +100,8 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.21'
-local SETTINGS_VERSION = 8
+local APP_VERSION = '0.22'
+local SETTINGS_VERSION = 9
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
 -- 0.25 with depth-write (`DEPTH_MODE = NORMAL`) + interior meshes hidden gives
@@ -192,6 +192,26 @@ do
   if type(settings.startOffsetS) ~= 'number' then settings.startOffsetS = GHOST_START_OFFSET_S end
   if type(settings.leadS) ~= 'number' then settings.leadS = GHOST_DEFAULT_LEAD_S end
   if settings.debugCross == nil then settings.debugCross = false end
+  if settings.showRacingLine == nil then settings.showRacingLine = true end
+  if settings.showCarHud == nil then settings.showCarHud = true end
+  if settings.showBrakeGlow == nil then settings.showBrakeGlow = true end
+  if settings.showRunningLights == nil then settings.showRunningLights = true end
+end
+
+local function racingLineEnabled()
+  return settings.showRacingLine ~= false
+end
+
+local function carHudEnabled()
+  return settings.showCarHud ~= false
+end
+
+local function brakeGlowEnabled()
+  return settings.showBrakeGlow ~= false
+end
+
+local function runningLightsEnabled()
+  return settings.showRunningLights ~= false
 end
 
 local function clamp01(value)
@@ -368,8 +388,14 @@ local state = {
   ghostMeshSets = {},
   interiorMeshSets = {},
   brakeLightSets = {},
+  headlightSets = {},
+  brakeDiscMeshes = nil,
   brake = 0,
+  throttle = 0,
+  gear = 0,
   brakeLit = false,
+  brakeDiscTemp = 0,
+  appliedBrakeGlow = -1,
   appliedAlpha = nil,
   appliedVisible = nil,
   fadeScale = 1.0,
@@ -820,6 +846,134 @@ end
 -- Render oracle
 -- ---------------------------------------------------------------------------
 
+local function drawGhostRacingLine()
+  if not runtime or not runtime.frames or #runtime.frames < 10 or runtimeDurationS <= 0 then return end
+  if not racingLineEnabled() or not ghostVisibleEnabled() then return end
+  if type(render.quad) ~= 'function' then return end
+
+  local frames = runtime.frames
+  local count = #frames
+  local dtNom = (type(runtime.frameIntervalS) == 'number' and runtime.frameIntervalS > 0)
+    and runtime.frameIntervalS or 0.015
+  local curIdx = state.runtimeCursor
+  if curIdx < 1 or curIdx > count then curIdx = 1 end
+
+  local backSteps = math.floor(0.6 / dtNom)
+  local fwdSteps = math.floor(2.2 / dtNom)
+  local stride = math.max(1, math.floor(0.075 / dtNom))
+  local halfW = 0.34
+  local yLift = 0.50 + currentHeightOffsetM()
+
+  local prevL, prevR = nil, nil
+  local totalSpan = backSteps + fwdSteps
+  for offset = -backSteps, fwdSteps, stride do
+    local idx = ((curIdx - 1 + offset) % count) + 1
+    local fr = frames[idx]
+    local p = fr.positionM
+    local yaw = (fr.rotationRad and fr.rotationRad[2]) or 0
+    -- Right vector in AC XZ plane (forward is (-sin(yaw), 0, cos(yaw)))
+    local rx = math.cos(yaw) * halfW
+    local rz = math.sin(yaw) * halfW
+    local py = p[2] + yLift
+    local curL = vec3(p[1] - rx, py, p[3] - rz)
+    local curR = vec3(p[1] + rx, py, p[3] + rz)
+
+    if prevL and prevR then
+      local frac = (offset + backSteps) / math.max(1, totalSpan)
+      local edgeFade = math.min(1.0, math.min(frac * 5.0, (1.0 - frac) * 3.5))
+      local a = 0.48 * edgeFade
+      if a > 0.02 then
+        local brk = type(fr.brake) == 'number' and fr.brake or 0
+        local thr = type(fr.throttle) == 'number' and fr.throttle or 0
+        local col
+        if brk >= 0.05 then
+          col = rgbm(0.95, 0.14, 0.14, a)
+        elseif thr >= 0.55 then
+          col = rgbm(0.14, 0.85, 0.28, a)
+        elseif thr >= 0.15 then
+          col = rgbm(0.74, 0.82, 0.18, a)
+        else
+          col = rgbm(0.88, 0.72, 0.22, a * 0.85)
+        end
+        pcall(render.quad, prevL, prevR, curR, curL, col)
+      end
+    end
+    prevL, prevR = curL, curR
+  end
+end
+
+local function drawGhostCarHud()
+  if not runtime or not carHudEnabled() or not ghostVisibleEnabled() then return end
+  if state.fadeHidden then return end
+  local okCam, camPos = pcall(ac.getCameraPosition)
+  if not okCam or not camPos then return end
+  local cdx = state.ghostX - camPos.x
+  local cdy = state.ghostY - camPos.y
+  local cdz = state.ghostZ - camPos.z
+  local d = math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz)
+  if d < 5.0 or d > 140.0 then return end
+
+  local hudPos = vec3(state.ghostX, state.ghostY + 2.15, state.ghostZ)
+  local brk = state.brake or 0
+  local thr = state.throttle or 0
+  local gear = state.gear or 0
+  local gearPrefix = ''
+  if gear > 0 then
+    gearPrefix = string.format('G%d  ', gear)
+  elseif gear == -1 then
+    gearPrefix = 'R  '
+  end
+
+  local label, col
+  if brk >= 0.04 then
+    label = string.format('%sBRK %.0f%%', gearPrefix, brk * 100)
+    col = rgbm(1.0, 0.28, 0.24, 0.95)
+  elseif thr >= 0.10 then
+    label = string.format('%sTHR %.0f%%', gearPrefix, thr * 100)
+    col = rgbm(0.24, 0.95, 0.42, 0.95)
+  else
+    label = gearPrefix..'COAST'
+    col = rgbm(0.95, 0.82, 0.35, 0.90)
+  end
+
+  if type(render.debugText) == 'function' then
+    pcall(render.debugText, hudPos, label, col, 0.95)
+  end
+
+  -- Compact 3D horizontal pedal bars facing the camera right under the text
+  if type(render.quad) == 'function' then
+    local dx = camPos.x - hudPos.x
+    local dz = camPos.z - hudPos.z
+    local hlen = math.sqrt(dx * dx + dz * dz)
+    if hlen > 1e-3 then
+      local rx = -dz / hlen
+      local rz = dx / hlen
+      local barW = 1.05
+      local barH = 0.085
+      local baseY = state.ghostY + 1.94
+      local half = barW * 0.5
+      local function drawBar(yOff, frac, fillCol)
+        local y0 = baseY + yOff
+        local y1 = y0 + barH
+        local pL0 = vec3(hudPos.x - rx * half, y0, hudPos.z - rz * half)
+        local pR0 = vec3(hudPos.x + rx * half, y0, hudPos.z + rz * half)
+        local pR1 = vec3(hudPos.x + rx * half, y1, hudPos.z + rz * half)
+        local pL1 = vec3(hudPos.x - rx * half, y1, hudPos.z - rz * half)
+        pcall(render.quad, pL0, pR0, pR1, pL1, rgbm(0.06, 0.07, 0.09, 0.55))
+        local f = math.max(0, math.min(1, frac))
+        if f > 0.01 then
+          local endX = -half + barW * f
+          local fR0 = vec3(hudPos.x + rx * endX, y0, hudPos.z + rz * endX)
+          local fR1 = vec3(hudPos.x + rx * endX, y1, hudPos.z + rz * endX)
+          pcall(render.quad, pL0, fR0, fR1, pL1, fillCol)
+        end
+      end
+      drawBar(0.0, thr, rgbm(0.18, 0.92, 0.35, 0.90))
+      drawBar(-0.11, brk, rgbm(0.95, 0.18, 0.18, 0.90))
+    end
+  end
+end
+
 -- `render.projectPoint()` is only reliable inside render context, so the
 -- projection is sampled from a render callback and cached for the 1 Hz log row.
 local function installRenderOracle()
@@ -841,6 +995,10 @@ local function installRenderOracle()
     pcall(function() point = render.projectPoint(position) end)
     if point then
       oracle.ndcX, oracle.ndcY = point.x, point.y
+    end
+    if state.status == 'ACTIVE' then
+      drawGhostRacingLine()
+      drawGhostCarHud()
     end
     if debugCrossEnabled() and ghostVisibleEnabled() then
       pcall(render.debugCross, position, GHOST_NODE_RADIUS * 0.5, rgbm(2, 0, 0, 1))
@@ -907,8 +1065,14 @@ local function disposeGhost()
   state.ghostMeshSets = {}
   state.interiorMeshSets = {}
   state.brakeLightSets = {}
+  state.headlightSets = {}
+  state.brakeDiscMeshes = nil
   state.brake = 0
+  state.throttle = 0
+  state.gear = 0
   state.brakeLit = false
+  state.brakeDiscTemp = 0
+  state.appliedBrakeGlow = -1
   state.interiorMeshes = 0
   state.appliedAlpha = nil
   state.appliedVisible = nil
@@ -1334,23 +1498,77 @@ local function applyBrakeLightState(lit, force)
   state.brakeLit = want
   local sets = state.brakeLightSets
   if type(sets) ~= 'table' or #sets == 0 then return end
-  local off = vec3(0, 0, 0)
+  local zero = vec3(0, 0, 0)
+  local running = runningLightsEnabled()
   for _, entry in ipairs(sets) do
-    local col = want and entry.onColor or off
+    local col = want and entry.onColor or (running and entry.offColor or zero)
     pcall(function() entry.meshes:setVisible(true, false) end)
     pcall(function() entry.meshes:setMaterialProperty('ksEmissive', col) end)
   end
 end
 
+local function applyHeadlightState()
+  local sets = state.headlightSets
+  if type(sets) ~= 'table' or #sets == 0 then return end
+  local zero = vec3(0, 0, 0)
+  local on = runningLightsEnabled()
+  for _, entry in ipairs(sets) do
+    local col = on and entry.onColor or zero
+    pcall(function() entry.meshes:setVisible(true, false) end)
+    pcall(function() entry.meshes:setMaterialProperty('ksEmissive', col) end)
+  end
+end
+
+local function updateBrakeDiscGlow(dtStep, force)
+  if type(dtStep) == 'number' and dtStep > 0 then
+    local brk = state.brake or 0
+    local spd = state.speedMps or 0
+    local heat = (brk >= 0.05 and spd > 8.0) and (brk * math.min(1.0, spd / 45.0) * 0.65 * dtStep) or 0
+    local cool = (0.10 + 0.08 * math.min(1.0, spd / 50.0)) * dtStep
+    state.brakeDiscTemp = clamp01((state.brakeDiscTemp or 0) + heat - cool)
+  end
+  local meshes = state.brakeDiscMeshes
+  if not meshes then return end
+  local glow = 0
+  if brakeGlowEnabled() and state.brakeDiscTemp > 0.18 then
+    glow = (state.brakeDiscTemp - 0.18) / 0.82
+  end
+  if not force and math.abs(glow - (state.appliedBrakeGlow or -1)) < 0.02 then
+    return
+  end
+  state.appliedBrakeGlow = glow
+  local col = glow > 0.01
+    and vec3(glow * 18.0, glow * 3.2, glow * 0.25)
+    or vec3(0, 0, 0)
+  pcall(function() meshes:setMaterialProperty('ksEmissive', col) end)
+end
+
+local function isInteriorLightName(name)
+  local low = tostring(name or ''):lower()
+  return low:find('int_', 1, true) ~= nil
+    or low:find('arrow_', 1, true) ~= nil
+    or low:find('dash', 1, true) ~= nil
+    or low:find('gauge', 1, true) ~= nil
+    or low:find('cockpit', 1, true) ~= nil
+    or low:find('interior', 1, true) ~= nil
+    or low:find('display', 1, true) ~= nil
+end
+
 local function collectBrakeLights(model)
   state.brakeLightSets = {}
+  state.headlightSets = {}
+  state.brakeDiscMeshes = nil
   state.brakeLit = false
+  state.brakeDiscTemp = 0
+  state.appliedBrakeGlow = -1
   if not model or type(model.findMeshes) ~= 'function' then return end
 
   local entries = {}
+  local headEntries = {}
   local seen = {}
+  local seenHead = {}
   local source = 'none'
-  local function tryAddMesh(name, onColor)
+  local function tryAddBrakeMesh(name, onColor, offColor)
     if type(name) ~= 'string' or name == '' then return end
     local key = name:lower()
     if seen[key] then return end
@@ -1361,6 +1579,23 @@ local function collectBrakeLights(model)
         name = name,
         meshes = m,
         onColor = onColor or vec3(180, 2, 1),
+        offColor = offColor or vec3(0, 0, 0),
+      }
+    end
+  end
+  local function tryAddHeadMesh(name, onColor)
+    if type(name) ~= 'string' or name == '' or isInteriorLightName(name) then return end
+    local key = name:lower()
+    if seenHead[key] or seen[key] then return end
+    local ok, m = pcall(function() return model:findMeshes(name) end)
+    if ok and m and (type(m.empty) ~= 'function' or not m:empty()) then
+      seenHead[key] = true
+      local c = onColor or vec3(60, 58, 55)
+      -- Keep headlights clearly visible in mirrors without excessive bloom
+      headEntries[#headEntries + 1] = {
+        name = name,
+        meshes = m,
+        onColor = vec3(c.x * 0.35, c.y * 0.35, c.z * 0.35),
       }
     end
   end
@@ -1392,7 +1627,13 @@ local function collectBrakeLights(model)
       for _, section in cfg:iterate('BRAKE') do
         local name = cfg:get(section, 'NAME', '')
         local rawColor = cfg:get(section, 'COLOR', '')
-        tryAddMesh(name, parseRgb3(rawColor, 180, 2, 1))
+        local rawOff = cfg:get(section, 'OFF_COLOR', '')
+        tryAddBrakeMesh(name, parseRgb3(rawColor, 180, 2, 1), parseRgb3(rawOff, 0, 0, 0))
+      end
+      for _, section in cfg:iterate('LIGHT') do
+        local name = cfg:get(section, 'NAME', '')
+        local rawColor = cfg:get(section, 'COLOR', '')
+        tryAddHeadMesh(name, parseRgb3(rawColor, 120, 115, 110))
       end
     end)
   elseif cfg and type(cfg.get) == 'function' then
@@ -1401,7 +1642,14 @@ local function collectBrakeLights(model)
       local name = cfg:get(sec, 'NAME', '')
       if type(name) == 'string' and name ~= '' then
         local rawColor = cfg:get(sec, 'COLOR', '')
-        tryAddMesh(name, parseRgb3(rawColor, 180, 2, 1))
+        local rawOff = cfg:get(sec, 'OFF_COLOR', '')
+        tryAddBrakeMesh(name, parseRgb3(rawColor, 180, 2, 1), parseRgb3(rawOff, 0, 0, 0))
+      end
+      local lsec = 'LIGHT_'..i
+      local lname = cfg:get(lsec, 'NAME', '')
+      if type(lname) == 'string' and lname ~= '' then
+        local rawColor = cfg:get(lsec, 'COLOR', '')
+        tryAddHeadMesh(lname, parseRgb3(rawColor, 120, 115, 110))
       end
     end
   end
@@ -1409,13 +1657,22 @@ local function collectBrakeLights(model)
   if #entries == 0 then
     source = 'fallback'
     for _, pattern in ipairs({ 'RearLight_0', 'RearLight_1', 'CENTRAL_light', '{?brake?}', '{?stop?}' }) do
-      tryAddMesh(pattern, vec3(180, 2, 1))
+      tryAddBrakeMesh(pattern, vec3(180, 2, 1), vec3(6, 0, 0))
     end
   end
 
+  local okDisc, discM = pcall(function() return model:findMeshes('shader:ksBrakeDisc') end)
+  if okDisc and discM and (type(discM.empty) ~= 'function' or not discM:empty()) then
+    state.brakeDiscMeshes = discM
+  end
+
   state.brakeLightSets = entries
+  state.headlightSets = headEntries
   applyBrakeLightState(false, true)
-  appendLog(string.format('BRAKELIGHTS count=%d source=%s', #entries, source))
+  applyHeadlightState()
+  updateBrakeDiscGlow(0, true)
+  appendLog(string.format('BRAKELIGHTS count=%d headlights=%d discs=%d source=%s',
+    #entries, #headEntries, state.brakeDiscMeshes and 1 or 0, source))
 end
 
 local function updateGhostAlpha(alpha)
@@ -1432,9 +1689,9 @@ local function updateGhostAlpha(alpha)
   end
   state.appliedAlpha = clamped
   state.materialMode = clamped < 0.999 and 'alpha' or 'opaque'
-  if state.brakeLit then
-    applyBrakeLightState(true, true)
-  end
+  applyBrakeLightState(state.brakeLit, true)
+  applyHeadlightState()
+  updateBrakeDiscGlow(0, true)
   updateInteriorVisibility(ghostVisibleEnabled(), clamped < 0.999)
 end
 
@@ -1502,8 +1759,14 @@ local function applyGhostMaterials(model)
   state.ghostMeshSets = {}
   state.interiorMeshSets = {}
   state.brakeLightSets = {}
+  state.headlightSets = {}
+  state.brakeDiscMeshes = nil
   state.brake = 0
+  state.throttle = 0
+  state.gear = 0
   state.brakeLit = false
+  state.brakeDiscTemp = 0
+  state.appliedBrakeGlow = -1
   state.interiorMeshes = 0
   if type(render) ~= 'table' or not render.BlendMode then
     return nil, 'render.BlendMode-missing'
@@ -2103,6 +2366,11 @@ local function sampleRuntimeFrame(elapsed)
   local brakeA = type(a.brake) == 'number' and a.brake or 0
   local brakeB = type(b.brake) == 'number' and b.brake or 0
   state.brake = brakeA + (brakeB - brakeA) * k
+  local thrA = type(a.throttle) == 'number' and a.throttle or 0
+  local thrB = type(b.throttle) == 'number' and b.throttle or 0
+  state.throttle = thrA + (thrB - thrA) * k
+  local gearVal = (k < 0.5) and a.gear or b.gear
+  state.gear = type(gearVal) == 'number' and math.floor(gearVal + 0.5) or 0
   return x, y, z, yaw, speed, pitch
 end
 
@@ -2704,6 +2972,7 @@ local function updateGhost(dt)
     updateWheels(state.steerRad, speed, advanceStep)
     refreshGhostOpacity(false)
     applyBrakeLightState((state.brake or 0) >= 0.03, false)
+    updateBrakeDiscGlow(advanceStep, false)
     updateGhostDelta(player, step)
     state.smooth.frames = state.smooth.frames + 1
   else
@@ -3031,6 +3300,25 @@ function script.windowSettings(dt)
       settings.distanceFade = not fade
       refreshGhostOpacity(true)
     end
+    local lineOn = racingLineEnabled()
+    if ui.checkbox('3D brake/throttle racing line', lineOn) then
+      settings.showRacingLine = not lineOn
+    end
+    local hudOn = carHudEnabled()
+    if ui.checkbox('3D gear & pedal HUD above ghost', hudOn) then
+      settings.showCarHud = not hudOn
+    end
+    local glowOn = brakeGlowEnabled()
+    if ui.checkbox('Glowing brake discs', glowOn) then
+      settings.showBrakeGlow = not glowOn
+      updateBrakeDiscGlow(0, true)
+    end
+    local runOn = runningLightsEnabled()
+    if ui.checkbox('Headlights & tail running lights', runOn) then
+      settings.showRunningLights = not runOn
+      applyBrakeLightState(state.brakeLit, true)
+      applyHeadlightState()
+    end
     local cross = debugCrossEnabled()
     if ui.checkbox('Show debug cross', cross) then
       settings.debugCross = not cross
@@ -3076,10 +3364,17 @@ function script.windowSettings(dt)
       settings.leadS = GHOST_DEFAULT_LEAD_S
       settings.heightOffsetM = 0.0
       settings.startOffsetS = GHOST_START_OFFSET_S
+      settings.showRacingLine = true
+      settings.showCarHud = true
+      settings.showBrakeGlow = true
+      settings.showRunningLights = true
       settings.debugCross = false
       state.fadeHidden = false
       applyGhostVisibility(true)
       refreshGhostOpacity(true)
+      applyBrakeLightState(state.brakeLit, true)
+      applyHeadlightState()
+      updateBrakeDiscGlow(0, true)
     end
     if type(ui.sameLine) == 'function' then ui.sameLine(0, 8) end
     if ui.button('Copy log path') then
