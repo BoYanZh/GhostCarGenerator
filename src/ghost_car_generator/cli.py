@@ -32,9 +32,11 @@ from .ld_replay import (
 from .motec import extract_motec_points, parse_channel_overrides
 from .replay_writer import _estimate_wheel_position_offsets
 from .runtime_ghost import (
+    deploy_runtime_ghost_to_ac,
     export_runtime_ghost_from_acreplay,
-    export_runtime_ghost_from_ld,
+    export_runtime_ghost_from_telemetry,
 )
+from .telemetry import is_telemetry_path
 
 
 def _csv_values(text: str, converter: Callable[[str], Any]) -> List[Any]:
@@ -1254,86 +1256,127 @@ def _handle_replay_offset_track(args: argparse.Namespace) -> None:
 
 
 def _handle_replay_export_runtime(args: argparse.Namespace) -> None:
+    import tempfile
+
     input_path = Path(args.input).expanduser()
-    output_path = Path(args.output).expanduser()
-    is_ld = input_path.suffix.lower() == ".ld"
-    if is_ld:
-        if not args.gps_track:
-            raise ValueError("--gps-track is required when exporting from a MoTeC .ld file")
-        result = export_runtime_ghost_from_ld(
-            input_path,
-            output_path,
-            gps_track_path=args.gps_track,
-            car_id=args.car_id or "ig_toyota_gr86_premium",
-            track_id=args.track_id,
-            lap=args.lap,
-            channel_overrides=parse_channel_overrides(args.channel),
-            height_mode=args.height_mode,
-            height_offset_m=args.height_offset_m,
-            track_surface_paths=args.track_surface,
-            position_smoothing_s=args.position_smoothing_s,
-            yaw_smoothing_s=args.yaw_smoothing_s,
-            fit_pavement=not args.no_fit_pavement,
-            pavement_search_radius_m=args.pavement_search_radius_m,
-            clamp_pavement=not args.no_clamp_pavement,
-            pavement_margin_m=args.pavement_margin_m,
-            align_start_line=True if args.align_start_line is None else args.align_start_line,
-            smooth=True if args.smooth is None else args.smooth,
-        )
-        print(
-            "Exported LD lap {selectedLap} ({lapTimeS:.3f}s, {frameCount} frames) -> {output}".format(
-                **result
-            )
-        )
-        if result["pavementFit"] is not None:
-            pf = result["pavementFit"]
-            off = pf["pavementOffsetAcM"]
-            print(
-                "Pavement fit: dx={x:+.2f}m, dz={z:+.2f}m, rot={rot:+.2f}deg, "
-                "on-road {before:.1%} -> {after:.1%}, both-wheels {b2:.1%} -> {a2:.1%}".format(
-                    x=off["x"],
-                    z=off["z"],
-                    rot=pf.get("pavementRotationDeg", 0.0),
-                    before=pf["pavementOnRoadBefore"],
-                    after=pf["pavementOnRoadAfter"],
-                    b2=pf["pavementBothWheelsBefore"],
-                    a2=pf["pavementBothWheelsAfter"],
-                )
-            )
-        if result["pavementClamp"] is not None:
-            pc = result["pavementClamp"]
-            print(
-                "Pavement clamp: margin={m:.2f}m, off-road pts {b} -> {a}, max pull {mp:.2f}m".format(
-                    m=pc["pavementClampMarginM"],
-                    b=pc["pavementClampOffBefore"],
-                    a=pc["pavementClampOffAfter"],
-                    mp=pc["pavementClampMaxPullM"],
-                )
-            )
-        if result["onPavementPct"] is not None:
-            print(
-                "Height: {heightMode} (offset {heightOffsetM:+.4f}m), final on-pavement {onPavementPct:.2f}%".format(
-                    **result
-                )
-            )
+    if not args.output and not args.deploy_ac:
+        raise ValueError("Provide -o/--output and/or --deploy-ac")
+
+    temp_ctx = None
+    if args.output:
+        output_path = Path(args.output).expanduser()
     else:
-        result = export_runtime_ghost_from_acreplay(
-            input_path,
-            output_path,
-            car_index=args.car,
-            car_id=args.car_id,
-            track_id=args.track_id,
-            height_offset_m=0.0 if args.height_offset_m is None else args.height_offset_m,
-            gps_track_path=args.gps_track,
-            align_start_line=False if args.align_start_line is None else args.align_start_line,
-            smooth=False if args.smooth is None else args.smooth,
-            lap_time_s=args.lap_time_s,
-        )
-        print(
-            "Exported acreplay car {car} ({carId} @ {trackId}, {lapTimeS:.3f}s, {frameCount} frames) -> {output}".format(
-                car=args.car, **result
+        temp_ctx = tempfile.TemporaryDirectory()
+        output_path = Path(temp_ctx.name) / f"{input_path.stem}.json"
+
+    try:
+        if is_telemetry_path(input_path):
+            if not args.gps_track and not args.ac_track_dir:
+                raise ValueError(
+                    "Provide --gps-track or --ac-track-dir when exporting from telemetry"
+                )
+            result = export_runtime_ghost_from_telemetry(
+                input_path,
+                output_path,
+                gps_track_path=args.gps_track,
+                ac_track_dir=args.ac_track_dir,
+                ac_layout=args.ac_layout,
+                car_id=args.car_id or "ig_toyota_gr86_premium",
+                track_id=args.track_id,
+                lap=args.lap,
+                channel_overrides=parse_channel_overrides(args.channel),
+                height_mode=args.height_mode,
+                height_offset_m=args.height_offset_m,
+                track_surface_paths=args.track_surface,
+                position_smoothing_s=args.position_smoothing_s,
+                yaw_smoothing_s=args.yaw_smoothing_s,
+                fit_pavement=not args.no_fit_pavement,
+                pavement_search_radius_m=args.pavement_search_radius_m,
+                clamp_pavement=not args.no_clamp_pavement,
+                pavement_margin_m=args.pavement_margin_m,
+                align_start_line=True if args.align_start_line is None else args.align_start_line,
+                smooth=True if args.smooth is None else args.smooth,
             )
-        )
+            print(
+                "Exported {mode} lap {selectedLap} ({lapTimeS:.3f}s, {frameCount} frames, track={trackId}) -> {output}".format(
+                    mode=str(result["sourceMode"]).upper(), **result
+                )
+            )
+            if result.get("autoCalibrated"):
+                print(
+                    "Auto-calibrated from AC fast_lane.ai + KN5 (raw GPS RMS {alignmentRmsRawM:.2f}m)".format(
+                        **result
+                    )
+                )
+            if result["pavementFit"] is not None:
+                pf = result["pavementFit"]
+                off = pf["pavementOffsetAcM"]
+                print(
+                    "Pavement fit: dx={x:+.2f}m, dz={z:+.2f}m, rot={rot:+.2f}deg, "
+                    "on-road {before:.1%} -> {after:.1%}, both-wheels {b2:.1%} -> {a2:.1%}".format(
+                        x=off["x"],
+                        z=off["z"],
+                        rot=pf.get("pavementRotationDeg", 0.0),
+                        before=pf["pavementOnRoadBefore"],
+                        after=pf["pavementOnRoadAfter"],
+                        b2=pf["pavementBothWheelsBefore"],
+                        a2=pf["pavementBothWheelsAfter"],
+                    )
+                )
+            if result["pavementClamp"] is not None:
+                pc = result["pavementClamp"]
+                print(
+                    "Pavement clamp: margin={m:.2f}m, off-road pts {b} -> {a}, max pull {mp:.2f}m".format(
+                        m=pc["pavementClampMarginM"],
+                        b=pc["pavementClampOffBefore"],
+                        a=pc["pavementClampOffAfter"],
+                        mp=pc["pavementClampMaxPullM"],
+                    )
+                )
+            if result["onPavementPct"] is not None:
+                print(
+                    "Height: {heightMode} (offset {heightOffsetM:+.4f}m), final on-pavement {onPavementPct:.2f}%".format(
+                        **result
+                    )
+                )
+        else:
+            result = export_runtime_ghost_from_acreplay(
+                input_path,
+                output_path,
+                car_index=args.car,
+                car_id=args.car_id,
+                track_id=args.track_id,
+                height_offset_m=0.0 if args.height_offset_m is None else args.height_offset_m,
+                gps_track_path=args.gps_track,
+                align_start_line=False if args.align_start_line is None else args.align_start_line,
+                smooth=False if args.smooth is None else args.smooth,
+                lap_time_s=args.lap_time_s,
+            )
+            print(
+                "Exported acreplay car {car} ({carId} @ {trackId}, {lapTimeS:.3f}s, {frameCount} frames) -> {output}".format(
+                    car=args.car, **result
+                )
+            )
+
+        if args.deploy_ac:
+            default_name = args.ghost_name or (
+                f"{input_path.stem}_lap{result['selectedLap']}"
+                if result.get("selectedLap") is not None
+                else input_path.stem
+            )
+            dep = deploy_runtime_ghost_to_ac(
+                output_path,
+                result["trackId"],
+                ac_root=args.deploy_ac,
+                ghost_name=default_name,
+                sync_lua=not args.no_sync_lua,
+            )
+            print(f"Deployed to AC: {dep['deployedPath']}")
+            if dep["syncedLuaFiles"]:
+                print(f"Synced CSP app files: {len(dep['syncedLuaFiles'])} file(s)")
+    finally:
+        if temp_ctx is not None:
+            temp_ctx.cleanup()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1625,20 +1668,51 @@ def _build_parser() -> argparse.ArgumentParser:
 
     replay_export_runtime = replay_commands.add_parser(
         "export-runtime",
-        help="Export a CSP Lua ghost-runtime-v1.json from a MoTeC .ld or AC .acreplay",
+        help="Export a CSP Lua ghost-runtime-v1.json from .ld/.ibt/.csv/.rcz/.xrk or .acreplay",
     )
     replay_export_runtime.add_argument(
-        "input", help="Input MoTeC .ld or Assetto Corsa .acreplay path"
+        "input", help="Input telemetry (.ld, .ibt, .csv, .rcz, .xrk) or .acreplay path"
     )
     replay_export_runtime.add_argument(
-        "-o", "--output", required=True, help="Output ghost-runtime-v1.json path"
+        "-o", "--output", help="Output ghost-runtime-v1.json path (optional when using --deploy-ac)"
     )
     replay_export_runtime.add_argument(
         "--gps-track",
         help=(
             "Calibrated track.json, track package dir, or builtin:<path> "
-            "(required for .ld; optional for .acreplay start-line alignment)"
+            "(optional if --ac-track-dir is provided)"
         ),
+    )
+    replay_export_runtime.add_argument(
+        "--ac-track-dir",
+        help=(
+            "Assetto Corsa track folder (e.g. content/tracks/<track>) for zero-replay "
+            "auto-calibration from fast_lane.ai + .kn5"
+        ),
+    )
+    replay_export_runtime.add_argument(
+        "--ac-layout",
+        help="Track layout subfolder name inside --ac-track-dir (e.g. threemilebypass)",
+    )
+    replay_export_runtime.add_argument(
+        "--deploy-ac",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="AC_ROOT",
+        help=(
+            "Deploy directly into <AC_ROOT>/apps/lua/ghostcar_hotlap/tracks/<track>/<layout>/ "
+            "(auto-detects AC install if AC_ROOT is omitted)"
+        ),
+    )
+    replay_export_runtime.add_argument(
+        "--ghost-name",
+        help="Target filename stem when deploying with --deploy-ac (default: <input>_lap<N>)",
+    )
+    replay_export_runtime.add_argument(
+        "--no-sync-lua",
+        action="store_true",
+        help="Do not sync ghostcar_hotlap.lua / manifest.ini when using --deploy-ac",
     )
     replay_export_runtime.add_argument(
         "--car",

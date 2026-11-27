@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.18'
+local APP_VERSION = '0.19'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -436,6 +436,10 @@ local runtime = nil
 local runtimeDurationS = 0
 local runtimeSmoothedTag = 'none'
 local runtimeTrackMismatch = nil
+local runtimeCandidates = {}
+local activeRuntimeIndex = 0
+local activeRuntimePath = nil
+local activeRuntimeLabel = 'none'
 local renderSubscription = nil
 
 -- ---------------------------------------------------------------------------
@@ -501,30 +505,50 @@ local function trackMatchesRuntime(expectedTrackId)
   return true, curCombined
 end
 
-local function resolveRuntimePath()
-  local curTrack, curLayout = getCurrentTrackAndLayout()
-  local candidates = {}
-  if curTrack ~= '' and curLayout ~= '' then
-    candidates[#candidates + 1] = __dirname..'/tracks/'..curTrack..'/'..curLayout..'/ghost-runtime-v1.json'
-  end
-  if curTrack ~= '' then
-    candidates[#candidates + 1] = __dirname..'/tracks/'..curTrack..'/ghost-runtime-v1.json'
-  end
-  candidates[#candidates + 1] = RUNTIME_FILENAME
-  for _, path in ipairs(candidates) do
-    if io.fileExists(path) then
-      return path
-    end
-  end
-  return nil
+local function basenameOf(path)
+  if type(path) ~= 'string' then return 'unknown' end
+  return (path:gsub('\\', '/'):match('([^/]+)$') or path)
 end
 
-local function loadRuntime()
-  runtimeTrackMismatch = nil
-  local path = resolveRuntimePath()
-  if not path then
-    return nil, 'missing-runtime'
+local function formatLapShort(sec)
+  if type(sec) ~= 'number' or sec <= 0 then return '--' end
+  local mins = math.floor(sec / 60)
+  local rem = sec - mins * 60
+  if mins > 0 then
+    return string.format('%d:%06.3f', mins, rem)
   end
+  return string.format('%.3fs', rem)
+end
+
+local function listJsonFilesInDir(dir)
+  local found = {}
+  local seen = {}
+  local function addPath(p)
+    local key = p:gsub('\\', '/'):lower()
+    if not seen[key] and io.fileExists(p) then
+      seen[key] = true
+      found[#found + 1] = p
+    end
+  end
+  if type(io.scanDir) == 'function' then
+    local names = {}
+    pcall(function()
+      io.scanDir(dir, '*.json', function(fileName)
+        if type(fileName) == 'string' and fileName:lower():sub(-5) == '.json' then
+          names[#names + 1] = fileName
+        end
+      end)
+    end)
+    table.sort(names)
+    for _, name in ipairs(names) do
+      addPath(dir..'/'..name)
+    end
+  end
+  addPath(dir..'/ghost-runtime-v1.json')
+  return found
+end
+
+local function decodeRuntimeFile(path)
   local text = io.load(path)
   if not text or text == '' then
     return nil, 'runtime-unreadable'
@@ -550,14 +574,122 @@ local function loadRuntime()
   if type(last.timeS) ~= 'number' or last.timeS <= 0 then
     return nil, 'runtime-duration-invalid'
   end
-  local matched, curCombined = trackMatchesRuntime(decoded.trackId)
-  if not matched then
-    runtimeTrackMismatch = {
-      current = curCombined,
-      expected = tostring(decoded.trackId or 'unknown'),
-    }
-    return nil, 'track-mismatch'
+  return decoded, nil
+end
+
+local function computeDurationS(decoded)
+  if not decoded or type(decoded.frames) ~= 'table' or #decoded.frames == 0 then
+    return 0
   end
+  local count = #decoded.frames
+  local lastTime = decoded.frames[count].timeS
+  local dtNom = (type(decoded.frameIntervalS) == 'number' and decoded.frameIntervalS > 0)
+    and decoded.frameIntervalS or 0.015
+  if type(decoded.lapTimeS) == 'number' and decoded.lapTimeS > lastTime then
+    return decoded.lapTimeS
+  elseif count >= 2 then
+    return lastTime + dtNom
+  end
+  return lastTime
+end
+
+local function scanRuntimeCandidates()
+  local curTrack, curLayout, curCombined = getCurrentTrackAndLayout()
+  local paths = {}
+  local seen = {}
+  local function appendPaths(list)
+    for _, p in ipairs(list) do
+      local key = p:gsub('\\', '/'):lower()
+      if not seen[key] then
+        seen[key] = true
+        paths[#paths + 1] = p
+      end
+    end
+  end
+  if curTrack ~= '' and curLayout ~= '' then
+    appendPaths(listJsonFilesInDir(__dirname..'/tracks/'..curTrack..'/'..curLayout))
+  end
+  if curTrack ~= '' then
+    appendPaths(listJsonFilesInDir(__dirname..'/tracks/'..curTrack))
+  end
+  if io.fileExists(RUNTIME_FILENAME) then
+    appendPaths({ RUNTIME_FILENAME })
+  end
+
+  local matches = {}
+  local firstMismatch = nil
+  local firstError = nil
+  for _, p in ipairs(paths) do
+    local decoded, err = decodeRuntimeFile(p)
+    if decoded then
+      local matched, cur = trackMatchesRuntime(decoded.trackId)
+      if matched then
+        local dur = computeDurationS(decoded)
+        local name = basenameOf(p)
+        matches[#matches + 1] = {
+          path = p,
+          name = name,
+          label = string.format('%s (%s)', name, formatLapShort(dur)),
+          carId = tostring(decoded.carId or 'unknown'),
+          trackId = tostring(decoded.trackId or 'unknown'),
+          lapTimeS = dur,
+        }
+      elseif not firstMismatch then
+        firstMismatch = {
+          current = cur,
+          expected = tostring(decoded.trackId or 'unknown'),
+        }
+      end
+    elseif not firstError then
+      firstError = err
+    end
+  end
+  return matches, firstMismatch, firstError, curCombined
+end
+
+local function loadRuntime(preferredPath)
+  runtimeTrackMismatch = nil
+  local matches, firstMismatch, firstError, curCombined = scanRuntimeCandidates()
+  runtimeCandidates = matches
+  activeRuntimeIndex = 0
+  activeRuntimePath = nil
+  activeRuntimeLabel = 'none'
+
+  if #matches == 0 then
+    if firstMismatch then
+      runtimeTrackMismatch = firstMismatch
+      return nil, 'track-mismatch'
+    end
+    return nil, firstError or 'missing-runtime'
+  end
+
+  local wantPath = preferredPath
+  if (not wantPath or wantPath == '') and curCombined ~= '' and type(ac.load) == 'function' then
+    local ok, saved = pcall(ac.load, 'gcg_ghost_sel_'..curCombined)
+    if ok and type(saved) == 'string' and saved ~= '' then
+      wantPath = saved
+    end
+  end
+
+  local chosenIdx = 1
+  if wantPath and wantPath ~= '' then
+    local wantNorm = wantPath:gsub('\\', '/'):lower()
+    for i, item in ipairs(matches) do
+      if item.path:gsub('\\', '/'):lower() == wantNorm then
+        chosenIdx = i
+        break
+      end
+    end
+  end
+
+  local chosen = matches[chosenIdx]
+  local decoded, err = decodeRuntimeFile(chosen.path)
+  if not decoded then
+    return nil, err or 'runtime-unreadable'
+  end
+  activeRuntimeIndex = chosenIdx
+  activeRuntimePath = chosen.path
+  activeRuntimeLabel = chosen.label
   return decoded, nil
 end
 
@@ -638,23 +770,19 @@ local function smoothTimelineIfNeeded(decoded)
   return string.format('auto(p95=%.2f)', p95)
 end
 
-local runtimeError = nil
-runtime, runtimeError = loadRuntime()
-if runtime then
-  runtimeSmoothedTag = smoothTimelineIfNeeded(runtime)
-  local count = #runtime.frames
-  local lastTime = runtime.frames[count].timeS
-  local dtNom = (type(runtime.frameIntervalS) == 'number' and runtime.frameIntervalS > 0)
-    and runtime.frameIntervalS or 0.015
-  if type(runtime.lapTimeS) == 'number' and runtime.lapTimeS > lastTime then
-    runtimeDurationS = runtime.lapTimeS
-  elseif count >= 2 then
-    -- Preserve exact loop period including the wrap segment frames[count]->frames[1].
-    runtimeDurationS = lastTime + dtNom
+local function applyLoadedRuntime(decoded)
+  if decoded then
+    runtimeSmoothedTag = smoothTimelineIfNeeded(decoded)
+    runtimeDurationS = computeDurationS(decoded)
   else
-    runtimeDurationS = lastTime
+    runtimeSmoothedTag = 'none'
+    runtimeDurationS = 0
   end
 end
+
+local runtimeError = nil
+runtime, runtimeError = loadRuntime(nil)
+applyLoadedRuntime(runtime)
 
 -- The INIT line is emitted only once the single-instance guard has made this
 -- instance the writer, so a duplicate app instance cannot add a second
@@ -1539,6 +1667,50 @@ local function resetForSession(token)
   state.isPaused = false
   appendLog(string.format('SESSION token=%s syncLaps=%d',
     tostring(token), syncLapsEnabled() and 1 or 0))
+end
+
+local function reloadRuntime(preferredPath, reason)
+  disposeGhost()
+  runtime, runtimeError = loadRuntime(preferredPath)
+  applyLoadedRuntime(runtime)
+  local _, _, curCombined = getCurrentTrackAndLayout()
+  if activeRuntimePath and curCombined ~= '' and type(ac.store) == 'function' then
+    pcall(ac.store, 'gcg_ghost_sel_'..curCombined, activeRuntimePath)
+  end
+  state.status = runtimeTrackMismatch and 'IDLE' or 'INIT'
+  state.mode = nil
+  state.errorMessage = nil
+  state.failed = false
+  state.initFailures = 0
+  state.nextInitAttemptAt = 0
+  state.runtimeTime = 0
+  state.runtimeCursor = 1
+  state.simGameTime = nil
+  state.logAccum = 0
+  state.prevPose = nil
+  state.activeTicks = 0
+  state.lapBaseline = nil
+  state.prevSpline = nil
+  state.deltaS = nil
+  state.deltaRateSps = 0
+  if runtime then
+    appendLog(string.format(
+      'RELOAD reason=%s status=ok file=%s carId=%s trackId=%s lapTimeS=%.3f candidates=%d',
+      sanitizeToken(reason or 'manual'), sanitizeToken(basenameOf(activeRuntimePath)),
+      sanitizeToken(runtime.carId), sanitizeToken(runtime.trackId),
+      runtimeDurationS, #runtimeCandidates))
+  elseif runtimeTrackMismatch then
+    appendLog(string.format(
+      'RELOAD reason=%s status=IDLE current=%s expected=%s candidates=%d',
+      sanitizeToken(reason or 'manual'),
+      sanitizeToken(runtimeTrackMismatch.current),
+      sanitizeToken(runtimeTrackMismatch.expected), #runtimeCandidates))
+  else
+    appendLog(string.format(
+      'RELOAD reason=%s status=%s candidates=%d',
+      sanitizeToken(reason or 'manual'), sanitizeToken(runtimeError or 'missing-runtime'),
+      #runtimeCandidates))
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -2467,6 +2639,9 @@ function script.windowMain(dt)
     ui.text('GhostCarGenerator: IDLE (wrong track)')
     ui.text('Track: '..tostring(runtimeTrackMismatch.current))
     ui.text('Ghost: '..tostring(runtimeTrackMismatch.expected))
+    if type(ui.button) == 'function' and ui.button('Reload ghosts') then
+      reloadRuntime(nil, 'ui-idle-reload')
+    end
   elseif state.status == 'ERROR' then
     ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
   else
@@ -2502,6 +2677,34 @@ function script.windowSettings(dt)
     math.max(0, state.materialMeshes - state.interiorMeshes), state.interiorMeshes))
   if state.materialError then
     ui.text('alpha error: '..tostring(state.materialError))
+  end
+
+  if #runtimeCandidates > 0 then
+    ui.text(string.format('Ghost [%d/%d]: %s',
+      activeRuntimeIndex, #runtimeCandidates, tostring(activeRuntimeLabel)))
+  elseif runtimeTrackMismatch then
+    ui.text('Ghost: IDLE (wrong track: '..tostring(runtimeTrackMismatch.current)..')')
+  else
+    ui.text('Ghost: none (5m fallback)')
+  end
+  if type(ui.button) == 'function' then
+    if #runtimeCandidates > 1 then
+      if ui.button('< Prev') then
+        local prevIdx = activeRuntimeIndex - 1
+        if prevIdx < 1 then prevIdx = #runtimeCandidates end
+        reloadRuntime(runtimeCandidates[prevIdx].path, 'ui-prev')
+      end
+      if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
+      if ui.button('Next >') then
+        local nextIdx = activeRuntimeIndex + 1
+        if nextIdx > #runtimeCandidates then nextIdx = 1 end
+        reloadRuntime(runtimeCandidates[nextIdx].path, 'ui-next')
+      end
+      if type(ui.sameLine) == 'function' then ui.sameLine(0, 8) end
+    end
+    if ui.button('Reload ghosts') then
+      reloadRuntime(activeRuntimePath, 'ui-reload')
+    end
   end
 
   if type(ui.checkbox) == 'function' then

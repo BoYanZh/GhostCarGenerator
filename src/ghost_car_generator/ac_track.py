@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 __all__ = [
+    "auto_calibrate_from_ac_track",
     "calibrate_track",
+    "discover_ac_track_files",
     "load_track_package",
     "load_track_reference_path",
+    "read_ac_fast_lane",
 ]
 
+import configparser
 import json
 import math
+import struct
 from pathlib import Path, PurePosixPath
 
 import numpy as np
 
 from .acreplay import parse_acreplay
 from .motec import extract_motec_points
+from .telemetry import extract_telemetry_points
 
 EARTH_RADIUS_M = 6371008.8
 BUILTIN_TRACK_ROOT = Path(__file__).resolve().parent / "resources" / "tracks"
@@ -158,9 +164,161 @@ def _select_replay_reference(replay, car_index, reference_lap):
     return selected
 
 
-def load_track_reference_path(reference_path, car_index=0, reference_lap=None):
-    """Load the AC-world reference path from a package/JSON or native replay."""
+_NON_ROAD_KN5_HINTS = (
+    "tree",
+    "flag",
+    "tower",
+    "crowd",
+    "spectator",
+    "sky",
+    "camera",
+    "marshal",
+    "balloon",
+    "heli",
+    "plane",
+    "sign",
+    "billboard",
+    "light",
+    "tent",
+    "building",
+    "garage",
+    "pitbox",
+)
+
+
+def read_ac_fast_lane(ai_path):
+    """Read an Assetto Corsa ``fast_lane.ai`` binary file into an Nx3 AC-world array."""
+    path = Path(ai_path).expanduser()
+    data = path.read_bytes()
+    if len(data) < 16:
+        raise ValueError("fast_lane.ai file is too small: {}".format(path))
+    _version, detail_count, _lap_time, _sample_count = struct.unpack_from("<4i", data, 0)
+    if detail_count < 3:
+        raise ValueError("fast_lane.ai has fewer than 3 detail points: {}".format(path))
+    needed = 16 + detail_count * 20
+    if len(data) < needed:
+        raise ValueError("fast_lane.ai is truncated: {}".format(path))
+    raw = np.frombuffer(
+        data,
+        dtype=np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("dist", "<f4"), ("id", "<i4")]),
+        count=detail_count,
+        offset=16,
+    )
+    points = np.column_stack((raw["x"], raw["y"], raw["z"])).astype(np.float64)
+    return points
+
+
+def discover_ac_track_files(track_dir, layout=None):
+    """Discover ``fast_lane.ai`` and road-bearing ``.kn5`` files in an AC track directory."""
+    root = Path(track_dir).expanduser()
+    if not root.is_dir():
+        raise ValueError("AC track directory does not exist: {}".format(root))
+    track_name = root.name
+    layout_name = str(layout or "").strip()
+
+    # Locate fast_lane.ai
+    ai_candidates = []
+    if layout_name:
+        ai_candidates.append(root / layout_name / "ai" / "fast_lane.ai")
+    ai_candidates.append(root / "ai" / "fast_lane.ai")
+    fast_lane = next((p for p in ai_candidates if p.is_file()), None)
+    if fast_lane is None and not layout_name:
+        # Auto-pick single layout if only one subdir has ai/fast_lane.ai
+        found = sorted(root.glob("*/ai/fast_lane.ai"))
+        if len(found) == 1:
+            fast_lane = found[0]
+            layout_name = found[0].parent.parent.name
+    if fast_lane is None:
+        raise ValueError(
+            "Could not find ai/fast_lane.ai in {} (layout={!r})".format(root, layout_name)
+        )
+
+    # Locate KN5 files via models_<layout>.ini or models.ini
+    ini_candidates = []
+    if layout_name:
+        ini_candidates.append(root / f"models_{layout_name}.ini")
+    ini_candidates.append(root / "models.ini")
+    models_ini = next((p for p in ini_candidates if p.is_file()), None)
+
+    kn5_files = []
+    if models_ini is not None:
+        parser = configparser.ConfigParser(strict=False)
+        try:
+            parser.read(models_ini, encoding="utf-8", errors="ignore")
+        except TypeError:
+            parser.read(models_ini, encoding="utf-8")
+        for section in parser.sections():
+            if not section.upper().startswith("MODEL_"):
+                continue
+            fname = parser.get(section, "FILE", fallback="").strip()
+            if not fname:
+                continue
+            cand = root / fname
+            if cand.is_file() and cand not in kn5_files:
+                kn5_files.append(cand)
+    else:
+        for name in (f"{layout_name}.kn5" if layout_name else "", f"{track_name}.kn5"):
+            if name and (root / name).is_file():
+                kn5_files.append(root / name)
+        if not kn5_files:
+            kn5_files = sorted(root.glob("*.kn5"))
+
+    # Prioritize road-bearing KN5 files (skip obvious scenery props when others exist)
+    road_kn5 = [
+        p
+        for p in kn5_files
+        if not any(hint in p.stem.lower() for hint in _NON_ROAD_KN5_HINTS)
+    ]
+    return {
+        "trackName": track_name,
+        "layout": layout_name,
+        "fastLanePath": fast_lane,
+        "kn5Paths": road_kn5 or kn5_files,
+        "allKn5Paths": kn5_files,
+    }
+
+
+def load_track_reference_path(reference_path, car_index=0, reference_lap=None, layout=None):
+    """Load the AC-world reference path from a package/JSON, AC track dir, ``.ai``, or replay."""
     path = Path(reference_path).expanduser()
+    if path.suffix.casefold() == ".ai":
+        points = read_ac_fast_lane(path)
+        track_layout = ""
+        track_name = path.parent.parent.name
+        if path.parent.name.casefold() == "ai":
+            parent_dir = path.parent.parent
+            if (parent_dir.parent / "ui").is_dir() or (
+                parent_dir.parent / f"models_{parent_dir.name}.ini"
+            ).is_file():
+                track_layout = parent_dir.name
+                track_name = parent_dir.parent.name
+        return {
+            "path": points,
+            "track": {"name": track_name, "layout": layout or track_layout},
+            "sourcePath": path,
+            "referenceLap": None,
+            "referenceLengthM": _path_length(points, closed=True),
+            "closureGapM": float(np.linalg.norm(points[-1] - points[0])),
+        }
+
+    if path.is_dir():
+        has_manifest = (path / "manifest.json").is_file() or (path / "package.json").is_file()
+        if not has_manifest:
+            discovered = discover_ac_track_files(path, layout=layout)
+            points = read_ac_fast_lane(discovered["fastLanePath"])
+            return {
+                "path": points,
+                "track": {
+                    "name": discovered["trackName"],
+                    "layout": discovered["layout"],
+                },
+                "sourcePath": discovered["fastLanePath"],
+                "referenceLap": None,
+                "referenceLengthM": _path_length(points, closed=True),
+                "closureGapM": float(np.linalg.norm(points[-1] - points[0])),
+                "kn5Paths": discovered["kn5Paths"],
+            }
+
     if path.is_dir() or path.suffix.casefold() == ".json":
         reference, source_path, _, _ = load_track_package(path)
         points = np.asarray(reference.get("referencePathAc"), dtype=np.float64)
@@ -279,8 +437,13 @@ def calibrate_track(
 
     point_sets = []
     for index, path in enumerate(ld_paths):
+        loader = (
+            extract_motec_points
+            if path.suffix.lower() == ".ld"
+            else extract_telemetry_points
+        )
         point_sets.append(
-            extract_motec_points(
+            loader(
                 path,
                 parser_path=parser_path,
                 channel_overrides=channel_overrides,
@@ -297,6 +460,7 @@ def calibrate_track(
         reference_path,
         car_index=reference_car,
         reference_lap=reference_lap,
+        layout=layout,
     )
     reference_resampled = _resample_path(reference["path"], alignment_samples)
     fit = _best_ordered_fit(
@@ -388,3 +552,116 @@ def calibrate_track(
             "sources": source_diagnostics,
         },
     }
+
+
+def _merge_kn5_surfaces(kn5_paths, mesh_pattern):
+    from .kn5 import read_kn5_surface
+    from .track_surface import TrackSurface
+
+    vertices_list = []
+    triangles_list = []
+    offset = 0
+    for kn5_path in kn5_paths:
+        try:
+            surface, _ = read_kn5_surface(kn5_path, mesh_pattern=mesh_pattern)
+        except ValueError:
+            continue
+        vertices_list.append(surface.vertices)
+        triangles_list.append(surface.triangles + offset)
+        offset += len(surface.vertices)
+    if not vertices_list:
+        return None
+    return TrackSurface(np.vstack(vertices_list), np.vstack(triangles_list))
+
+
+def auto_calibrate_from_ac_track(
+    ac_track_dir,
+    point_set,
+    *,
+    layout=None,
+    track_name=None,
+    alignment_samples=500,
+    allow_scale=False,
+    max_scale_error=0.05,
+    max_rmse_m=15.0,
+    load_kn5_surfaces=True,
+):
+    """Auto-calibrate a single telemetry point-set directly against an AC track folder.
+
+    Uses ``fast_lane.ai`` for 3D centerline & exact start/finish line, and
+    extracts road/terrain ``TrackSurface`` directly from the track's ``.kn5``
+    files—requiring no pre-recorded ``.acreplay`` or pre-baked track package.
+    """
+    discovered = discover_ac_track_files(ac_track_dir, layout=layout)
+    fast_lane = read_ac_fast_lane(discovered["fastLanePath"])
+    origin, source_paths = _common_enu([point_set])
+    source_path = source_paths[0]
+    source_resampled = _resample_path(source_path, int(alignment_samples))
+    reference_resampled = _resample_path(fast_lane, int(alignment_samples))
+
+    fit = _best_ordered_fit(
+        source_resampled[:, :2], reference_resampled[:, [0, 2]], allow_scale
+    )
+    rms, rotation, translation, scale, shift, reversed_path, _ = fit
+    if abs(scale - 1.0) > float(max_scale_error):
+        raise ValueError(
+            "Auto-calibration scale {:.6f} exceeds allowed error {:.2%}".format(
+                scale, max_scale_error
+            )
+        )
+    if rms > float(max_rmse_m):
+        raise ValueError(
+            "Auto-calibration ordered RMSE {:.3f}m exceeds limit {:.3f}m".format(
+                rms, max_rmse_m
+            )
+        )
+
+    ordered_reference = reference_resampled[::-1] if reversed_path else reference_resampled
+    ordered_reference = np.roll(ordered_reference, shift, axis=0)
+    vertical_translation = float(
+        np.median(ordered_reference[:, 1] - source_resampled[:, 2])
+    )
+    matrix = np.array(
+        [
+            [scale * rotation[0, 0], scale * rotation[0, 1], 0.0, translation[0]],
+            [0.0, 0.0, 1.0, vertical_translation],
+            [scale * rotation[1, 0], scale * rotation[1, 1], 0.0, translation[1]],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    resolved_track = {
+        "name": track_name or discovered["trackName"],
+        "layout": discovered["layout"],
+    }
+    track_ref = {
+        "schemaVersion": 1,
+        "track": resolved_track,
+        "origin": origin,
+        "enuToAc": {"matrix": matrix.tolist()},
+        # fast_lane[0] is AC's exact start/finish line position.
+        "startLineAc": fast_lane[0].tolist(),
+        "referencePathAc": fast_lane.tolist(),
+        "calibration": {
+            "method": "ac-fast-lane-auto-fit",
+            "fastLanePath": str(discovered["fastLanePath"]),
+            "alignmentSamples": int(alignment_samples),
+            "scale": float(scale),
+            "orderedRmseM": float(rms),
+            "referenceReversed": bool(reversed_path),
+            "reflected": bool(np.linalg.det(rotation) < 0.0),
+        },
+    }
+
+    road_surface = None
+    full_surface = None
+    if load_kn5_surfaces and discovered["kn5Paths"]:
+        road_surface = _merge_kn5_surfaces(
+            discovered["kn5Paths"], r"^(1ROAD|1PIT|\d*ROAD|\d*ASPHALT)"
+        )
+        full_surface = _merge_kn5_surfaces(
+            discovered["kn5Paths"],
+            r"^(1ROAD|1PIT|1KERB|1CURB|1GRASS|1SAND|1GRAVEL|1TERRAIN|\d*ROAD|\d*KERB)",
+        ) or road_surface
+    return track_ref, road_surface, full_surface

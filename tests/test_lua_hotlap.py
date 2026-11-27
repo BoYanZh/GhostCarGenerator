@@ -503,3 +503,162 @@ print('MISMATCH_IDLE_OK')
     assert "IDLE track-mismatch" in log_text
     assert "ACTIVE mode=" not in log_text
     assert "ERROR " not in log_text
+
+
+@pytest.mark.skipif(_find_lua() is None, reason="lua interpreter not installed")
+def test_lua_multi_ghost_switch_and_hot_reload(tmp_path: Path):
+    """Verify tracks/<track>/<layout>/*.json discovery, live Next> switching, and Reload."""
+    lua = _find_lua()
+    assert lua is not None
+
+    track_dir = tmp_path / "tracks" / "synth_track" / "loop"
+    track_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    def _make_runtime(lap_time_s: float, car_id: str) -> str:
+        frames = [
+            {
+                "timeS": round(i * 0.015, 6),
+                "positionM": [float(i), 0.0, float(i)],
+                "rotationRad": [0.0, 0.0, 0.0],
+                "steerAngleDeg": 0.0,
+                "velocityMS": [0.0, 0.0, 20.0],
+            }
+            for i in range(40)
+        ]
+        return json.dumps(
+            {
+                "schema": "ghost-runtime-v1",
+                "carId": car_id,
+                "trackId": "synth_track/loop",
+                "frameIntervalS": 0.015,
+                "lapTimeS": lap_time_s,
+                "frames": frames,
+            },
+            separators=(",", ":"),
+        )
+
+    (track_dir / "alpha_fast.json").write_text(_make_runtime(95.123, "car_alpha"), encoding="utf-8")
+    (track_dir / "beta_slow.json").write_text(_make_runtime(98.456, "car_beta"), encoding="utf-8")
+
+    harness = tmp_path / "harness_multi.lua"
+    harness.write_text(
+        f"""
+__dirname = {json.dumps(str(tmp_path))}
+script = {{}}
+math.saturate = math.saturate or function(x) return math.max(0, math.min(1, x)) end
+math.atan2 = math.atan2 or math.atan
+function vec2(x, y) return {{ x = x or 0, y = y or 0 }} end
+function vec3(x, y, z) return {{ x = x or 0, y = y or 0, z = z or 0 }} end
+function rgbm(r, g, b, m) return {{ r = r or 0, g = g or 0, b = b or 0, mult = m or 1 }} end
+json = {{}}
+function json.decode(text)
+  local lua_src = text:gsub('%[', '{{'):gsub('%]', '}}'):gsub('"([^"]+)"%s*:', '["%1"]=')
+  return assert(load('return ' .. lua_src))()
+end
+function io.fileExists(p) local f = io.open(p, 'r'); if f then f:close(); return true end; return false end
+function io.load(p, fb) local f = io.open(p, 'r'); if not f then return fb end; local d = f:read('*a'); f:close(); return d end
+function io.save(p, c) local f = io.open(p, 'w'); if not f then return false end; f:write(c); f:close(); return true end
+function io.createDir(_) return true end
+local dirFiles = {{ 'alpha_fast.json', 'beta_slow.json' }}
+function io.scanDir(dir, mask, cb)
+  if dir:gsub('\\\\', '/'):find('tracks/synth_track/loop', 1, true) then
+    for _, name in ipairs(dirFiles) do cb(name) end
+  end
+end
+
+local store = {{}}
+local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local function makeNode()
+  local n = {{}}
+  function n:createBoundingSphereNode() return makeNode() end
+  function n:loadKN5() return makeNode() end
+  function n:findMeshes() return {{}} end
+  function n:findNodes() return makeNode() end
+  function n:setPosition() end
+  function n:setOrientation() end
+  function n:setVisible() end
+  function n:dispose() end
+  return n
+end
+ac = {{
+  FolderID = {{ Root = 1, Logs = 2, ContentCars = 4 }},
+  getFolder = function(id)
+    if id == 2 then return {json.dumps(str(tmp_path / "logs"))} end
+    return {json.dumps(str(tmp_path))}
+  end,
+  getSim = function() return sim end,
+  getCar = function(i) return i == 0 and car0 or nil end,
+  getTrackID = function() return 'synth_track' end,
+  getTrackLayout = function() return 'loop' end,
+  findNodes = function(_) return makeNode() end,
+  store = function(k, v) store[k] = v end,
+  load = function(k) return store[k] end,
+  storage = function(d, _) return d end,
+  warn = function(_) end,
+  log = function(_) end,
+}}
+render = {{ on = function() return {{ dispose = function() end }} end }}
+local clickTarget = nil
+local uiTexts = {{}}
+ui = {{
+  windowSize = function() return vec2(410, 450) end,
+  drawRectFilled = function() end,
+  drawRect = function() end,
+  sameLine = function() end,
+  text = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
+  button = function(label)
+    if clickTarget == label then
+      clickTarget = nil
+      return true
+    end
+    return false
+  end,
+}}
+
+dofile({json.dumps(str(LUA_SCRIPT))})
+for _ = 1, 20 do
+  sim.gameTime = sim.gameTime + 0.02
+  script.update(0.02)
+end
+-- Initial ghost should be [1/2] alpha_fast.json
+uiTexts = {{}}
+script.windowSettings(0.02)
+local sawAlpha = false
+for _, line in ipairs(uiTexts) do
+  if line:find('Ghost [1/2]: alpha_fast.json', 1, true) then sawAlpha = true end
+end
+assert(sawAlpha, 'Expected initial Ghost [1/2]: alpha_fast.json')
+
+-- Click Next > to switch to beta_slow.json
+clickTarget = 'Next >'
+script.windowSettings(0.02)
+for _ = 1, 5 do
+  sim.gameTime = sim.gameTime + 0.02
+  script.update(0.02)
+end
+uiTexts = {{}}
+script.windowSettings(0.02)
+local sawBeta = false
+for _, line in ipairs(uiTexts) do
+  if line:find('Ghost [2/2]: beta_slow.json', 1, true) then sawBeta = true end
+end
+assert(sawBeta, 'Expected switched Ghost [2/2]: beta_slow.json')
+
+-- Click Reload ghosts
+clickTarget = 'Reload ghosts'
+script.windowSettings(0.02)
+script.shutdown()
+print('MULTI_GHOST_OK')
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run([lua, str(harness)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Multi-ghost test failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "MULTI_GHOST_OK" in proc.stdout
+    log_text = (tmp_path / "logs" / "ghostcar_hotlap_verify.log").read_text(encoding="utf-8")
+    assert "RELOAD reason=ui-next status=ok file=beta_slow.json carId=car_beta" in log_text
+    assert "RELOAD reason=ui-reload status=ok file=beta_slow.json" in log_text
+    assert "ERROR " not in log_text

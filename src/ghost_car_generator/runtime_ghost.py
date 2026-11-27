@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -297,11 +300,82 @@ def export_runtime_ghost_from_acreplay(
     }
 
 
-def export_runtime_ghost_from_ld(
-    ld_path: str | Path,
+def _sanitize_ghost_stem(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip()).strip("._-")
+    return cleaned or "ghost-runtime-v1"
+
+
+def detect_ac_install_dir(explicit_root: str | Path | None = None) -> Path:
+    """Locate the Assetto Corsa installation directory."""
+    if explicit_root is not None and str(explicit_root).strip() and str(explicit_root).lower() != "auto":
+        root = Path(explicit_root).expanduser()
+        if not root.is_dir():
+            raise ValueError(f"Assetto Corsa directory does not exist: {root}")
+        return root
+    env_root = os.environ.get("AC_ROOT") or os.environ.get("ASSETTO_CORSA_DIR")
+    candidates: list[Path] = []
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    for drive in ("E", "C", "D", "F"):
+        candidates.append(Path(f"{drive}:/Games/Steam/steamapps/common/assettocorsa"))
+        candidates.append(Path(f"{drive}:/SteamLibrary/steamapps/common/assettocorsa"))
+        candidates.append(Path(f"{drive}:/Program Files (x86)/Steam/steamapps/common/assettocorsa"))
+    for cand in candidates:
+        if (cand / "acs.exe").is_file() or (cand / "apps" / "lua").is_dir():
+            return cand
+    raise ValueError(
+        "Could not auto-detect Assetto Corsa directory. Pass --deploy-ac <path-to-assettocorsa>."
+    )
+
+
+def deploy_runtime_ghost_to_ac(
+    json_path: str | Path,
+    track_id: str,
+    *,
+    ac_root: str | Path | None = None,
+    ghost_name: str | None = None,
+    sync_lua: bool = True,
+) -> dict[str, Any]:
+    """Deploy a runtime ghost JSON into ``apps/lua/ghostcar_hotlap/tracks/<track>/<layout>/``."""
+    ac_dir = detect_ac_install_dir(ac_root)
+    app_dir = ac_dir / "apps" / "lua" / "ghostcar_hotlap"
+    parts = [p.strip().lower() for p in str(track_id or "").replace("\\", "/").split("/") if p.strip()]
+    if not parts:
+        target_dir = app_dir
+    else:
+        target_dir = app_dir / "tracks" / Path(*parts)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    src = Path(json_path).expanduser().resolve()
+    stem = _sanitize_ghost_stem(ghost_name) if ghost_name else _sanitize_ghost_stem(src.stem)
+    filename = stem if stem.lower().endswith(".json") else f"{stem}.json"
+    dest = (target_dir / filename).resolve()
+    if src != dest:
+        shutil.copyfile(src, dest)
+
+    synced_files: list[str] = []
+    if sync_lua:
+        repo_csp = Path(__file__).resolve().parents[1] / "resources" / "csp" / "ghostcar_hotlap"
+        if repo_csp.is_dir():
+            for fname in ("ghostcar_hotlap.lua", "manifest.ini"):
+                src_f = repo_csp / fname
+                if src_f.is_file():
+                    shutil.copyfile(src_f, app_dir / fname)
+                    synced_files.append(str(app_dir / fname))
+    return {
+        "acDir": str(ac_dir),
+        "deployedPath": str(dest),
+        "syncedLuaFiles": synced_files,
+    }
+
+
+def export_runtime_ghost_from_telemetry(
+    telemetry_path: str | Path,
     output_path: str | Path,
     *,
-    gps_track_path: str | Path,
+    gps_track_path: str | Path | None = None,
+    ac_track_dir: str | Path | None = None,
+    ac_layout: str | None = None,
     car_id: str = "ig_toyota_gr86_premium",
     track_id: str | None = None,
     lap: int | None = None,
@@ -318,8 +392,13 @@ def export_runtime_ghost_from_ld(
     align_start_line: bool = True,
     smooth: bool = True,
 ) -> dict[str, Any]:
-    """Build and write a ``ghost-runtime-v1.json`` directly from a MoTeC ``.ld`` lap."""
-    from .ac_track import load_track_package
+    """Build and write a ``ghost-runtime-v1.json`` from ``.ld``/``.ibt``/``.csv``/``.rcz``/``.xrk``.
+
+    Supports either a calibrated ``gps_track_path`` package/JSON OR direct
+    zero-replay auto-calibration from an Assetto Corsa track folder via
+    ``ac_track_dir`` (using ``fast_lane.ai`` + ``.kn5``).
+    """
+    from .ac_track import auto_calibrate_from_ac_track, load_track_package
     from .ld_replay import (
         align_replay_heights,
         build_poses_from_xyz,
@@ -328,23 +407,46 @@ def export_runtime_ghost_from_ld(
         gps_track_to_ac,
         smooth_replay_positions,
     )
-    from .motec import extract_motec_points
+    from .telemetry import extract_telemetry_points
     from .track_surface import TrackSurface
 
-    pts = extract_motec_points(
-        Path(ld_path),
+    pts = extract_telemetry_points(
+        Path(telemetry_path),
         target_lap=lap,
         channel_overrides=dict(channel_overrides) if channel_overrides else None,
     )
-    track_ref, _, packaged_surfaces, _ = load_track_package(gps_track_path)
+
+    road_only = None
+    full_surface = None
+    auto_calibrated = False
+    if ac_track_dir is not None:
+        track_ref, road_only, full_surface = auto_calibrate_from_ac_track(
+            ac_track_dir,
+            pts,
+            layout=ac_layout,
+            load_kn5_surfaces=(height_mode in ("auto", "kn5") or fit_pavement or clamp_pavement),
+        )
+        auto_calibrated = True
+        if track_surface_paths:
+            sp = [Path(p) for p in track_surface_paths]
+            road_only = TrackSurface.from_files([sp[0]])
+            full_surface = TrackSurface.from_files(sp)
+    elif gps_track_path is not None:
+        track_ref, _, packaged_surfaces, _ = load_track_package(gps_track_path)
+        surface_paths = [Path(p) for p in (track_surface_paths or packaged_surfaces)]
+        if surface_paths:
+            road_only = TrackSurface.from_files([surface_paths[0]])
+            full_surface = TrackSurface.from_files(surface_paths)
+    else:
+        raise ValueError("Provide either gps_track_path or ac_track_dir")
+
     resolved_track_id = track_id or _track_id_from_reference(track_ref)
     ref = np.asarray(track_ref["referencePathAc"], dtype=np.float64)
 
-    surface_paths = [Path(p) for p in (track_surface_paths or packaged_surfaces)]
-    has_surfaces = bool(surface_paths)
+    has_surfaces = road_only is not None
     effective_height_mode = ("kn5" if has_surfaces else "track") if height_mode == "auto" else height_mode
-    if effective_height_mode == "kn5" and not has_surfaces:
-        raise ValueError("--height-mode kn5 requires a packaged or explicit --track-surface")
+    if effective_height_mode == "kn5" and full_surface is None:
+        raise ValueError("--height-mode kn5 requires a packaged, KN5-discovered, or explicit --track-surface")
     effective_height_offset_m = (
         float(height_offset_m)
         if height_offset_m is not None
@@ -358,9 +460,7 @@ def export_runtime_ghost_from_ld(
 
     pavement_diag: dict[str, Any] | None = None
     clamp_diag: dict[str, Any] | None = None
-    road_only = None
-    if has_surfaces:
-        road_only = TrackSurface.from_files([surface_paths[0]])
+    if road_only is not None:
         if fit_pavement:
             ac_xyz, pavement_diag = fit_pavement_offset(
                 ac_xyz,
@@ -377,13 +477,12 @@ def export_runtime_ghost_from_ld(
                 frequency_hz=pts["frequencyHz"],
             )
 
-    full_surface = TrackSurface.from_files(surface_paths) if effective_height_mode == "kn5" else None
     ac_xyz, height_diag = align_replay_heights(
         ac_xyz,
         ref,
         mode=effective_height_mode,
         offset_m=effective_height_offset_m,
-        track_surface=full_surface,
+        track_surface=full_surface if effective_height_mode == "kn5" else None,
     )
 
     poses, _ = build_poses_from_xyz(
@@ -421,7 +520,7 @@ def export_runtime_ghost_from_ld(
     out.write_text(json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n", encoding="utf-8")
     return {
         "output": str(out),
-        "sourceMode": "ld",
+        "sourceMode": Path(telemetry_path).suffix.lower().lstrip(".") or "telemetry",
         "selectedLap": pts.get("selectedLap"),
         "carId": car_id,
         "trackId": resolved_track_id,
@@ -437,4 +536,53 @@ def export_runtime_ghost_from_ld(
         "onPavementPct": on_pavement_pct,
         "smoothed": bool(smooth),
         "startLineShiftFrames": sf_shift,
+        "autoCalibrated": auto_calibrated,
     }
+
+
+def export_runtime_ghost_from_ld(
+    ld_path: str | Path,
+    output_path: str | Path,
+    *,
+    gps_track_path: str | Path | None = None,
+    ac_track_dir: str | Path | None = None,
+    ac_layout: str | None = None,
+    car_id: str = "ig_toyota_gr86_premium",
+    track_id: str | None = None,
+    lap: int | None = None,
+    channel_overrides: Mapping[str, str] | None = None,
+    height_mode: str = "auto",
+    height_offset_m: float | None = None,
+    track_surface_paths: Sequence[str | Path] | None = None,
+    position_smoothing_s: float = 0.75,
+    yaw_smoothing_s: float = 0.35,
+    fit_pavement: bool = True,
+    pavement_search_radius_m: float = 8.0,
+    clamp_pavement: bool = True,
+    pavement_margin_m: float = 0.55,
+    align_start_line: bool = True,
+    smooth: bool = True,
+) -> dict[str, Any]:
+    """Backward-compatible wrapper around ``export_runtime_ghost_from_telemetry``."""
+    return export_runtime_ghost_from_telemetry(
+        ld_path,
+        output_path,
+        gps_track_path=gps_track_path,
+        ac_track_dir=ac_track_dir,
+        ac_layout=ac_layout,
+        car_id=car_id,
+        track_id=track_id,
+        lap=lap,
+        channel_overrides=channel_overrides,
+        height_mode=height_mode,
+        height_offset_m=height_offset_m,
+        track_surface_paths=track_surface_paths,
+        position_smoothing_s=position_smoothing_s,
+        yaw_smoothing_s=yaw_smoothing_s,
+        fit_pavement=fit_pavement,
+        pavement_search_radius_m=pavement_search_radius_m,
+        clamp_pavement=clamp_pavement,
+        pavement_margin_m=pavement_margin_m,
+        align_start_line=align_start_line,
+        smooth=smooth,
+    )
