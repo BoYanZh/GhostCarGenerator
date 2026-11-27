@@ -96,6 +96,20 @@ def _finite_vector(value: Any, size: int, name: str) -> list[float]:
     return result
 
 
+def _normalize_brake(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v) or v <= 0.0:
+        return 0.0
+    if v > 1.0:
+        v = v / 255.0 if v <= 255.0 else 1.0
+    return round(max(0.0, min(1.0, v)), 3)
+
+
 def build_runtime_ghost(
     poses: Iterable[Mapping[str, Any]],
     *,
@@ -122,6 +136,7 @@ def build_runtime_ghost(
             "positionM": position,
             "rotationRad": rotation,
             "steerAngleDeg": float(pose.get("steerAngleDeg", 0.0)),
+            "brake": _normalize_brake(pose.get("brake", 0.0)),
             "velocityMS": _finite_vector(
                 pose.get("velocityMS", [0.0, 0.0, 0.0]), 3, "velocityMS"
             ),
@@ -260,6 +275,7 @@ def export_runtime_ghost_from_acreplay(
                 "positionM": [round(float(pos[0]), 4), round(float(pos[1]), 4), round(float(pos[2]), 4)],
                 "rotationRad": [round(float(v), 6) for v in fr["rotationRad"]],
                 "steerAngleDeg": round(float(fr.get("steerAngleDeg", 0.0)), 4),
+                "brake": _normalize_brake(fr.get("brake", 0.0)),
                 "velocityMS": [round(float(v), 4) for v in fr.get("velocityMS", [0.0, 0.0, 0.0])],
             }
         )

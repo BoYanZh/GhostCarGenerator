@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.20'
+local APP_VERSION = '0.21'
 local SETTINGS_VERSION = 8
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -367,6 +367,9 @@ local state = {
   materialError = nil,
   ghostMeshSets = {},
   interiorMeshSets = {},
+  brakeLightSets = {},
+  brake = 0,
+  brakeLit = false,
   appliedAlpha = nil,
   appliedVisible = nil,
   fadeScale = 1.0,
@@ -903,6 +906,9 @@ local function disposeGhost()
   state.wheels = {}
   state.ghostMeshSets = {}
   state.interiorMeshSets = {}
+  state.brakeLightSets = {}
+  state.brake = 0
+  state.brakeLit = false
   state.interiorMeshes = 0
   state.appliedAlpha = nil
   state.appliedVisible = nil
@@ -1309,6 +1315,109 @@ local function updateInteriorVisibility(visible, translucent)
   end
 end
 
+local function parseRgb3(raw, dr, dg, db)
+  if type(raw) == 'table' then
+    local r = tonumber(raw[1] or raw.x or raw.r)
+    local g = tonumber(raw[2] or raw.y or raw.g)
+    local b = tonumber(raw[3] or raw.z or raw.b)
+    if r and g and b then return vec3(r, g, b) end
+  elseif type(raw) == 'string' then
+    local r, g, b = raw:match('([%+%-]?%d*%.?%d+)%s*,%s*([%+%-]?%d*%.?%d+)%s*,%s*([%+%-]?%d*%.?%d+)')
+    if r and g and b then return vec3(tonumber(r), tonumber(g), tonumber(b)) end
+  end
+  return vec3(dr, dg, db)
+end
+
+local function applyBrakeLightState(lit, force)
+  local want = lit == true
+  if not force and want == state.brakeLit then return end
+  state.brakeLit = want
+  local sets = state.brakeLightSets
+  if type(sets) ~= 'table' or #sets == 0 then return end
+  local off = vec3(0, 0, 0)
+  for _, entry in ipairs(sets) do
+    local col = want and entry.onColor or off
+    pcall(function() entry.meshes:setVisible(true, false) end)
+    pcall(function() entry.meshes:setMaterialProperty('ksEmissive', col) end)
+  end
+end
+
+local function collectBrakeLights(model)
+  state.brakeLightSets = {}
+  state.brakeLit = false
+  if not model or type(model.findMeshes) ~= 'function' then return end
+
+  local entries = {}
+  local seen = {}
+  local source = 'none'
+  local function tryAddMesh(name, onColor)
+    if type(name) ~= 'string' or name == '' then return end
+    local key = name:lower()
+    if seen[key] then return end
+    local ok, m = pcall(function() return model:findMeshes(name) end)
+    if ok and m and (type(m.empty) ~= 'function' or not m:empty()) then
+      seen[key] = true
+      entries[#entries + 1] = {
+        name = name,
+        meshes = m,
+        onColor = onColor or vec3(180, 2, 1),
+      }
+    end
+  end
+
+  local cfg = nil
+  local carId = (runtime and runtime.carId) or ''
+  if type(ac.INIConfig) == 'table' then
+    local playerCarId = (type(ac.getCarID) == 'function') and select(2, pcall(ac.getCarID, 0)) or nil
+    if type(ac.INIConfig.carData) == 'function'
+      and (carId == '' or not playerCarId or tostring(playerCarId):lower() == tostring(carId):lower()) then
+      local ok, c = pcall(ac.INIConfig.carData, 0, 'lights.ini')
+      if ok and c then cfg = c; source = 'carData' end
+    end
+    if not cfg and carId ~= '' and type(ac.INIConfig.load) == 'function'
+      and ac.FolderID and ac.FolderID.ContentCars and type(ac.getFolder) == 'function' then
+      local carsDir = ac.getFolder(ac.FolderID.ContentCars)
+      if type(carsDir) == 'string' and carsDir ~= '' then
+        local iniPath = carsDir:gsub('[/\\]+$', '')..'/'..carId..'/data/lights.ini'
+        if io.fileExists(iniPath) then
+          local ok, c = pcall(ac.INIConfig.load, iniPath)
+          if ok and c then cfg = c; source = 'lights.ini' end
+        end
+      end
+    end
+  end
+
+  if cfg and type(cfg.iterate) == 'function' then
+    pcall(function()
+      for _, section in cfg:iterate('BRAKE') do
+        local name = cfg:get(section, 'NAME', '')
+        local rawColor = cfg:get(section, 'COLOR', '')
+        tryAddMesh(name, parseRgb3(rawColor, 180, 2, 1))
+      end
+    end)
+  elseif cfg and type(cfg.get) == 'function' then
+    for i = 0, 15 do
+      local sec = 'BRAKE_'..i
+      local name = cfg:get(sec, 'NAME', '')
+      if type(name) == 'string' and name ~= '' then
+        local rawColor = cfg:get(sec, 'COLOR', '')
+        tryAddMesh(name, parseRgb3(rawColor, 180, 2, 1))
+      end
+    end
+  end
+
+  if #entries == 0 then
+    source = 'fallback'
+    for _, pattern in ipairs({ 'RearLight_0', 'RearLight_1', 'CENTRAL_light', '{?brake?}', '{?stop?}' }) do
+      tryAddMesh(pattern, vec3(180, 2, 1))
+    end
+  end
+
+  state.brakeLightSets = entries
+  applyBrakeLightState(false, true)
+  appendLog(string.format('BRAKELIGHTS count=%d source=%s', #entries, source))
+end
+
 local function updateGhostAlpha(alpha)
   local clamped = clamp01(alpha)
   if state.appliedAlpha and math.abs(clamped - state.appliedAlpha) < 1e-3 then
@@ -1323,6 +1432,9 @@ local function updateGhostAlpha(alpha)
   end
   state.appliedAlpha = clamped
   state.materialMode = clamped < 0.999 and 'alpha' or 'opaque'
+  if state.brakeLit then
+    applyBrakeLightState(true, true)
+  end
   updateInteriorVisibility(ghostVisibleEnabled(), clamped < 0.999)
 end
 
@@ -1389,6 +1501,9 @@ local function applyGhostMaterials(model)
   local alpha = currentAlpha()
   state.ghostMeshSets = {}
   state.interiorMeshSets = {}
+  state.brakeLightSets = {}
+  state.brake = 0
+  state.brakeLit = false
   state.interiorMeshes = 0
   if type(render) ~= 'table' or not render.BlendMode then
     return nil, 'render.BlendMode-missing'
@@ -1631,6 +1746,7 @@ local function initialize()
   logNodeIntrospection(node, model)
   local materialInfo, materialError = applyGhostMaterials(model)
   logGhostMaterials(materialInfo, materialError)
+  collectBrakeLights(model)
   applyGhostVisibility(ghostVisibleEnabled())
   appendLog(string.format('ACTIVE mode=%s frames=%d hook=%s alpha=%.3f log=%s',
     tostring(state.mode), runtime and #runtime.frames or 0,
@@ -1984,6 +2100,9 @@ local function sampleRuntimeFrame(elapsed)
   local steerB = b.steerAngleDeg or 0
   local steerDeg = steerA + (steerB - steerA) * k
   state.steerRad = -math.rad(steerDeg) / GHOST_STEER_RATIO
+  local brakeA = type(a.brake) == 'number' and a.brake or 0
+  local brakeB = type(b.brake) == 'number' and b.brake or 0
+  state.brake = brakeA + (brakeB - brakeA) * k
   return x, y, z, yaw, speed, pitch
 end
 
@@ -2584,6 +2703,7 @@ local function updateGhost(dt)
     applyPose(x, y, z, yaw, pitch)
     updateWheels(state.steerRad, speed, advanceStep)
     refreshGhostOpacity(false)
+    applyBrakeLightState((state.brake or 0) >= 0.03, false)
     updateGhostDelta(player, step)
     state.smooth.frames = state.smooth.frames + 1
   else

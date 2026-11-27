@@ -446,7 +446,7 @@ function io.createDir(_) return true end
 
 local store = {{}}
 local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
-local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.95 }}
 local kn5Loaded = false
 ac = {{
   FolderID = {{ Root = 1, Logs = 2, ContentCars = 4 }},
@@ -569,7 +569,7 @@ end
 
 local store = {{}}
 local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
-local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.95 }}
 local function makeNode()
   local n = {{}}
   function n:createBoundingSphereNode() return makeNode() end
@@ -744,7 +744,7 @@ end
 
 local store = {{}}
 local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
-local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.2 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.95 }}
 local function makeNode()
   local n = {{}}
   function n:createBoundingSphereNode() return makeNode() end
@@ -831,4 +831,169 @@ print('IMPORT_TELEMETRY_OK')
     assert "IMPORT start file=new_lap.ld" in log_text
     assert "IMPORT ok file=new_lap.ld" in log_text
     assert "RELOAD reason=ui-import status=ok file=new_lap.json" in log_text
+    assert "ERROR " not in log_text
+
+
+@pytest.mark.skipif(_find_lua() is None, reason="lua interpreter not installed")
+def test_lua_brake_lights_from_channel(tmp_path: Path):
+    """Verify ghost brake lights toggle ksEmissive from frame brake channel."""
+    lua = _find_lua()
+    assert lua is not None
+
+    frames = []
+    for i in range(40):
+        frames.append(
+            {
+                "timeS": round(i * 0.015, 6),
+                "positionM": [float(i), 0.0, float(i)],
+                "rotationRad": [0.0, 0.0, 0.0],
+                "steerAngleDeg": 0.0,
+                "brake": 0.85 if 10 <= i <= 25 else 0.0,
+                "velocityMS": [0.0, 0.0, 20.0],
+            }
+        )
+    (tmp_path / "ghost-runtime-v1.json").write_text(
+        json.dumps(
+            {
+                "schema": "ghost-runtime-v1",
+                "carId": "ig_toyota_gr86_premium",
+                "trackId": "synth_track/loop",
+                "frameIntervalS": 0.015,
+                "lapTimeS": 0.6,
+                "frames": frames,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    car_dir = tmp_path / "ig_toyota_gr86_premium"
+    car_dir.mkdir(parents=True, exist_ok=True)
+    (car_dir / "toyota_gr86_premium.kn5").write_bytes(b"sc6969")
+
+    harness = tmp_path / "harness_brake.lua"
+    harness.write_text(
+        f"""
+__dirname = {json.dumps(str(tmp_path))}
+script = {{}}
+math.saturate = math.saturate or function(x) return math.max(0, math.min(1, x)) end
+math.atan2 = math.atan2 or math.atan
+function vec2(x, y) return {{ x = x or 0, y = y or 0 }} end
+function vec3(x, y, z) return {{ x = x or 0, y = y or 0, z = z or 0 }} end
+function rgbm(r, g, b, m) return {{ r = r or 0, g = g or 0, b = b or 0, mult = m or 1 }} end
+json = {{}}
+function json.decode(text)
+  local lua_src = text:gsub('%[', '{{'):gsub('%]', '}}'):gsub('"([^"]+)"%s*:', '["%1"]=')
+  return assert(load('return ' .. lua_src))()
+end
+function io.fileExists(p) local f = io.open(p, 'r'); if f then f:close(); return true end; return false end
+function io.load(p, fb) local f = io.open(p, 'r'); if not f then return fb end; local d = f:read('*a'); f:close(); return d end
+function io.save(p, c) local f = io.open(p, 'w'); if not f then return false end; f:write(c); f:close(); return true end
+function io.createDir(_) return true end
+
+local brakeEmissiveLog = {{}}
+local function makeBrakeMesh()
+  local m = {{}}
+  function m:empty() return false end
+  function m:setVisible() end
+  function m:setMaterialProperty(k, v)
+    if k == 'ksEmissive' then
+      brakeEmissiveLog[#brakeEmissiveLog + 1] = v.x
+    end
+  end
+  return m
+end
+local function makeNode()
+  local n = {{}}
+  function n:empty() return false end
+  function n:createBoundingSphereNode() return makeNode() end
+  function n:loadKN5() return makeNode() end
+  function n:findMeshes(pat)
+    if pat == 'RearLight_0' then return makeBrakeMesh() end
+    return {{ empty = function() return true end }}
+  end
+  function n:findNodes() return makeNode() end
+  function n:ensureUniqueMaterials() end
+  function n:setTransparent() end
+  function n:setBlendMode() end
+  function n:setDepthMode() end
+  function n:setShadows() end
+  function n:excludeFromCubemap() end
+  function n:excludeFromSecondary() end
+  function n:setMaterialProperty() end
+  function n:setMaterialTexture() end
+  function n:setPosition() end
+  function n:setOrientation() end
+  function n:setRotation() end
+  function n:setVirtualCarFlag() end
+  function n:setVisible() end
+  function n:dispose() end
+  return n
+end
+
+local store = {{}}
+local sim = {{ gameTime = 0, dt = 0.02, isPaused = false, isInMainMenu = false, currentSessionIndex = 0 }}
+local car0 = {{ position = vec3(0,0,0), speedKmh = 80, lapCount = 0, lapTimeMs = 5000, splinePosition = 0.95, isInPit = false, isInPitlane = false, resetCounter = 0 }}
+ac = {{
+  FolderID = {{ Root = 1, Logs = 2, ContentCars = 4 }},
+  getFolder = function(id)
+    if id == 2 then return {json.dumps(str(tmp_path / "logs"))} end
+    return {json.dumps(str(tmp_path))}
+  end,
+  INIConfig = {{
+    carData = function(_, fname)
+      if fname == 'lights.ini' then
+        return {{
+          get = function(_, sec, key, def)
+            if sec == 'BRAKE_0' and key == 'NAME' then return 'RearLight_0' end
+            if sec == 'BRAKE_0' and key == 'COLOR' then return '400,0,0' end
+            return def
+          end,
+        }}
+      end
+      return nil
+    end,
+  }},
+  getSim = function() return sim end,
+  getCar = function(i) return i == 0 and car0 or nil end,
+  getCarID = function(_) return 'ig_toyota_gr86_premium' end,
+  getTrackID = function() return 'synth_track' end,
+  getTrackLayout = function() return 'loop' end,
+  findNodes = function(_) return makeNode() end,
+  store = function(k, v) store[k] = v end,
+  load = function(k) return store[k] end,
+  storage = function(d, _) return d end,
+  warn = function(_) end,
+  log = function(_) end,
+}}
+render = {{ on = function() return {{ dispose = function() end }} end }}
+ui = {{}}
+
+dofile({json.dumps(str(LUA_SCRIPT))})
+for i = 1, 80 do
+  sim.gameTime = sim.gameTime + 0.02
+  car0.lapTimeMs = car0.lapTimeMs + 20
+  car0.position.z = car0.position.z + 0.5
+  car0.splinePosition = (car0.splinePosition + 0.005) % 1.0
+  script.update(0.02)
+end
+script.shutdown()
+
+local sawOn, sawOffAfterOn = false, false
+for _, r in ipairs(brakeEmissiveLog) do
+  if r >= 300 then sawOn = true end
+  if sawOn and r == 0 then sawOffAfterOn = true end
+end
+assert(sawOn, 'Expected brake light ksEmissive >= 300 during braking frames')
+assert(sawOffAfterOn, 'Expected brake light ksEmissive to return to 0 after braking')
+print('BRAKE_LIGHTS_OK')
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run([lua, str(harness)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Brake lights test failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "BRAKE_LIGHTS_OK" in proc.stdout
+    log_text = (tmp_path / "logs" / "ghostcar_hotlap_verify.log").read_text(encoding="utf-8")
+    assert "BRAKELIGHTS count=1 source=carData" in log_text
     assert "ERROR " not in log_text
