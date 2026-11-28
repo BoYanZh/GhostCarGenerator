@@ -471,9 +471,10 @@ ac = {{
 }}
 render = {{ on = function() return {{ dispose = function() end }} end }}
 local uiTexts = {{}}
+local bgDraws = 0
 ui = {{
   windowSize = function() return vec2(320, 100) end,
-  drawRectFilled = function() end,
+  drawRectFilled = function() bgDraws = bgDraws + 1 end,
   drawRect = function() end,
   text = function(t) uiTexts[#uiTexts + 1] = tostring(t) end,
 }}
@@ -485,11 +486,13 @@ for _ = 1, 45 do
 end
 script.windowMain(0.02)
 assert(not kn5Loaded, 'Ghost node/KN5 must not be loaded on a non-matching track')
+assert(#uiTexts == 0 and bgDraws == 0, 'Delta windowMain must stay completely hidden when no ghost is loaded')
+script.windowSettings(0.02)
 local sawIdle = false
 for _, line in ipairs(uiTexts) do
-  if line:find('IDLE (wrong track)', 1, true) then sawIdle = true end
+  if line:find('IDLE (wrong track', 1, true) then sawIdle = true end
 end
-assert(sawIdle, 'Expected IDLE (wrong track) in windowMain UI')
+assert(sawIdle, 'Expected IDLE (wrong track) in windowSettings UI')
 script.shutdown()
 print('MISMATCH_IDLE_OK')
 """,

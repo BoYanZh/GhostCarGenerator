@@ -100,7 +100,7 @@
 --     `GhostCarGenerator Hotlap: ERROR: ...` (or `... STANDBY ...`) so
 --     screenshots can be asserted on without OCR of the numbers.
 
-local APP_VERSION = '0.22'
+local APP_VERSION = '0.23'
 local SETTINGS_VERSION = 9
 -- Default tunable alpha for the ghost body, 0..1 (1 = opaque look).
 -- Persisted via ac.storage and live-adjustable in the UI.
@@ -3165,45 +3165,23 @@ local function drawGhostDeltaHero(distM)
 end
 
 function script.windowMain(dt)
-  drawTranslucentPanelBg()
-  if instance.role == 'standby' then
-    ui.text('GhostCarGenerator Delta: STANDBY')
+  if instance.role ~= 'writer' then
     return
   end
-  if instance.role == 'claiming' then
-    ui.text('GhostCarGenerator Delta: INIT')
-    return
-  end
-  if state.status == 'ACTIVE' then
+  if state.status == 'ACTIVE' and runtime then
+    drawTranslucentPanelBg()
     local distM = dist3(state.ghostX, state.ghostY, state.ghostZ,
       state.playerX, state.playerY, state.playerZ)
-    if runtime then
-      drawGhostDeltaBar()
-      drawGhostDeltaHero(distM)
-    else
-      ui.text(string.format('Ghost Fallback (5m)   Dist %.1fm', distM))
-    end
-  elseif state.status == 'IDLE' and runtimeTrackMismatch then
-    ui.text('GhostCarGenerator: IDLE (wrong track)')
-    ui.text('Track: '..tostring(runtimeTrackMismatch.current))
-    ui.text('Ghost: '..tostring(runtimeTrackMismatch.expected))
-    if type(ui.button) == 'function' then
-      if not importState.running and ui.button('Import telemetry...') then
-        openImportTelemetryDialog()
-      end
-      if type(ui.sameLine) == 'function' then ui.sameLine(0, 6) end
-      if ui.button('Reload') then
-        reloadRuntime(nil, 'ui-idle-reload')
-      end
-    end
-    if importState.status then
-      ui.text(tostring(importState.status))
-    end
-  elseif state.status == 'ERROR' then
-    ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
-  else
-    ui.text('GhostCarGenerator Delta: waiting for scene')
+    drawGhostDeltaBar()
+    drawGhostDeltaHero(distM)
+    return
   end
+  if state.status == 'ERROR' then
+    drawTranslucentPanelBg()
+    ui.text('GhostCarGenerator Hotlap: ERROR: '..tostring(state.errorMessage))
+  end
+  -- Otherwise (IDLE / wrong track / no runtime ghost loaded / waiting):
+  -- render nothing so the NO_BACKGROUND Delta window stays completely hidden.
 end
 
 function script.shutdown()
